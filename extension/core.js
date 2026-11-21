@@ -8,9 +8,15 @@
  * Public session fields:
  *   {
  *     id, question, providers, stage, round, paused,
- *     tasks, history, report?, updatedAt
+ *     tasks, history, guidance, report?, updatedAt
  *   }
  * `stopReason` is an optional, additional field written when a debate ends.
+ *
+ * `guidance` holds user conditions added while the discussion is paused. A
+ * note is recorded with the stage, round, source and time it was written and
+ * is appended only to tasks constructed afterwards (independent, critique and
+ * proposal). Already pending, archived or vote prompts are never rewritten,
+ * so a vote still covers exactly the candidate text it was issued for.
  *
  * `tasks` only ever contains the current stage. Completed or skipped tasks
  * are copied into `history` with their stage and round; history entries are
@@ -33,6 +39,13 @@
 
 const STANCES = ['agree', 'conditional', 'oppose'];
 const PROVIDER_ID_RE = /^[a-z0-9]+(?:[-_][a-z0-9]+)*$/;
+
+// Where a paused user may add a condition, and which newly constructed task
+// prompts carry it. Vote prompts are excluded on purpose: a vote must stay on
+// the exact candidate text it was issued for.
+const GUIDANCE_INPUT_STAGES = new Set(['independent', 'critique']);
+const GUIDANCE_TASK_STAGES = new Set(['independent', 'critique', 'proposal']);
+const MAX_GUIDANCE = 2000;
 
 const STAGE_LABELS = {
   independent: '独立作答',
@@ -82,6 +95,7 @@ export function createSession(question, providers) {
     paused: false,
     tasks: [],
     history: [],
+    guidance: [],
     updatedAt: Date.now(),
   };
 
@@ -108,6 +122,7 @@ export function createSession(question, providers) {
  * action:
  *   'answer' payload { taskId, text, stance?, version?, stage?, round? }
  *   'skip'   payload { taskId }
+ *   'guide'  payload { text }          (only while paused, independent/critique)
  *   'pause' | 'resume' | 'finish'
  */
 export function applyAction(session, action, payload = {}) {
@@ -121,6 +136,8 @@ export function applyAction(session, action, payload = {}) {
   }
 
   const next = clone(session);
+  // Sessions saved before guidance existed have no field; treat them as empty.
+  if (!Array.isArray(next.guidance)) next.guidance = [];
 
   if (action === 'pause') {
     if (session.stage === 'done' || next.paused) return next;
@@ -170,6 +187,12 @@ export function applyAction(session, action, payload = {}) {
     }
     actSkip(next, payload);
     advanceWhilePossible(next);
+    touch(next, session);
+    return next;
+  }
+
+  if (action === 'guide') {
+    actGuide(next, payload);
     touch(next, session);
     return next;
   }
@@ -270,6 +293,52 @@ function actSkip(session, payload) {
     throw new Error(`task "${task.id}" was already skipped`);
   }
   task.status = 'skipped';
+}
+
+/**
+ * Record a user condition without touching any prompt already issued. The note
+ * carries immutable markers (where it was added, who wrote it, when); only
+ * tasks constructed later pick it up through `makeTask`.
+ */
+function actGuide(session, payload) {
+  if (!GUIDANCE_INPUT_STAGES.has(session.stage)) {
+    throw new Error(
+      `guidance is not accepted in the ${session.stage} stage; add a condition only during independent or critique, before a candidate or vote exists`,
+    );
+  }
+  if (!session.paused) {
+    throw new Error(
+      'pause the discussion before adding a condition; a running round is not changed retroactively',
+    );
+  }
+
+  const raw = payload.text;
+  if (typeof raw !== 'string') {
+    throw new Error('guidance text must be a string');
+  }
+  const text = raw.trim();
+  if (text.length === 0) {
+    throw new Error('guidance text must be a non-empty string');
+  }
+  if (text.length > MAX_GUIDANCE) {
+    throw new Error(`guidance text must be at most ${MAX_GUIDANCE} characters`);
+  }
+
+  const notes = session.guidance;
+  const seq =
+    notes.reduce((max, note) => Math.max(max, Number(note.seq) || 0), 0) + 1;
+  const lastAt = notes.length ? Number(notes[notes.length - 1].createdAt) || 0 : 0;
+  notes.push({
+    seq,
+    text,
+    // Immutable markers: later stages and rounds never rewrite them.
+    stage: session.stage,
+    round: session.round,
+    source: 'user',
+    createdAt: Math.max(Date.now(), lastAt + 1),
+    // Bookkeeping only: filled with the tasks this condition was appended to.
+    deliveredTo: [],
+  });
 }
 
 function requireCurrentTask(session, taskId) {
@@ -600,13 +669,53 @@ function finalize(session, reason) {
 // ---------------------------------------------------------------------------
 
 function makeTask(session, stage, round, provider, prompt) {
-  return {
-    id: `${session.id}:r${round}:${stage}:${provider}`,
+  const id = `${session.id}:r${round}:${stage}:${provider}`;
+  // Guidance exists only from the moment it was saved: applying it here means
+  // every task built afterwards carries it, while prompts already pending or
+  // archived keep the exact text they were issued with.
+  const notes =
+    GUIDANCE_TASK_STAGES.has(stage) && Array.isArray(session.guidance)
+      ? session.guidance.slice()
+      : [];
+
+  const task = {
+    id,
     provider,
-    prompt,
+    prompt: notes.length > 0 ? appendGuidance(prompt, notes) : prompt,
     status: 'pending',
     sourceId: allocateSourceId(session),
   };
+
+  if (notes.length > 0) {
+    task.guidanceSeqs = notes.map((note) => note.seq);
+    for (const note of notes) {
+      const delivered = Array.isArray(note.deliveredTo) ? note.deliveredTo : [];
+      if (!delivered.includes(id)) delivered.push(id);
+      note.deliveredTo = delivered;
+    }
+  }
+
+  return task;
+}
+
+function appendGuidance(prompt, notes) {
+  const lines = [
+    '【用户补充条件】',
+    '用户在讨论中追加了以下条件，必须作为判断输入考虑；这些是用户陈述，未经事实核验，也不代表其他席位已经接受。',
+  ];
+  for (const note of notes) {
+    lines.push(
+      `- #${note.seq}（${STAGE_LABELS[note.stage] ?? note.stage}第${note.round}轮提出）：${note.text}`,
+    );
+  }
+  lines.push('如果其中某条改变了你的主张，请写明是第几条、改变了什么。');
+  const block = lines.join('\n');
+
+  // Keep the prompt's own opening (original question) and closing instructions
+  // intact; the condition sits right after the question it qualifies.
+  const split = prompt.indexOf('\n\n');
+  if (split === -1) return `${prompt}\n\n${block}`;
+  return `${prompt.slice(0, split + 2)}${block}\n\n${prompt.slice(split + 2)}`;
 }
 
 function allocateSourceId(session) {
@@ -1016,6 +1125,22 @@ function buildReport(session, reason) {
   }
   lines.push('');
 
+  const guidance = orderedGuidance(session);
+  if (guidance.length > 0) {
+    lines.push('## 用户补充条件', '');
+    lines.push(
+      '以下为用户在讨论暂停时追加的条件，按提出顺序保存，原文照录。它们是用户输入，未经事实核验，也不代表模型或证据已经确认。',
+      '',
+    );
+    for (const note of guidance) {
+      lines.push(
+        `- 补充 #${note.seq} · ${formatGuidanceTime(note.createdAt)} · ${STAGE_LABELS[note.stage] ?? note.stage}第${note.round}轮提出：${note.text}`,
+      );
+      lines.push(`  - 随新任务发出：${guidanceDelivery(session, note)}`);
+    }
+    lines.push('');
+  }
+
   if (proposal) {
     lines.push(
       '## 建议回答',
@@ -1207,6 +1332,42 @@ function buildReport(session, reason) {
   );
 
   return lines.join('\n');
+}
+
+function orderedGuidance(session) {
+  const notes = Array.isArray(session.guidance) ? session.guidance : [];
+  return notes
+    .slice()
+    .sort(
+      (left, right) =>
+        (Number(left.seq) || 0) - (Number(right.seq) || 0) ||
+        (Number(left.createdAt) || 0) -
+        (Number(right.createdAt) || 0),
+    );
+}
+
+/** Name the exact newly issued tasks that carried this condition. */
+function guidanceDelivery(session, note) {
+  const ids = Array.isArray(note.deliveredTo) ? note.deliveredTo : [];
+  const labels = [];
+  for (const id of ids) {
+    const task =
+      session.tasks.find((candidate) => candidate.id === id) ||
+      session.history.find((candidate) => candidate.id === id);
+    if (!task) continue;
+    const label = `${STAGE_LABELS[task.stage] ?? task.stage}（第${task.round}轮）· ${task.provider}`;
+    if (!labels.includes(label)) labels.push(label);
+  }
+  return labels.length > 0 ? labels.join('；') : '尚未随新任务发出';
+}
+
+function formatGuidanceTime(at) {
+  const date = new Date(Number(at) || 0);
+  if (Number.isNaN(date.getTime())) return '时间未知';
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
+    date.getDate(),
+  )} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
 function pendingSeatLabels(pending) {

@@ -25,12 +25,12 @@ export const PROVIDERS = Object.freeze({
   // 连接设置 (automation.config), never a blank localhost:80 guess.
   'local-a': {
     name: '本机 A',
-    url: 'http://127.0.0.1:8765/web-driver-fixture.html?seat=A',
+    url: 'http://127.0.0.1:8877/web-driver-fixture.html?seat=A',
     note: '本机网页自动驱动（需在连接设置保存实际地址）',
   },
   'local-b': {
     name: '本机 B',
-    url: 'http://127.0.0.1:8765/web-driver-fixture.html?seat=B',
+    url: 'http://127.0.0.1:8877/web-driver-fixture.html?seat=B',
     note: '本机网页自动驱动（需在连接设置保存实际地址）',
   },
 });

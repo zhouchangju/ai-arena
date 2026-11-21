@@ -814,6 +814,20 @@ function normalizeHistoryEntry(raw, fallbackIndex = 0) {
   };
 }
 
+/* 用户补充的判断条件由后台保存，工作台只做只读展示。 */
+function normalizeGuidance(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((item) => item && typeof item === 'object')
+    .map((item) => ({
+      text: typeof item.text === 'string' ? item.text : '',
+      stage: typeof item.stage === 'string' ? item.stage : '',
+      round: Number.isFinite(Number(item.round)) ? Number(item.round) : 1,
+      createdAt: Number.isFinite(Number(item.createdAt)) ? Number(item.createdAt) : 0,
+    }))
+    .filter((item) => item.text.trim());
+}
+
 function normalizeSession(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const id = String(raw.id || '').trim();
@@ -827,6 +841,7 @@ function normalizeSession(raw) {
     paused: Boolean(raw.paused),
     tasks: Array.isArray(raw.tasks) ? raw.tasks.map(normalizeTask).filter(Boolean) : [],
     history: Array.isArray(raw.history) ? raw.history.map(normalizeHistoryEntry).filter(Boolean) : [],
+    guidance: normalizeGuidance(raw.guidance),
     report: typeof raw.report === 'string' ? raw.report : '',
     updatedAt: Number.isFinite(Number(raw.updatedAt)) ? Number(raw.updatedAt) : Date.now(),
   };
@@ -1815,6 +1830,9 @@ function renderSession() {
     wrap.append(renderPauseBanner(session));
   }
 
+  const guidancePanel = renderGuidance(session);
+  if (guidancePanel) wrap.append(guidancePanel);
+
   if (session.stage === 'done') {
     wrap.append(renderReport(session));
   } else {
@@ -2040,6 +2058,123 @@ function renderPauseBanner(session) {
     button);
 }
 
+/* 暂停时补充的判断条件：只在独立作答与交叉质询两段出现。它只写入后台
+ * 记录，供之后新建的任务使用；不修改当前提示，也不触发任何发送。 */
+function guidanceStageLabel(stage) {
+  return stage ? stageInfo(stage).label : '未注明阶段';
+}
+
+function renderGuidance(session) {
+  const entries = Array.isArray(session.guidance) ? session.guidance : [];
+  const canAdd = session.paused && (session.stage === 'independent' || session.stage === 'critique');
+  if (!entries.length && !canAdd) return null;
+
+  const countEl = h('span', {
+    class: 'guide-count',
+    text: entries.length ? `${entries.length} 条已保存` : '',
+  });
+
+  const section = h('section', {
+    class: 'guide-panel',
+    attrs: { 'aria-labelledby': 'guide-title' },
+  },
+    h('div', { class: 'guide-head' },
+      h('h2', { class: 'guide-title', id: 'guide-title', text: '补充判断条件' }),
+      countEl),
+    h('p', {
+      class: 'guide-note',
+      id: 'guide-note',
+      text: '只用于之后新建的任务，不会改动当前提示，也不会自动发送；已保存的条件随本场记录保留。',
+    }));
+
+  if (entries.length) {
+    const list = h('ol', { class: 'guide-list', attrs: { 'aria-label': '已保存的判断条件' } });
+    for (const entry of entries) {
+      list.append(h('li', { class: 'guide-item' },
+        h('p', { class: 'guide-text', text: entry.text }),
+        h('p', {
+          class: 'guide-meta',
+          text: `${guidanceStageLabel(entry.stage)} · 第 ${entry.round} 轮`,
+        })));
+    }
+    section.append(list);
+  }
+
+  if (canAdd) {
+    const input = h('textarea', {
+      class: 'guide-input',
+      rows: 2,
+      value: '',
+      spellcheck: false,
+      autocomplete: 'off',
+      id: 'guide-input',
+      dataset: { focusKey: 'guide' },
+      placeholder: '例如：预算上限是两万元；没有实测数据时不要给确定结论。',
+      attrs: { 'aria-describedby': 'guide-note' },
+    });
+    const errorEl = h('div', { class: 'task-error', role: 'alert', hidden: true });
+    const saveButton = h('button', {
+      class: 'btn btn-small btn-strong',
+      type: 'button',
+      text: '保存条件',
+      title: '保存到本场记录，供之后新建的任务使用',
+    });
+    saveButton.addEventListener('click', () => {
+      void saveGuidance(session, input, saveButton, errorEl);
+    });
+    input.addEventListener('keydown', (event) => {
+      if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+        event.preventDefault();
+        void saveGuidance(session, input, saveButton, errorEl);
+      }
+    });
+
+    section.append(h('div', { class: 'guide-form' },
+      h('label', { class: 'field-label', for: 'guide-input', text: '要补充的条件' }),
+      input,
+      h('div', { class: 'guide-actions' }, saveButton),
+      errorEl));
+  }
+
+  return section;
+}
+
+async function saveGuidance(session, textarea, button, errorEl) {
+  const text = textarea.value.trim();
+  const fail = (message) => {
+    errorEl.textContent = message;
+    errorEl.hidden = false;
+    textarea.focus();
+  };
+  if (!text) {
+    fail('先写下要补充的条件。');
+    return;
+  }
+  if (button.disabled) return;
+
+  button.disabled = true;
+  button.textContent = '保存中…';
+  errorEl.hidden = true;
+  try {
+    const raw = await actSession('guide', { text });
+    const next = normalizeSession(raw);
+    if (!next) throw new Error('后台返回的场次数据不完整。');
+    commitSession(next);
+    toast('条件已保存：只用于之后新建的任务');
+  } catch (error) {
+    if (button.isConnected) {
+      button.disabled = false;
+      button.textContent = '保存条件';
+    }
+    const message = friendlyError(error, '保存失败');
+    if (errorEl.isConnected) {
+      errorEl.textContent = message;
+      errorEl.hidden = false;
+    }
+    toast(message, 'error');
+  }
+}
+
 function renderStage(session) {
   const info = stageInfo(session.stage);
   const tasks = session.tasks;
@@ -2142,6 +2277,18 @@ function renderTaskCard(session, task, fallbackIndex) {
   card.append(header, renderPromptBox(task));
 
   const actions = h('div', { class: 'task-actions' });
+
+  if (task.status === 'pending' && seatOperatesManually(session, providerId)) {
+    actions.append(h('button', {
+      class: 'btn btn-small btn-accent',
+      type: 'button',
+      text: '复制提示并打开原页',
+      title: '一次点击：复制本轮提示并切到这一席的原页；已绑定的原页会复用当前标签',
+      dataset: { taskId: task.id },
+      onClick: (event) => copyPromptAndOpen(session, task, event.currentTarget),
+    }));
+  }
+
   actions.append(
     h('button', {
       class: 'btn btn-small',
@@ -2533,6 +2680,66 @@ async function copyPrompt(task) {
   } catch (error) {
     toast(friendlyError(error, '复制失败'), 'error');
   }
+}
+
+/* 自动驱动没有接管时，这一席仍需手动中转。 */
+function seatOperatesManually(session, providerId) {
+  if (!isAutomationSeat(providerId)) return true;
+  const run = automationRun(session);
+  if (!run || !run.enabled) return true;
+  const seat = automationSeatState(run, providerId);
+  if (automationSeatNeedsAction(seat)) return true;
+  return Boolean(seat && seat.status === 'detached');
+}
+
+/* 一次点击完成复制和打开原页。复制失败时绝不声称已复制；两边分开报告，
+ * 保留「复制提示」「打开原站」作为各自独立的退路。 */
+async function copyPromptAndOpen(session, task, button) {
+  if (!session || !task) return;
+  if (button && button.disabled) return;
+  const prompt = typeof task.prompt === 'string' ? task.prompt : '';
+  if (!prompt.trim()) {
+    toast('这一席的提示原文为空，无法复制。', 'error');
+    return;
+  }
+
+  const original = button ? button.textContent : '';
+  if (button) {
+    button.disabled = true;
+    button.textContent = '复制并打开…';
+  }
+
+  let copyError = null;
+  let openError = null;
+  try {
+    await copyText(prompt);
+  } catch (error) {
+    copyError = error;
+  }
+  try {
+    await callBackground({ type: 'open', id: session.id, provider: task.provider });
+  } catch (error) {
+    openError = error;
+  }
+
+  if (button && button.isConnected) {
+    button.disabled = false;
+    button.textContent = original;
+  }
+
+  if (!copyError && !openError) {
+    toast('已复制提示并切到原页');
+    return;
+  }
+  if (!copyError) {
+    toast(friendlyError(openError, '提示已复制，但打开原页失败；可用「打开原站」重试'), 'error');
+    return;
+  }
+  if (!openError) {
+    toast(friendlyError(copyError, '未能复制提示，原页已打开；请回来点「复制提示」重试'), 'error');
+    return;
+  }
+  toast(friendlyError(copyError, '复制与打开都失败'), 'error');
 }
 
 async function openProviderSite(session, task, button) {

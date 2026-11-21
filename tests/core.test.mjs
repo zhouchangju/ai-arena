@@ -421,6 +421,207 @@ test('an early finish names the outstanding seat and stage, never implying nobod
 });
 
 // ---------------------------------------------------------------------------
+// Paused user guidance
+// ---------------------------------------------------------------------------
+
+test('guidance added while paused reaches only newly issued prompts', () => {
+  const GUIDE =
+    'GUIDE_WEEKEND_LIMIT 只有两个周末能验证采集频次时才做移动端，否则先补桌面检索。';
+  const initial = start();
+  const openingPrompts = new Map(
+    initial.tasks.map((task) => [task.provider, task.prompt]),
+  );
+  assert.equal(openingPrompts.get('chatgpt'), openingPrompts.get('claude'));
+
+  let session = answerFor(initial, 'chatgpt', 'A_FIRST 先做移动端。');
+  assert.equal(session.stage, 'independent');
+  const bTaskBefore = pendingTask(session, 'claude');
+  const aTaskBefore = session.tasks.find((task) => task.provider === 'chatgpt');
+
+  // A running round cannot be changed.
+  assert.throws(
+    () => applyAction(session, 'guide', { text: GUIDE }),
+    /pause the discussion/,
+  );
+
+  session = applyAction(session, 'pause');
+  const guided = applyAction(session, 'guide', { text: `  ${GUIDE}  ` });
+
+  assert.equal(guided.guidance.length, 1);
+  const [note] = guided.guidance;
+  assert.equal(note.seq, 1);
+  assert.equal(note.text, GUIDE);
+  assert.equal(note.stage, 'independent');
+  assert.equal(note.round, 1);
+  assert.equal(note.source, 'user');
+  assert.equal(typeof note.createdAt, 'number');
+
+  // Existing prompts are never rewritten: not the answered A task and not the
+  // still-pending B task.
+  assert.equal(
+    guided.tasks.find((task) => task.provider === 'claude').prompt,
+    bTaskBefore.prompt,
+  );
+  assert.equal(
+    guided.tasks.find((task) => task.provider === 'chatgpt').prompt,
+    aTaskBefore.prompt,
+  );
+  assert.equal(guided.stage, 'independent');
+  assert.equal(guided.tasks.filter((task) => task.status === 'pending').length, 1);
+
+  session = applyAction(guided, 'resume');
+  assert.equal(session.paused, false);
+  assert.equal(session.stage, 'independent');
+  session = answerFor(session, 'claude', 'B_FIRST 先补桌面检索。');
+
+  // The next newly issued stage is critique: both seats receive the condition.
+  assert.equal(session.stage, 'critique');
+  assert.equal(session.tasks.length, 2);
+  for (const task of session.tasks) {
+    assert.ok(task.prompt.includes(GUIDE));
+    assert.deepEqual(task.guidanceSeqs, [1]);
+  }
+  assert.deepEqual(
+    session.guidance[0].deliveredTo.slice().sort(),
+    session.tasks.map((task) => task.id).sort(),
+  );
+
+  // Immutable markers and the full original independent history survive.
+  assert.equal(session.guidance[0].stage, note.stage);
+  assert.equal(session.guidance[0].round, note.round);
+  assert.equal(session.guidance[0].source, note.source);
+  assert.equal(session.guidance[0].createdAt, note.createdAt);
+  assert.equal(session.history.length, 2);
+  for (const provider of PROVIDERS) {
+    const entry = session.history.find(
+      (task) => task.stage === 'independent' && task.provider === provider,
+    );
+    assert.equal(entry.prompt, openingPrompts.get(provider));
+    assert.equal(entry.status, 'answered');
+  }
+  assert.equal(
+    session.history.find((task) => task.provider === 'chatgpt').answer,
+    'A_FIRST 先做移动端。',
+  );
+  assert.equal(
+    session.history.find((task) => task.provider === 'claude').answer,
+    'B_FIRST 先补桌面检索。',
+  );
+
+  // A partial report keeps the dated supplement and names the tasks it reached.
+  session = applyAction(session, 'finish');
+  assert.equal(session.stopReason, 'user-finished');
+  assert.match(session.report, /## 用户补充条件/);
+  assert.match(session.report, /独立作答第1轮提出：GUIDE_WEEKEND_LIMIT/);
+  assert.match(
+    session.report,
+    /随新任务发出：质询（第1轮）· chatgpt；质询（第1轮）· claude/,
+  );
+});
+
+test('guidance is rejected outside independent/critique and never enters vote prompts', () => {
+  let session = start();
+  session = answerFor(session, 'chatgpt', 'A_INDEPENDENT');
+  session = answerFor(session, 'claude', 'B_INDEPENDENT');
+  assert.equal(session.stage, 'critique');
+  const critiquePromptsBefore = session.tasks.map((task) => task.prompt);
+
+  session = applyAction(session, 'pause');
+  session = applyAction(session, 'guide', {
+    text: 'GUIDE_CRITIQUE 先验证两周内的采集频次，再决定是否做完整移动端。',
+  });
+  session = applyAction(session, 'resume');
+
+  // The condition does not rewrite critique prompts that were already issued.
+  assert.deepEqual(
+    session.tasks.map((task) => task.prompt),
+    critiquePromptsBefore,
+  );
+
+  session = answerFor(session, 'chatgpt', 'C_CRITIQUE [S2]');
+  session = answerFor(session, 'claude', 'D_CRITIQUE [S1]');
+  assert.equal(session.stage, 'proposal');
+  assert.ok(session.tasks[0].prompt.includes('GUIDE_CRITIQUE'));
+
+  // Once a candidate exists, the condition is closed for input.
+  assert.throws(
+    () => applyAction(session, 'guide', { text: 'LATE_CONDITION' }),
+    /not accepted in the proposal stage/,
+  );
+
+  session = answerFor(session, 'chatgpt', 'CANDIDATE_GUIDED [S1][S2]');
+  assert.equal(session.stage, 'vote');
+  for (const task of session.tasks) {
+    assert.doesNotMatch(task.prompt, /GUIDE_CRITIQUE/);
+  }
+  assert.throws(
+    () => applyAction(session, 'guide', { text: 'LATE_CONDITION' }),
+    /not accepted in the vote stage/,
+  );
+
+  session = voteAll(
+    session,
+    { chatgpt: 'agree', claude: 'agree' },
+    { chatgpt: 'VOTE_A 同意。', claude: 'VOTE_B 同意。' },
+  );
+  assert.equal(session.stage, 'done');
+  assert.throws(
+    () => applyAction(session, 'guide', { text: 'LATE_CONDITION' }),
+    /not accepted in the done stage/,
+  );
+
+  // The report keeps the user supplement dated, ordered and explicitly
+  // unverified, and names the tasks that actually carried it.
+  assert.match(session.report, /## 用户补充条件/);
+  assert.match(session.report, /补充 #1 · \d{4}-\d{2}-\d{2} \d{2}:\d{2}/);
+  assert.match(session.report, /质询第1轮提出：GUIDE_CRITIQUE/);
+  assert.match(session.report, /未经事实核验/);
+  assert.match(
+    session.report,
+    /随新任务发出：候选结论（第1轮）· chatgpt/,
+  );
+  for (const vote of session.history.filter((task) => task.stage === 'vote')) {
+    assert.doesNotMatch(vote.prompt, /GUIDE_CRITIQUE/);
+  }
+});
+
+test('guidance input is trimmed and bounded to 2000 characters', () => {
+  let session = applyAction(start(), 'pause');
+
+  assert.throws(
+    () => applyAction(session, 'guide', { text: '   ' }),
+    /non-empty/,
+  );
+  assert.throws(
+    () => applyAction(session, 'guide', { text: 42 }),
+    /must be a string/,
+  );
+  assert.throws(
+    () => applyAction(session, 'guide', { text: 'x'.repeat(2001) }),
+    /at most 2000/,
+  );
+
+  session = applyAction(session, 'guide', { text: 'x'.repeat(2000) });
+  assert.equal(session.guidance[0].text.length, 2000);
+});
+
+test('sessions saved before guidance existed are treated as having none', () => {
+  const legacy = JSON.parse(JSON.stringify(start()));
+  delete legacy.guidance;
+
+  const normalized = answerFor(legacy, 'chatgpt', 'LEGACY_A');
+  assert.deepEqual(normalized.guidance, []);
+
+  const pausedLegacy = JSON.parse(JSON.stringify(start()));
+  delete pausedLegacy.guidance;
+  pausedLegacy.paused = true;
+  const guided = applyAction(pausedLegacy, 'guide', { text: 'LEGACY_GUIDE' });
+  assert.equal(guided.guidance.length, 1);
+  assert.equal(guided.guidance[0].seq, 1);
+  assert.equal(guided.guidance[0].text, 'LEGACY_GUIDE');
+});
+
+// ---------------------------------------------------------------------------
 // Vote stage
 // ---------------------------------------------------------------------------
 

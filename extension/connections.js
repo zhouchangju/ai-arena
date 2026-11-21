@@ -27,7 +27,7 @@ const FIELD_LABELS = {
   done: '完成标记',
 };
 
-const SAMPLE_BASE = 'http://127.0.0.1:8765/web-driver-fixture.html';
+const SAMPLE_BASE = 'http://127.0.0.1:8877/web-driver-fixture.html';
 const SAMPLE_SELECTORS = {
   input: '#composer',
   send: '#send',
@@ -267,7 +267,7 @@ function parseLocalUrl(raw) {
   try {
     url = new URL(text);
   } catch {
-    return { error: '网页地址格式不正确，应形如 http://127.0.0.1:8765/。', field: 'url' };
+    return { error: '网页地址格式不正确，应形如 http://127.0.0.1:8877/。', field: 'url' };
   }
 
   if (url.protocol !== 'http:') {

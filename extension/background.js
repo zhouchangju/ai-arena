@@ -6,7 +6,7 @@
 //   sendMessage({ type: 'create', question, providers: [idA, idB] })
 //   sendMessage({ type: 'act', id, action, payload })
 //      actions: 'answer' {taskId, text, stance?, version?, stage?, round?}
-//               'skip' {taskId} | 'pause' | 'resume' | 'finish'
+//               'skip' {taskId} | 'guide' {text} | 'pause' | 'resume' | 'finish'
 //   sendMessage({ type: 'delete', id })
 //   sendMessage({ type: 'open', id, provider })
 //   → { ok: true, sessions? | session? } or { ok: false, error }
@@ -48,10 +48,11 @@ import {
 const AUTOMATION_SEATS = new Set(AUTOMATION_PROVIDER_IDS);
 const STANCES = new Set(['agree', 'conditional', 'oppose']);
 const COMMAND_TYPES = new Set(['list', 'get', 'create', 'act', 'delete', 'open']);
-const ACTIONS = new Set(['answer', 'skip', 'pause', 'resume', 'finish']);
+const ACTIONS = new Set(['answer', 'skip', 'guide', 'pause', 'resume', 'finish']);
 
 const MAX_QUESTION = 8000;
 const MAX_ANSWER = 200000;
+const MAX_GUIDANCE = 2000;
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,200}$/;
 
 // ---------------------------------------------------------------------------
@@ -167,6 +168,18 @@ function normalizeActPayload(action, raw) {
     return { taskId: requireTaskId(payload.taskId) };
   }
 
+  // A user condition is stored trimmed; core.js records where and when it was
+  // added and appends it only to prompts constructed afterwards.
+  if (action === 'guide') {
+    if (typeof payload.text !== 'string') throw new ArenaError('text 必须是文本');
+    const text = payload.text.trim();
+    if (!text) throw new ArenaError('补充条件不能为空');
+    if (text.length > MAX_GUIDANCE) {
+      throw new ArenaError(`补充条件超过 ${MAX_GUIDANCE} 字符上限`);
+    }
+    return { text };
+  }
+
   return {};
 }
 
@@ -184,6 +197,10 @@ function assertCoreSession(value) {
   }
   if (!Array.isArray(value.providers) || !Array.isArray(value.tasks) || !Array.isArray(value.history)) {
     throw new ArenaError('核心引擎返回的会话结构不完整');
+  }
+  // Older stored sessions have no guidance field; only a wrong type is fatal.
+  if (value.guidance !== undefined && !Array.isArray(value.guidance)) {
+    throw new ArenaError('核心引擎返回的补充条件结构不完整');
   }
   if (typeof value.stage !== 'string') {
     throw new ArenaError('核心引擎返回的会话缺少阶段');
@@ -808,23 +825,142 @@ if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage)
   });
 }
 
-if (typeof chrome !== 'undefined' && chrome.action && chrome.action.onClicked) {
-  chrome.action.onClicked.addListener(() => {
+// ---------------------------------------------------------------------------
+// Toolbar entry: one workspace tab, never a second copy
+// ---------------------------------------------------------------------------
+
+const WORKSPACE_PAGE = 'workspace.html';
+
+/**
+ * True only for this extension's own workspace page. The path must match
+ * exactly, so `workspace.html.evil`, another extension's page or a provider
+ * tab that merely mentions the name never counts as the workspace.
+ */
+function isWorkspaceTabUrl(url, baseUrl) {
+  if (typeof url !== 'string' || !url || typeof baseUrl !== 'string' || !baseUrl) return false;
+  let target;
+  let base;
+  try {
+    target = new URL(url);
+    base = new URL(baseUrl);
+  } catch {
+    return false;
+  }
+  if (target.protocol !== base.protocol || target.host !== base.host) return false;
+  return target.pathname === base.pathname;
+}
+
+/**
+ * The tab's destination URL decides: a tab that is loading the workspace is
+ * reusable, one that is leaving it (pendingUrl points elsewhere) is not.
+ */
+function workspaceTabUrl(tab) {
+  return tabEntryUrl(tab);
+}
+
+/**
+ * Query only this extension's own workspace page. The URL filter is applied by
+ * the browser, so no other tab's address is even read back; the strict URL check
+ * afterwards rejects anything the pattern still let through. The focused window
+ * is asked first, so a workspace open in the window the user clicked in wins
+ * over one in a background window; if that window has none, all windows are
+ * searched rather than opening a duplicate.
+ */
+async function queryWorkspaceTabs(tabsApi, baseUrl) {
+  const pattern = `${baseUrl}*`;
+  const found = new Map();
+  for (const filter of [{ url: pattern, lastFocusedWindow: true }, { url: pattern }]) {
+    let tabs;
     try {
-      const result = chrome.tabs.create({ url: chrome.runtime.getURL('workspace.html') });
-      if (result && typeof result.catch === 'function') result.catch(() => {});
+      tabs = await tabsApi.query(filter);
     } catch {
-      /* opening the workspace is a convenience, not state */
+      // No filtered query (older browser): report nothing instead of reading
+      // every tab's address. The click then opens one tab, as it did before.
+      continue;
     }
+    for (const tab of Array.isArray(tabs) ? tabs : []) {
+      if (tab && Number.isInteger(tab.id) && isWorkspaceTabUrl(workspaceTabUrl(tab), baseUrl)) {
+        found.set(tab.id, tab);
+      }
+    }
+    if (found.size) break;
+  }
+  return [...found.values()];
+}
+
+/**
+ * Prefer the workspace the user is looking at, then the most recently used one,
+ * so several open workspaces still produce one deterministic tab to focus.
+ */
+function pickWorkspaceTab(tabs, baseUrl) {
+  const usable = (Array.isArray(tabs) ? tabs : []).filter(
+    (tab) => tab && Number.isInteger(tab.id) && isWorkspaceTabUrl(workspaceTabUrl(tab), baseUrl),
+  );
+  if (!usable.length) return null;
+  const active = usable.filter((tab) => tab.active === true);
+  const pool = active.length ? active : usable;
+  return pool.reduce((best, tab) => (
+    (Number(tab.lastAccessed) || 0) > (Number(best.lastAccessed) || 0) ? tab : best
+  ), pool[0]);
+}
+
+async function openWorkspaceTabOnce({ tabs = chrome.tabs, windows = chrome.windows } = {}) {
+  const baseUrl = chrome.runtime.getURL(WORKSPACE_PAGE);
+  const existing = pickWorkspaceTab(await queryWorkspaceTabs(tabs, baseUrl), baseUrl);
+  if (existing) {
+    try {
+      // Activating keeps the tab's URL, `#s=<session>` route and in-memory draft
+      // untouched: nothing here navigates, reloads or rewrites the hash.
+      await focusTab(existing, tabs, windows);
+      return { tabId: existing.id, created: false };
+    } catch {
+      // Closed or replaced between the query and the focus: open a fresh tab.
+    }
+  }
+  const created = await tabs.create({ url: baseUrl, active: true });
+  if (!created || !Number.isInteger(created.id)) throw new ArenaError('无法打开工作台标签');
+  return { tabId: created.id, created: true };
+}
+
+/**
+ * Two clicks before the first tab exists join one attempt, so a slow open can
+ * not produce two workspaces. After a worker restart this map is empty again and
+ * the filtered query alone prevents the duplicate.
+ */
+let pendingWorkspaceOpen = null;
+
+function openWorkspaceTab(overrides = {}) {
+  if (pendingWorkspaceOpen) return pendingWorkspaceOpen;
+  const attempt = openWorkspaceTabOnce(overrides);
+  pendingWorkspaceOpen = attempt;
+  return attempt.finally(() => {
+    if (pendingWorkspaceOpen === attempt) pendingWorkspaceOpen = null;
   });
 }
 
-// Test surface for tests/tab-reuse.mjs. A service worker ignores exports; the
-// real wiring above is unchanged.
+async function handleWorkspaceClick() {
+  try {
+    await openWorkspaceTab();
+  } catch {
+    /* opening the workspace is a convenience, not state */
+  }
+}
+
+if (typeof chrome !== 'undefined' && chrome.action && chrome.action.onClicked) {
+  chrome.action.onClicked.addListener(() => {
+    void handleWorkspaceClick();
+  });
+}
+
+// Test surface for tests/tab-reuse.mjs and tests/workspace-entry.mjs. A service
+// worker ignores exports; the real wiring above is unchanged.
 export {
   openProviderTab,
   tabMatchesEntry,
   tabEntryUrl,
   sameOrigin,
   seatOf,
+  openWorkspaceTab,
+  pickWorkspaceTab,
+  isWorkspaceTabUrl,
 };
