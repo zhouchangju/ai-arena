@@ -496,24 +496,54 @@ class WorkspaceUI:
                     return candidate
         raise AcceptanceError("Entry form: no start/create button is visible")
 
-    def create_debate(self, question: str, provider_ids: list[str]) -> str:
+    def selection_snapshot(self) -> dict[str, Any]:
+        """Read the compact seat picker's real state, not its marketing copy."""
+        return self.page.evaluate(
+            """() => {
+              const buttons = Array.from(document.querySelectorAll('button.provider-option'));
+              const counter = document.querySelector('.selection-count');
+              return {
+                count: buttons.length,
+                ids: buttons.map((button) => button.dataset.providerId || ''),
+                pressed: buttons
+                  .filter((button) => button.getAttribute('aria-pressed') === 'true')
+                  .map((button) => button.dataset.providerId || ''),
+                labels: buttons.map((button) => ((button.querySelector('.provider-name') || {}).textContent || '').trim()),
+                counter: ((counter || {}).textContent || '').trim(),
+              };
+            }"""
+        )
+
+    def create_debate(self, question: str, provider_ids: list[str]) -> tuple[str, dict[str, Any]]:
         self.set_question(question)
         for provider_id in provider_ids:
             provider = self.by_id.get(provider_id, Provider(provider_id, provider_id))
             self.select_provider(provider)
-            # Selection styling is implementation-defined; do not fail here.
-            # The created session's providers list is the authoritative check.
-            try:
-                wait_until(
-                    lambda provider=provider: self.provider_is_selected(provider),
-                    f"provider {provider_id} selection indicator",
-                    timeout=1.5,
-                )
-            except AcceptanceError:
-                pass
 
-        # A selection indicator may live on the card, not the hidden input, so
-        # the authoritative check is the created session's providers list.
+        selected = self.selection_snapshot()
+        if selected["pressed"] != provider_ids:
+            raise AcceptanceError(
+                f"Entry form pressed seats {selected['pressed']!r}, expected {provider_ids!r}"
+            )
+        if "2 / 2" not in selected["counter"]:
+            raise AcceptanceError(
+                f"Selection counter did not reach two seats: {selected['counter']!r}"
+            )
+
+        # A third seat must be refused instead of silently replacing one.
+        extra_pid = next((pid for pid in self.by_id if pid not in provider_ids), None)
+        extra_state = selected
+        extra_error = ""
+        if extra_pid is not None:
+            self.select_provider(self.by_id[extra_pid])
+            extra_state = self.selection_snapshot()
+            banner = first_visible(self.page, [".inline-error", "[role='alert']"])
+            extra_error = (banner.inner_text(timeout=1500) if banner is not None else "").strip()
+            if extra_state["pressed"] != provider_ids:
+                raise AcceptanceError(
+                    f"A third seat changed the selection: {extra_state['pressed']!r}"
+                )
+
         self.start_button().click()
         reply = wait_until(
             lambda: self._try_list_for_new_question(question),
@@ -528,7 +558,12 @@ class WorkspaceUI:
             )
         if session.get("question") != question:
             raise AcceptanceError("Created session question differs from the question entered in the UI")
-        return session_id
+        return session_id, {
+            "selected": selected,
+            "extra_provider": extra_pid,
+            "after_extra": extra_state,
+            "extra_error": extra_error,
+        }
 
     def _try_list_for_new_question(self, question: str) -> Optional[str]:
         try:
@@ -709,11 +744,24 @@ class WorkspaceUI:
             "conditional": ("conditional", "有条件", "附条件", "条件同意"),
             "oppose": ("oppose", "反对", "不接受", "不同意"),
         }[stance]
-        # Radios / buttons with explicit values.
+        # Compact vote UI: a real pressed button. The state must actually change.
+        for value in labels:
+            for selector in (f"button.stance-btn[data-stance='{value}']", f"[data-stance='{value}']"):
+                locator = card.locator(selector)
+                for index in range(min(locator.count(), 4)):
+                    button = locator.nth(index)
+                    try:
+                        if not button.is_visible() or not button.is_enabled():
+                            continue
+                        button.click(timeout=2000)
+                        if button.get_attribute("aria-pressed") == "true":
+                            return
+                    except PlaywrightError:
+                        continue
+        # Radios with explicit values.
         for value in labels:
             for selector in (
                 f"input[type='radio'][value='{value}']",
-                f"[data-stance='{value}']",
                 f"button[value='{value}']",
             ):
                 locator = card.locator(selector)
@@ -874,6 +922,35 @@ class WorkspaceUI:
                 continue
         return None
 
+    def joined_vote(self) -> Optional[dict[str, Any]]:
+        """Read the done view's joined per-seat vote block."""
+        return self.page.evaluate(
+            """() => {
+              const wrap = document.querySelector('.stance-summary');
+              if (!wrap) return null;
+              const rows = Array.from(wrap.querySelectorAll('.stance-row')).map((row) => ({
+                name: ((row.querySelector('.stance-name') || {}).textContent || '').trim(),
+                stance: ((row.querySelector('.stance-chip') || {}).textContent || '').trim(),
+                reason: ((row.querySelector('.stance-reason') || {}).textContent || '').trim(),
+              }));
+              return {
+                title: ((wrap.querySelector('.stance-title') || {}).textContent || '').trim(),
+                rule: ((wrap.querySelector('.stance-rule') || {}).textContent || '').trim(),
+                rows,
+              };
+            }"""
+        )
+
+    def capture_joined_vote(self, out_dir: Path) -> Path:
+        element = self.page.locator(".stance-summary")
+        if not element.count():
+            raise AcceptanceError("Done view has no joined vote block")
+        element.first.scroll_into_view_if_needed()
+        path = out_dir / "07b_joined_vote.png"
+        element.first.screenshot(path=str(path))
+        log(f"  screenshot: {path}")
+        return path
+
     def export_markdown(self, out_dir: Path) -> tuple[Path, str]:
         button = None
         for pattern in (r"导出", r"下载", r"Markdown", r"Export"):
@@ -939,10 +1016,10 @@ class WorkspaceUI:
         wait_until(lambda: question[:32] in self.body_text(), "history session to render", timeout=6.0)
 
 
-def screenshot(page: Page, out_dir: Path, name: str) -> Path:
+def screenshot(page: Page, out_dir: Path, name: str, full_page: bool = True) -> Path:
     path = out_dir / f"{name}.png"
     try:
-        page.screenshot(path=str(path), full_page=True)
+        page.screenshot(path=str(path), full_page=full_page)
     except PlaywrightError:
         page.screenshot(path=str(path))
     log(f"  screenshot: {path}")
@@ -1051,6 +1128,23 @@ def run_ui_flow(
 ) -> dict[str, Any]:
     log("\n[2/8] Initial workspace and entry form")
     wait_until(lambda: page.locator("body").inner_text(timeout=3000).strip(), "workspace to render", timeout=10.0)
+    question_field = ui.question_input()
+    question_value = (
+        question_field.input_value()
+        if question_field.evaluate("el => 'value' in el")
+        else question_field.inner_text()
+    )
+    logbook.check(
+        "Entry form starts empty and does not prefill a demo debate",
+        question_value.strip() == "",
+        f"question field starts with {question_value!r}",
+    )
+    initial = ui.selection_snapshot()
+    logbook.check(
+        "Entry form starts with no seat pressed and a zero counter",
+        initial["pressed"] == [] and "0 / 2" in initial["counter"],
+        f"pressed={initial['pressed']!r} counter={initial['counter']!r}",
+    )
     screenshot(page, out_dir, "00_initial_workspace")
     logbook.check(
         "Workspace loads as an extension page",
@@ -1058,10 +1152,17 @@ def run_ui_flow(
         page.url,
     )
     logbook.check(
+        "Entry form renders one pressable button per offered provider",
+        initial["count"] >= 2
+        and all(initial["ids"])
+        and len(set(initial["ids"])) == initial["count"]
+        and all(label for label in initial["labels"]),
+        f"{initial['count']} buttons ids={initial['ids']!r}",
+    )
+    logbook.check(
         "Both selected providers are offered on the entry form",
-        all(provider_id.casefold() in ui.body_text().casefold() for provider_id in provider_ids)
-        or all(ui.by_id[pid].name.casefold() in ui.body_text().casefold() for pid in provider_ids),
-        "provider names visible in initial UI",
+        all(pid in initial["ids"] for pid in provider_ids),
+        f"ids={initial['ids']!r}",
     )
     stylesheets = ui.linked_stylesheets()
     logbook.check(
@@ -1071,7 +1172,21 @@ def run_ui_flow(
     )
 
     log("\n[3/8] Create a debate through the visible UI")
-    session_id = ui.create_debate(question, provider_ids)
+    session_id, seat_state = ui.create_debate(question, provider_ids)
+    logbook.check(
+        "Selecting two seats updates the pressed state and the 2/2 counter",
+        seat_state["selected"]["pressed"] == provider_ids
+        and "2 / 2" in seat_state["selected"]["counter"],
+        f"pressed={seat_state['selected']['pressed']!r} counter={seat_state['selected']['counter']!r}",
+    )
+    logbook.check(
+        "A third seat is refused instead of replacing a selection",
+        seat_state["extra_provider"] is not None
+        and seat_state["after_extra"]["pressed"] == provider_ids
+        and bool(seat_state["extra_error"]),
+        f"third={seat_state['extra_provider']!r} kept={seat_state['after_extra']['pressed']!r} "
+        f"notice={seat_state['extra_error']!r}",
+    )
     session = runtime.get(session_id)
     logbook.check("Created session has two distinct canonical providers", sorted(session.get("providers") or []) == sorted(provider_ids), safe_session_text(session.get("providers")))
     logbook.check("Created session starts in independent stage", session.get("stage") == "independent", str(session.get("stage")))
@@ -1201,10 +1316,27 @@ def run_ui_flow(
         {provider_ids[0]: vote_a, provider_ids[1]: vote_b},
         stances={provider_ids[0]: "conditional", provider_ids[1]: "conditional"},
     )
+    session = runtime.get(session_id)
+    votes = {
+        str(entry.get("provider")): entry
+        for entry in session.get("history") or []
+        if entry.get("stage") == "vote"
+    }
+    logbook.check(
+        "Vote history records an explicit per-seat stance from the pressed buttons",
+        set(votes) == set(provider_ids)
+        and all(entry.get("status") == "answered" and entry.get("stance") == "conditional" for entry in votes.values()),
+        safe_session_text({provider: entry.get("stance") for provider, entry in votes.items()}),
+    )
+    logbook.check(
+        "Vote history preserves each seat's written reason",
+        any("ARENA_VOTE_A" in str(entry.get("answer") or "") for entry in votes.values())
+        and any("ARENA_VOTE_B" in str(entry.get("answer") or "") for entry in votes.values()),
+        "both vote reasons saved on their own seat",
+    )
 
     # If the renderer does not auto-finish after the last vote, use the visible
     # finish control; the runtime fallback below is only for diagnosis.
-    session = runtime.get(session_id)
     if session.get("stage") != "done":
         try:
             finish = first_visible(
@@ -1255,6 +1387,44 @@ def run_ui_flow(
         "条件" in report or "采集" in report or "反例" in report,
         "action-changing condition present",
     )
+    logbook.check(
+        "Report keeps traceable source ids for the cited claims",
+        "引用校验" in report and "[S1]" in report and "[S2]" in report,
+        "citation section and source markers present",
+    )
+
+    report_node = page.locator("section.report")
+    if report_node.count():
+        report_node.first.scroll_into_view_if_needed()
+    screenshot(page, out_dir, "07_final_report_top", full_page=False)
+
+    joined = ui.joined_vote()
+    if joined is None:
+        raise AcceptanceError("Done view did not render a joined vote block")
+    joined_path = ui.capture_joined_vote(out_dir)
+    logbook.check(
+        "Done view joins both seats into one visible vote summary",
+        len(joined.get("rows") or []) == 2
+        and {row.get("name") for row in joined["rows"]} == {ui.by_id[pid].name for pid in provider_ids},
+        safe_session_text(joined),
+    )
+    logbook.check(
+        "Joined vote shows each seat's conditional stance and written reason",
+        all("有条件同意" in str(row.get("stance") or "") for row in joined["rows"])
+        and any("ARENA_VOTE_A" in str(row.get("reason") or "") for row in joined["rows"])
+        and any("ARENA_VOTE_B" in str(row.get("reason") or "") for row in joined["rows"]),
+        f"captured at {joined_path}",
+    )
+    logbook.check(
+        "Joined vote repeats that absence or silence is never counted as consent",
+        "不计为同意" in str(joined.get("rule") or ""),
+        str(joined.get("rule") or ""),
+    )
+    logbook.check(
+        "Joined vote agrees with the stored per-seat stances",
+        all(votes[pid].get("stance") == "conditional" for pid in provider_ids),
+        "both stored as conditional",
+    )
     screenshot(page, out_dir, "07_final_report")
 
     log("\n[7/8] Export Markdown through the UI")
@@ -1271,6 +1441,11 @@ def run_ui_flow(
         not re.search(r"(?m)^\s*(?:[-*]\s*)?全体一致[：:]", exported)
         and any(term in exported for term in ("未达成全体一致", "有条件一致", "附条件", "条件一致")),
         "no unconditional consensus claim",
+    )
+    logbook.check(
+        "Exported Markdown keeps source ids for offline citation",
+        "[S1]" in exported and "[S2]" in exported,
+        "S1/S2 present in export",
     )
     screenshot(page, out_dir, "08_exported_result")
 
@@ -1459,8 +1634,10 @@ def main() -> int:
                 "--disable-background-networking",
                 "--disable-sync",
                 "--metrics-recording-only",
-                # Belt and braces: the route guard aborts external HTTP(S) too.
-                "--host-resolver-rules=MAP * ~NOTFOUND",
+                # No DNS override: MAP * ~NOTFOUND also breaks the loopback origin a
+                # future step may need. External HTTP(S) is blocked by the route
+                # guard below and by --no-proxy-server (no proxy performs the fetch).
+                "--no-proxy-server",
             ],
         )
         install_network_guard(context, attempts)

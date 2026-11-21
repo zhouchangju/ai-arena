@@ -362,8 +362,11 @@ function advanceFromIndependent(session, completed) {
     const opponents = independentAnswers.filter(
       (task) => task.provider !== provider,
     );
+    // A seat is absent only when it is missing from the eligible independent
+    // answers. The recipient itself is not "missing" from its own opponent
+    // list: in a fully attended two-seat round nothing is absent.
     const missing = session.providers.filter(
-      (candidate) => !opponents.some((task) => task.provider === candidate),
+      (candidate) => !eligible.includes(candidate),
     );
     session.tasks.push(
       makeTask(
@@ -949,6 +952,10 @@ function buildReport(session, reason) {
       (digest === null || task.proposalDigest === digest),
   );
   const skipped = history.filter((task) => task.status === 'skipped');
+  // Pending entries only survive an early user finish: the stage was archived
+  // before it completed. They are outstanding work, not absences and not
+  // silent agreement.
+  const pending = history.filter((task) => task.status === 'pending');
   const critiques = answered.filter((task) => task.stage === 'critique');
   const currentVoteIds = new Set(votes.map((task) => task.id));
   const olderVotes = history.filter(
@@ -988,6 +995,19 @@ function buildReport(session, reason) {
     `- 本轮交叉质询席位：${crossReviewSeats.map((p) => `\`${p}\``).join('、') || '无'}（${crossReviewSeats.length}/${session.providers.length}）`,
   );
   lines.push(`- 质询轮次：${critiqueRoundCount(history)} / 2`);
+  if (reason === 'user-finished') {
+    const last = history.length > 0 ? history[history.length - 1] : null;
+    lines.push(
+      last
+        ? `- 提前结束阶段：${STAGE_LABELS[last.stage] ?? last.stage}（第${last.round}轮），该阶段未完成`
+        : '- 提前结束阶段：无',
+    );
+    if (pending.length > 0) {
+      lines.push(
+        `- 未完成席位：${pendingSeatLabels(pending)}；状态仍为 pending（尚未提交），未计为同意，也不代表其他席位缺席。`,
+      );
+    }
+  }
   lines.push('');
 
   lines.push('## 原始问题', '');
@@ -1102,12 +1122,17 @@ function buildReport(session, reason) {
   }
 
   lines.push('## 缺席与跳过', '');
-  if (skipped.length === 0) {
+  if (skipped.length === 0 && pending.length === 0) {
     lines.push('- 无。');
   } else {
     for (const task of skipped) {
       lines.push(
         `- \`${task.provider}\` 在${STAGE_LABELS[task.stage] ?? task.stage}（第${task.round}轮）跳过。`,
+      );
+    }
+    for (const task of pending) {
+      lines.push(
+        `- \`${task.provider}\` 在${STAGE_LABELS[task.stage] ?? task.stage}（第${task.round}轮）尚未提交，状态仍为 pending；不计为同意。`,
       );
     }
   }
@@ -1182,6 +1207,15 @@ function buildReport(session, reason) {
   );
 
   return lines.join('\n');
+}
+
+function pendingSeatLabels(pending) {
+  return pending
+    .map(
+      (task) =>
+        `\`${task.provider}\`（${STAGE_LABELS[task.stage] ?? task.stage} · 第${task.round}轮）`,
+    )
+    .join('、');
 }
 
 function statusLabel(reason) {

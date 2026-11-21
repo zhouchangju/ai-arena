@@ -203,6 +203,29 @@ test('skipping one independent seat keeps the skipped state and excludes it from
   assert.doesNotMatch(session.tasks[0].prompt, /CHATGPT_ONLY/);
 });
 
+test('a fully attended two-seat critique never marks the recipient itself absent', () => {
+  let session = start();
+  session = answerFor(session, 'chatgpt', 'CHATGPT_PRESENT 先做移动端。');
+  session = answerFor(session, 'claude', 'CLAUDE_PRESENT 先补桌面检索。');
+  assert.equal(session.stage, 'critique');
+  assert.equal(session.tasks.length, 2);
+
+  for (const task of session.tasks) {
+    const other = task.provider === 'chatgpt' ? 'claude' : 'chatgpt';
+    const otherEntry = session.history.find(
+      (entry) => entry.stage === 'independent' && entry.provider === other,
+    );
+    assert.ok(otherEntry);
+
+    // Regression: the recipient used to appear in 【缺席席位】 because it was
+    // excluded from its own opponent list. With both seats present nothing is
+    // absent, and the peer answer still arrives in full.
+    assert.doesNotMatch(task.prompt, /【缺席席位】/);
+    assert.ok(task.prompt.includes(otherEntry.answer));
+    assert.match(task.prompt, new RegExp(`\\[${otherEntry.sourceId} · ${other}`));
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Validation and stale / overdue submissions
 // ---------------------------------------------------------------------------
@@ -368,6 +391,33 @@ test('finish early produces a partial report and is idempotent', () => {
       }),
     /done/,
   );
+});
+
+test('an early finish names the outstanding seat and stage, never implying nobody is missing', () => {
+  let session = toVote();
+  session = answerFor(session, 'chatgpt', 'EARLY_VOTE_AGREE 同意。', {
+    stance: 'agree',
+  });
+  const pendingClaude = pendingTask(session, 'claude');
+
+  session = applyAction(session, 'finish');
+  assert.equal(session.stage, 'done');
+  assert.equal(session.stopReason, 'user-finished');
+  assert.equal(
+    session.history.find((entry) => entry.id === pendingClaude.id).status,
+    'pending',
+  );
+
+  // The unfinished stage and the seats still pending are named explicitly...
+  assert.match(session.report, /提前结束阶段：表决（第1轮），该阶段未完成/);
+  assert.match(session.report, /未完成席位：`claude`（表决 · 第1轮）/);
+  assert.match(
+    session.report,
+    /`claude` 在表决（第1轮）尚未提交，状态仍为 pending；不计为同意/,
+  );
+  // ...and the absence section never collapses to "无" while a seat is pending.
+  assert.doesNotMatch(session.report, /## 缺席与跳过\n\n- 无。/);
+  assert.doesNotMatch(session.report, /全体一致/);
 });
 
 // ---------------------------------------------------------------------------

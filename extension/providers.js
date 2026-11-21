@@ -20,10 +20,26 @@ export const PROVIDERS = Object.freeze({
   qwen: { name: '通义千问', url: 'https://www.qianwen.com/' },
   yuanbao: { name: '腾讯元宝', url: 'https://yuanbao.tencent.com/chat/' },
   grok: { name: 'Grok', url: 'https://grok.com/' },
+  // Two distinct loopback seats. The URL shown here is only a local sample
+  // entry; the address actually used for automation is the one saved under
+  // 连接设置 (automation.config), never a blank localhost:80 guess.
+  'local-a': {
+    name: '本机 A',
+    url: 'http://127.0.0.1:8765/web-driver-fixture.html?seat=A',
+    note: '本机网页自动驱动（需在连接设置保存实际地址）',
+  },
+  'local-b': {
+    name: '本机 B',
+    url: 'http://127.0.0.1:8765/web-driver-fixture.html?seat=B',
+    note: '本机网页自动驱动（需在连接设置保存实际地址）',
+  },
 });
 
 /** Canonical, lowercase provider ids in display order. */
 export const PROVIDER_IDS = Object.freeze(Object.keys(PROVIDERS));
+
+/** Seats that the first automation version may drive (local loopback only). */
+export const AUTOMATION_PROVIDER_IDS = Object.freeze(['local-a', 'local-b']);
 
 /**
  * Strict canonical allowlist check: only the exact lowercase ids above pass.

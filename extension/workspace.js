@@ -1,4 +1,4 @@
-import { PROVIDERS } from './providers.js';
+import { PROVIDERS, AUTOMATION_PROVIDER_IDS } from './providers.js';
 
 /* ---------------------------------------------------------------------------
  * 判断台工作台
@@ -48,6 +48,27 @@ const STATUS_LABELS = {
   skipped: '已跳过',
 };
 
+const AUTOMATION_SEATS = new Set(AUTOMATION_PROVIDER_IDS);
+const AUTOMATION_POLL_MS = 4000;
+const AUTOMATION_NEEDS_ACTION = new Set([
+  'paused',
+  'stale',
+  'session-paused',
+  'unconfigured',
+]);
+const AUTOMATION_SEAT_LABELS = {
+  idle: '待命',
+  probing: '检查页面',
+  dispatching: '提交中',
+  waiting: '等待回答',
+  answered: '已写入本场',
+  stale: '已过期，需人工核对',
+  'session-paused': '讨论已暂停',
+  paused: '需要处理',
+  unconfigured: '未配置',
+  detached: '已停止',
+};
+
 const DRAFTS_KEY = 'aiArena.workspace.drafts.v1';
 const COMPOSE_KEY = 'aiArena.workspace.compose.v1';
 const DRAFT_MAX_AGE = 30 * 24 * 60 * 60 * 1000;
@@ -76,6 +97,12 @@ const state = {
   homeRefs: null,
   pendingCreate: false,
   toastTimer: null,
+  automation: { loaded: false, configs: {}, runs: {}, error: '' },
+  automationPanel: null,
+  automationPollTimer: null,
+  automationSignature: '',
+  automationRefreshPending: false,
+  automationBusy: false,
 };
 
 let loadToken = 0;
@@ -167,6 +194,104 @@ function initialOf(name) {
 
 function seatLetter(index) {
   return String.fromCharCode(65 + Math.max(0, index));
+}
+
+/* ------------------------------ 本机自动化状态 ------------------------------ */
+
+function isAutomationSeat(id) {
+  return AUTOMATION_SEATS.has(String(id || '').toLowerCase());
+}
+
+function automationConfig(id) {
+  const key = String(id || '').toLowerCase();
+  return state.automation.configs && state.automation.configs[key]
+    ? state.automation.configs[key]
+    : null;
+}
+
+function automationRun(session) {
+  if (!session) return null;
+  return (state.automation.runs && state.automation.runs[session.id]) || null;
+}
+
+function automationSeats(session) {
+  if (!session) return [];
+  return sessionProviderList(session).filter(isAutomationSeat);
+}
+
+function automationSeatState(run, provider) {
+  if (!run || !run.seats) return null;
+  const seat = run.seats[provider];
+  return seat && typeof seat === 'object' ? seat : null;
+}
+
+function automationSeatNeedsAction(seat) {
+  if (!seat) return false;
+  if (seat.paused) return true;
+  return AUTOMATION_NEEDS_ACTION.has(String(seat.status || '').toLowerCase());
+}
+
+function automationNeedsAction(run) {
+  if (!run) return 0;
+  let count = 0;
+  for (const provider of AUTOMATION_PROVIDER_IDS) {
+    if (automationSeatNeedsAction(automationSeatState(run, provider))) count += 1;
+  }
+  return count;
+}
+
+function automationSeatMode(session, provider) {
+  const id = String(provider || '').toLowerCase();
+  if (!isAutomationSeat(id)) return '手动中转';
+  const run = automationRun(session);
+  const seat = automationSeatState(run, id);
+  if (run && run.enabled) {
+    if (automationSeatNeedsAction(seat)) return '本机待处理';
+    if (seat && seat.status === 'detached') return '本机手动';
+    return '本机自动';
+  }
+  return automationConfig(id) ? '本机手动' : '本机未配置';
+}
+
+function automationSeatLabel(seat) {
+  if (!seat) return '待命';
+  const status = String(seat.status || '').toLowerCase();
+  const label = AUTOMATION_SEAT_LABELS[status] || (status || '待命');
+  return seat.paused && status !== 'paused' ? `${label}（需处理）` : label;
+}
+
+function automationRunSignature(run) {
+  if (!run) return '';
+  const seats = {};
+  for (const [provider, seat] of Object.entries(run.seats || {})) {
+    seats[provider] = {
+      status: seat.status || '',
+      taskId: seat.taskId || '',
+      detail: seat.detail || '',
+      paused: Boolean(seat.paused),
+    };
+  }
+  return JSON.stringify({
+    enabled: Boolean(run.enabled),
+    completed: Boolean(run.completed),
+    stoppedAt: run.stoppedAt || null,
+    lastError: run.lastError || '',
+    seats,
+  });
+}
+
+function automationRunSummary(run) {
+  if (!run) return '未启用。本场仍可手动复制、粘贴和提交。';
+  if (run.enabled) {
+    const needs = automationNeedsAction(run);
+    if (needs > 0) {
+      return `运行中，但有 ${needs} 席需要你处理。未处理的席位不会继续自动派发。`;
+    }
+    return '运行中：只驱动已配置的本机席位；手动操作始终可用。';
+  }
+  if (run.completed) return '本场已结束，自动驱动也随之停止。';
+  if (run.stoppedAt) return '已停止自动驱动；原页保留，可继续手动操作。';
+  return '未启用。本场仍可手动复制、粘贴和提交。';
 }
 
 /* ------------------------------ 小工具 ------------------------------ */
@@ -374,6 +499,177 @@ async function actSession(action, payload) {
   return ensureSession(reply, current.id);
 }
 
+/* ------------------------------ 本机自动化通信 ------------------------------ */
+
+async function loadAutomationInfo({ silent = true } = {}) {
+  try {
+    const reply = await callBackground({ type: 'automation.info' });
+    state.automation.configs = reply.configs && typeof reply.configs === 'object'
+      ? reply.configs
+      : {};
+    state.automation.runs = reply.runs && typeof reply.runs === 'object'
+      ? reply.runs
+      : {};
+    state.automation.loaded = true;
+    state.automation.error = '';
+    refreshHomeAutomationHints();
+    updateAutomationPanel();
+    return reply;
+  } catch (error) {
+    state.automation.error = friendlyError(error);
+    updateAutomationPanel();
+    if (!silent) toast(friendlyError(error, '读取自动化状态失败'), 'error');
+    return null;
+  }
+}
+
+function automationEditingFocus() {
+  const active = document.activeElement;
+  if (!active || !(active instanceof HTMLElement)) return false;
+  const tag = active.tagName;
+  if (tag === 'TEXTAREA' || tag === 'INPUT' || tag === 'SELECT') return true;
+  if (active.isContentEditable) return true;
+  return Boolean(active.closest && active.closest('.answer-editor'));
+}
+
+function stopAutomationPolling() {
+  if (state.automationPollTimer) {
+    clearInterval(state.automationPollTimer);
+    state.automationPollTimer = null;
+  }
+}
+
+function ensureAutomationPolling() {
+  if (state.view !== 'session' || !state.session) {
+    stopAutomationPolling();
+    return;
+  }
+  const run = automationRun(state.session);
+  if (!run || !run.enabled) {
+    stopAutomationPolling();
+    return;
+  }
+  if (state.automationPollTimer) return;
+  state.automationPollTimer = setInterval(() => {
+    void pollAutomation();
+  }, AUTOMATION_POLL_MS);
+}
+
+async function refreshSessionQuietly() {
+  const current = state.session;
+  if (!current) return false;
+  try {
+    const raw = await fetchSession(current.id);
+    if (!state.session || state.session.id !== current.id) return false;
+    applySession(raw);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function pollAutomation() {
+  if (state.view !== 'session' || !state.session) {
+    stopAutomationPolling();
+    return;
+  }
+  if (state.automationBusy) return;
+
+  const reply = await loadAutomationInfo({ silent: true });
+  if (!reply) return;
+
+  const session = state.session;
+  if (!session) {
+    stopAutomationPolling();
+    return;
+  }
+  const run = automationRun(session);
+  const signature = automationRunSignature(run);
+  const changed = Boolean(state.automationSignature)
+    && signature !== state.automationSignature;
+  state.automationSignature = signature;
+
+  if (changed) {
+    if (automationEditingFocus()) {
+      state.automationRefreshPending = true;
+      updateAutomationPanel();
+      return;
+    }
+    state.automationRefreshPending = false;
+    await refreshSessionQuietly();
+  }
+
+  if (!run || !run.enabled) {
+    stopAutomationPolling();
+    return;
+  }
+  ensureAutomationPolling();
+}
+
+async function startAutomation(button) {
+  const session = state.session;
+  if (!session || state.automationBusy) return;
+  state.automationBusy = true;
+  const original = button ? button.textContent : '';
+  if (button) {
+    button.disabled = true;
+    button.textContent = '启动中…';
+  }
+  try {
+    await callBackground({ type: 'automation.start', id: session.id });
+    await loadAutomationInfo({ silent: true });
+    state.automationSignature = automationRunSignature(automationRun(state.session));
+    await refreshSessionQuietly();
+    ensureAutomationPolling();
+    toast('已开始本机自动化：只驱动已配置的席位，手动操作始终可用');
+  } catch (error) {
+    toast(friendlyError(error, '无法开始自动化'), 'error');
+  } finally {
+    state.automationBusy = false;
+    if (button && button.isConnected) {
+      button.disabled = false;
+      button.textContent = original;
+    }
+    updateAutomationPanel();
+  }
+}
+
+async function stopAutomation(button) {
+  const session = state.session;
+  if (!session || state.automationBusy) return;
+  state.automationBusy = true;
+  const original = button ? button.textContent : '';
+  if (button) {
+    button.disabled = true;
+    button.textContent = '停止中…';
+  }
+  try {
+    await callBackground({ type: 'automation.stop', id: session.id });
+    stopAutomationPolling();
+    await loadAutomationInfo({ silent: true });
+    toast('已停止自动驱动；原页保留，可继续手动操作');
+  } catch (error) {
+    toast(friendlyError(error, '无法停止自动化'), 'error');
+  } finally {
+    state.automationBusy = false;
+    if (button && button.isConnected) {
+      button.disabled = false;
+      button.textContent = original;
+    }
+    updateAutomationPanel();
+  }
+}
+
+async function refreshAutomationNow(button) {
+  const session = state.session;
+  if (!session) return;
+  await withButton(button, '刷新中…', async () => {
+    await loadAutomationInfo({ silent: false });
+    await refreshSessionQuietly();
+    ensureAutomationPolling();
+  });
+}
+
 /* ------------------------------ 本地草稿 ------------------------------ */
 
 function loadStoredState() {
@@ -503,6 +799,7 @@ function normalizeTask(raw, fallbackIndex = 0) {
     status,
     answer: typeof raw.answer === 'string' ? raw.answer : '',
     stance: STANCE_LABELS[raw.stance] ? raw.stance : undefined,
+    sourceId: typeof raw.sourceId === 'string' ? raw.sourceId.trim() : '',
     _index: fallbackIndex,
   };
 }
@@ -734,8 +1031,10 @@ function renderLoading(text) {
 
 function goHome() {
   loadToken += 1;
+  stopAutomationPolling();
   state.view = 'home';
   state.session = null;
+  state.automationPanel = null;
   state.showEditor = {};
   state.dismissedDraftEditors = new Set();
   state.stanceChoice = {};
@@ -744,6 +1043,7 @@ function goHome() {
   setHash('');
   renderHome();
   renderHistoryList();
+  void loadAutomationInfo({ silent: true });
   window.scrollTo(0, 0);
   requestAnimationFrame(() => {
     const input = document.getElementById('question-input');
@@ -826,84 +1126,117 @@ async function reloadList({ silent = false } = {}) {
 
 /* ------------------------------ 首页 ------------------------------ */
 
+/* 首页只做一件事：尽快让人写下问题、选两席并开始。接线方可以注册
+ * 额外链接，不必改动这里的布局。 */
+const homeExtraLinks = [];
+
+function registerHomeLink(link) {
+  if (!link || typeof link !== 'object') return;
+  const label = typeof link.label === 'string' ? link.label.trim() : '';
+  const href = typeof link.href === 'string' ? link.href.trim() : '';
+  if (!label || !href) return;
+  if (homeExtraLinks.some((item) => item.href === href && item.label === label)) return;
+  homeExtraLinks.push({ label, href, title: typeof link.title === 'string' ? link.title : '' });
+  if (state.view === 'home') renderHome();
+}
+
+function homeSeatTag(id) {
+  if (!isAutomationSeat(id)) return '';
+  if (!state.automation.loaded) return '本机';
+  return automationConfig(id) ? '自动' : '';
+}
+
+function homeSeatModeText(id) {
+  if (!isAutomationSeat(id)) return '手动中转';
+  if (!state.automation.loaded) return '本机（读取设置中）';
+  return automationConfig(id) ? '本机可自动' : '本机未配置，按手动继续';
+}
+
+function homeSeatStatusText() {
+  const selected = state.compose.providers;
+  if (!selected.length) return '尚未选择席位。选两席不同成员后即可开始；手动中转始终可用。';
+
+  const parts = selected.map((id, index) =>
+    `${seatLetter(index)} ${providerName(id)}：${homeSeatModeText(id)}`);
+  let text = parts.join(' · ');
+
+  if (selected.length < 2) {
+    return `${text}。还需再选一席，两席才能交换质疑。`;
+  }
+
+  if (selected.some(isAutomationSeat) && !state.automation.loaded) {
+    return `${text}。正在读取本机设置；完成前手动中转可用。`;
+  }
+
+  const autoReady = selected.filter((id) => isAutomationSeat(id) && automationConfig(id)).length;
+  if (autoReady === 0) {
+    return `${text}。两席都按手动中转：复制提示、在原站取得回答，再粘贴回来。`;
+  }
+  if (autoReady < selected.length) {
+    return `${text}。混合模式：自动席位需创建后显式开始，其余席位手动；自动未就绪时仍可手动完成。`;
+  }
+  return `${text}。创建后需显式开始自动化；不开始就按手动完成。`;
+}
+
+function focusHomeQuestion() {
+  requestAnimationFrame(() => {
+    if (state.view !== 'home') return;
+    const active = document.activeElement;
+    if (active && active !== document.body && viewEl.contains(active)) return;
+    const input = document.getElementById('question-input');
+    if (input) input.focus({ preventScroll: true });
+  });
+}
+
+/* 其它模块可在不修改布局的前提下追加首页链接（例如本机席位设置）。 */
+try {
+  window.aiArenaWorkspace = Object.assign(window.aiArenaWorkspace || {}, {
+    registerHomeLink,
+    renderHome,
+  });
+} catch {
+  /* 非窗口环境。 */
+}
+
 function renderHome() {
   state.view = 'home';
   state.homeRefs = null;
-
-  const wrap = h('div', { class: 'wrap home' });
-  wrap.append(
-    h('header', { class: 'home-hero' },
-      h('div', { class: 'eyebrow-row' },
-        h('span', { class: 'eyebrow', text: '本地工作台' }),
-        h('span', { class: 'hero-tag', text: '手动中转' })),
-      h('h1', { class: 'home-title', text: '把一个问题，交给两席独立判断。' }),
-      h('p', { class: 'home-lede', text: '两席先各自回答，再交换质疑，最后逐席确认同一版结论。每一步由你复制提示、在原网站取得回答，再粘贴回来。工作台不代替你发送。' })),
-  );
+  state.automationPanel = null;
+  stopAutomationPolling();
 
   const refs = {
     providerButtons: new Map(),
+    providerTags: new Map(),
     selectionCount: null,
     previewNames: null,
+    heroTag: null,
+    manualNote: null,
+    manualNoteStrong: null,
+    manualNoteSpan: null,
+    seatStatus: null,
+    seatLinks: null,
     error: null,
     errorText: null,
     start: null,
     charCount: null,
   };
 
-  /* 一 · 选择两席 */
-  const providerGrid = h('div', { class: 'provider-grid' });
-  if (!PROVIDER_LIST.length) {
-    providerGrid.append(
-      h('div', { class: 'inline-empty' },
-        h('strong', { text: '没有读到站点清单。' }),
-        h('p', { text: '请重新加载扩展后再试；建场需要 extension/providers.js 提供至少两个站点。' })),
-    );
-  } else {
-    for (const provider of PROVIDER_LIST) {
-      const selectedIndex = state.compose.providers.indexOf(provider.id);
-      const order = h('span', {
-        class: 'provider-order',
-        text: selectedIndex >= 0 ? `席 ${seatLetter(selectedIndex)}` : '',
-        hidden: selectedIndex < 0,
-      });
-      const button = h('button', {
-        class: `provider-option${selectedIndex >= 0 ? ' is-selected' : ''}`,
-        type: 'button',
-        attrs: { 'aria-pressed': String(selectedIndex >= 0) },
-        title: provider.note || `使用 ${provider.name} 的原网页手动回答`,
-        onClick: () => toggleProvider(provider.id),
-      },
-        h('span', { class: 'provider-avatar', attrs: { 'aria-hidden': 'true' }, text: initialOf(provider.name) }),
-        h('span', { class: 'provider-body' },
-          h('span', { class: 'provider-name', text: provider.name }),
-          h('span', { class: 'provider-host', text: hostOf(provider.url) || '站点地址未登记' }),
-          h('span', { class: 'provider-tags' }, h('span', { class: 'provider-tag', text: '手动中转' }))),
-        order,
-      );
-      refs.providerButtons.set(provider.id, button);
-      providerGrid.append(button);
-    }
-  }
-
-  refs.selectionCount = h('span', {
-    class: `selection-count${state.compose.providers.length === 2 ? ' is-complete' : ''}`,
-    text: `${state.compose.providers.length} / 2 已选`,
-  });
+  refs.heroTag = h('span', { class: 'hero-tag', text: '手动中转' });
+  const wrap = h('div', { class: 'wrap home' });
   wrap.append(
-    h('section', { class: 'section' },
-      h('div', { class: 'section-head' },
-        h('span', { class: 'section-index', text: '一' }),
-        h('h2', { class: 'section-title', text: '选择两席' }),
-        refs.selectionCount),
-      h('p', { class: 'section-note', text: '两位不同成员。点击卡片选择或取消；最多两席，第一席为 A，第二席为 B。' }),
-      providerGrid),
+    h('header', { class: 'home-hero' },
+      h('div', { class: 'eyebrow-row' },
+        h('span', { class: 'eyebrow', text: '本地工作台' }),
+        refs.heroTag),
+      h('h1', { class: 'home-title', text: '把一个问题，交给两席独立判断。' }),
+      h('p', { class: 'home-lede', text: '两席先各自回答，再交换质疑，最后逐席确认同一版结论。可全程手动中转；本机席位配置后也可显式启用自动驱动。' })),
   );
 
-  /* 二 · 写下问题 */
+  /* 问题优先：打开首页即可直接输入。 */
   const questionInput = h('textarea', {
     id: 'question-input',
     class: 'question-input',
-    rows: 4,
+    rows: 3,
     placeholder: '例如：我的个人笔记工具值不值得先做移动端？我只有两个周末。',
     spellcheck: false,
     autocomplete: 'off',
@@ -929,17 +1262,76 @@ function renderHome() {
     text: `${Array.from(state.compose.question).length} 字 · 会原样出现在两席提示中`,
   });
 
-  wrap.append(
-    h('section', { class: 'section' },
-      h('div', { class: 'section-head' },
-        h('span', { class: 'section-index', text: '二' }),
-        h('h2', { class: 'section-title', text: '写下问题' })),
-      h('p', { class: 'section-note', text: '尽量写清你已有的条件、时间和判断标准。问题原文会保存，也会进入每一轮的提示。' }),
-      questionInput,
-      h('div', { class: 'field-foot' }, refs.charCount)),
-  );
+  /* 两席选择器：紧凑的可切换按钮，保留 button.provider-option 和 aria-pressed。 */
+  const providerGrid = h('div', { class: 'provider-grid' });
+  if (!PROVIDER_LIST.length) {
+    providerGrid.append(
+      h('div', { class: 'inline-empty' },
+        h('strong', { text: '没有读到站点清单。' }),
+        h('p', { text: '请重新加载扩展后再试；建场需要 extension/providers.js 提供至少两个站点。' })),
+    );
+  } else {
+    for (const provider of PROVIDER_LIST) {
+      const selectedIndex = state.compose.providers.indexOf(provider.id);
+      const local = isAutomationSeat(provider.id);
+      const order = h('span', {
+        class: 'provider-order',
+        text: selectedIndex >= 0 ? seatLetter(selectedIndex) : '',
+        hidden: selectedIndex < 0,
+      });
+      const tag = h('span', { class: 'provider-tag', text: '', hidden: true });
+      const button = h('button', {
+        class: [
+          'provider-option',
+          local ? 'is-local' : '',
+          selectedIndex >= 0 ? 'is-selected' : '',
+        ].filter(Boolean).join(' '),
+        type: 'button',
+        dataset: { providerId: provider.id },
+        attrs: { 'aria-pressed': String(selectedIndex >= 0) },
+        title: providerChipTitle(provider),
+        onClick: () => toggleProvider(provider.id),
+      },
+        h('span', { class: 'provider-avatar', attrs: { 'aria-hidden': 'true' }, text: initialOf(provider.name) }),
+        h('span', { class: 'provider-name', text: provider.name }),
+        tag,
+        order,
+      );
+      refs.providerButtons.set(provider.id, button);
+      refs.providerTags.set(provider.id, tag);
+      providerGrid.append(button);
+    }
+  }
 
-  /* 三 · 开始之后 */
+  refs.selectionCount = h('span', {
+    class: `selection-count${state.compose.providers.length === 2 ? ' is-complete' : ''}`,
+    text: `${state.compose.providers.length} / 2 已选`,
+  });
+
+  refs.seatStatus = h('p', {
+    class: 'home-seat-status',
+    attrs: { 'aria-live': 'polite' },
+    text: homeSeatStatusText(),
+  });
+
+  refs.seatLinks = h('p', { class: 'seat-links' },
+    h('a', {
+      class: 'link-quiet',
+      href: 'connections.html',
+      target: '_blank',
+      rel: 'noopener noreferrer',
+      text: '连接设置',
+      title: '配置本机 A / B 的网页地址与 CSS 选择器',
+    }),
+    ...homeExtraLinks.map((link) => h('a', {
+      class: 'link-quiet',
+      href: link.href,
+      target: '_blank',
+      rel: 'noopener noreferrer',
+      text: link.label,
+      title: link.title || link.label,
+    })));
+
   refs.previewNames = h('strong', { text: previewNameText() });
   const flow = h('ol', { class: 'flow-steps' },
     h('li', {}, '第一轮会把同一题面交给你复制到 ', refs.previewNames, '；两席各自独立回答，互相看不到。'),
@@ -948,15 +1340,25 @@ function renderHome() {
     h('li', {}, '最后由你导出结论，或保留仍未解决的分歧。'),
   );
 
+  refs.manualNoteStrong = h('strong', { text: '本版全程手动中转' });
+  refs.manualNoteSpan = h('span', { text: '不自动登录、不自动发送，也不读取网页回答。复制、粘贴和提交都由你操作。' });
+  refs.manualNote = h('div', { class: 'manual-note' }, refs.manualNoteStrong, refs.manualNoteSpan);
+
   wrap.append(
-    h('section', { class: 'section' },
-      h('div', { class: 'section-head' },
-        h('span', { class: 'section-index', text: '三' }),
-        h('h2', { class: 'section-title', text: '开始之后' })),
-      h('div', { class: 'flow-card' }, flow),
-      h('div', { class: 'manual-note' },
-        h('strong', { text: '本版全程手动中转' }),
-        h('span', { text: '不自动登录、不自动发送，也不读取网页回答。复制、粘贴和提交都由你操作。' }))),
+    h('section', { class: 'home-compose', attrs: { 'aria-label': '开始一场判断' } },
+      h('div', { class: 'home-question' },
+        h('label', { class: 'home-field-label', for: 'question-input', text: '写下问题' }),
+        questionInput,
+        h('div', { class: 'field-foot' },
+          refs.charCount,
+          h('span', { class: 'kbd-hint', text: '⌘ / Ctrl + Enter 开始' }))),
+      h('div', { class: 'home-seats' },
+        h('div', { class: 'home-seat-head' },
+          h('h2', { class: 'home-seat-title', text: '选择两席' }),
+          refs.selectionCount),
+        providerGrid,
+        refs.seatStatus,
+        refs.seatLinks)),
   );
 
   refs.errorText = h('span');
@@ -966,6 +1368,7 @@ function renderHome() {
     class: 'btn btn-accent btn-large',
     type: 'button',
     text: '开始判断',
+    title: '创建两席场次；⌘ / Ctrl + Enter 也可开始',
     onClick: () => { void startSession(); },
   });
 
@@ -974,11 +1377,92 @@ function renderHome() {
       refs.start,
       h('p', { class: 'start-note', text: '创建后可随时暂停、补录或结束；记录保存在本机，也可导出为 Markdown。' })),
     refs.error,
+    h('details', { class: 'home-guide' },
+      h('summary', {},
+        h('span', { class: 'home-guide-title', text: '走完一场会发生什么' }),
+        h('span', { class: 'home-guide-hint', text: '4 步 · 可随时暂停' })),
+      h('div', { class: 'home-guide-body' },
+        h('div', { class: 'flow-card' }, flow),
+        refs.manualNote)),
     h('p', { class: 'home-foot', text: '每一轮的提示与回答原文会按席位保存，关闭工作台后仍能回到本场。' }),
   );
 
   state.homeRefs = refs;
+  refreshHomeAutomationHints();
   viewEl.replaceChildren(wrap);
+  focusHomeQuestion();
+}
+
+function providerTagLabel(id) {
+  if (!isAutomationSeat(id)) return '手动中转';
+  if (!state.automation.loaded) return '本机 · 待检查配置';
+  return automationConfig(id) ? '本机自动 · 已配置' : '本机 · 未配置';
+}
+
+function providerChipTitle(provider) {
+  if (!provider) return '';
+  return [provider.note, hostOf(provider.url), providerTagLabel(provider.id)]
+    .filter(Boolean)
+    .join(' · ');
+}
+
+function homeAutomationSummary() {
+  const localSeats = state.compose.providers.filter(isAutomationSeat);
+  if (!localSeats.length) {
+    return {
+      tag: '手动中转',
+      strong: '本版全程手动中转',
+      span: '不自动登录、不自动发送，也不读取网页回答。复制、粘贴和提交都由你操作。',
+    };
+  }
+  if (!state.automation.loaded) {
+    return {
+      tag: `${localSeats.length} 席本机`,
+      strong: '正在读取本机连接设置',
+      span: '读取完成前不会开始任何自动驱动；手动复制、粘贴和提交仍然可用。',
+    };
+  }
+  const configured = localSeats.filter((id) => automationConfig(id));
+  if (!configured.length) {
+    return {
+      tag: '本机未配置',
+      strong: '本机席位尚未连接',
+      span: '先在「连接设置」保存本机网页地址与 CSS 选择器。未配置时按手动中转处理。',
+    };
+  }
+  if (configured.length < localSeats.length) {
+    return {
+      tag: '部分席可自动',
+      strong: '需显式开始自动化',
+      span: '已配置的本机席位可自动派发，其余席位仍需手动复制粘贴；创建场次后还要点击「开始自动化」。',
+    };
+  }
+  return {
+    tag: localSeats.length === 2 ? '两席可本机自动' : '可本机自动',
+    strong: '需显式开始自动化',
+    span: '已保存本机连接设置。创建场次后仍要点击「开始自动化」才会派发；手动复制、粘贴和提交始终可用。',
+  };
+}
+
+function refreshHomeAutomationHints() {
+  const refs = state.homeRefs;
+  if (!refs) return;
+  const summary = homeAutomationSummary();
+  if (refs.heroTag) refs.heroTag.textContent = summary.tag;
+  if (refs.manualNoteStrong) refs.manualNoteStrong.textContent = summary.strong;
+  if (refs.manualNoteSpan) refs.manualNoteSpan.textContent = summary.span;
+  if (refs.seatStatus) refs.seatStatus.textContent = homeSeatStatusText();
+  for (const [id, tag] of refs.providerTags) {
+    const label = homeSeatTag(id);
+    tag.hidden = !label;
+    tag.textContent = label;
+    tag.classList.toggle('is-auto', label === '自动');
+    const button = refs.providerButtons.get(id);
+    if (!button) continue;
+    button.classList.toggle('is-auto-ready', label === '自动');
+    const provider = providerById(id);
+    if (provider) button.title = providerChipTitle(provider);
+  }
 }
 
 function previewNameText() {
@@ -1017,7 +1501,7 @@ function syncHomeSelection() {
     const order = button.querySelector('.provider-order');
     if (order) {
       order.hidden = !selected;
-      order.textContent = selected ? `席 ${seatLetter(index)}` : '';
+      order.textContent = selected ? seatLetter(index) : '';
     }
   }
   if (refs.selectionCount) {
@@ -1025,6 +1509,7 @@ function syncHomeSelection() {
     refs.selectionCount.classList.toggle('is-complete', state.compose.providers.length === 2);
   }
   if (refs.previewNames) refs.previewNames.textContent = previewNameText();
+  refreshHomeAutomationHints();
 }
 
 function showHomeError(message) {
@@ -1132,19 +1617,25 @@ function readHashId() {
 async function openSession(id) {
   if (!id) return;
   const previous = state.session;
+  stopAutomationPolling();
   loadToken += 1;
   const token = loadToken;
   state.view = 'loading';
+  state.automationPanel = null;
   renderLoading('正在读取场次…');
 
   try {
-    const raw = await fetchSession(id);
+    const [raw] = await Promise.all([
+      fetchSession(id),
+      loadAutomationInfo({ silent: true }),
+    ]);
     if (token !== loadToken) return;
     const session = normalizeSession(raw);
     if (!session) throw new Error('后台返回的场次数据不完整。');
 
     state.session = session;
     state.view = 'session';
+    state.automationSignature = automationRunSignature(automationRun(session));
     state.showEditor = {};
     state.dismissedDraftEditors = new Set();
     state.stanceChoice = {};
@@ -1276,9 +1767,12 @@ async function deleteCurrentSession(button) {
   await withButton(button, '删除中…', async () => {
     try {
       await callBackground({ type: 'delete', id: current.id });
+      stopAutomationPolling();
       purgeDraftsForSession(current.id);
       state.sessions = state.sessions.filter((item) => item.id !== current.id);
       state.session = null;
+      state.automationPanel = null;
+      state.automationSignature = '';
       state.view = 'home';
       state.showEditor = {};
       state.dismissedDraftEditors = new Set();
@@ -1306,9 +1800,16 @@ function renderSession() {
   }
   state.homeRefs = null;
   state.taskErrorEls = new Map();
+  state.automationPanel = null;
 
   const wrap = h('div', { class: 'wrap session' });
   wrap.append(renderSessionHeader(session), renderStepper(session));
+
+  if (automationSeats(session).length) {
+    wrap.append(renderAutomationPanel(session));
+  } else {
+    stopAutomationPolling();
+  }
 
   if (session.paused && session.stage !== 'done') {
     wrap.append(renderPauseBanner(session));
@@ -1322,13 +1823,118 @@ function renderSession() {
 
   wrap.append(renderHistory(session));
   viewEl.replaceChildren(wrap);
+  ensureAutomationPolling();
+}
+
+function renderAutomationPanel(session) {
+  const seats = automationSeats(session);
+  const statusEl = h('span');
+  const seatListEl = h('div');
+
+  const startButton = h('button', {
+    class: 'btn btn-small btn-strong',
+    type: 'button',
+    text: '开始自动化',
+  });
+  startButton.addEventListener('click', () => { void startAutomation(startButton); });
+
+  const stopButton = h('button', {
+    class: 'btn btn-small',
+    type: 'button',
+    text: '停止自动化',
+  });
+  stopButton.addEventListener('click', () => { void stopAutomation(stopButton); });
+
+  const refreshButton = h('button', {
+    class: 'btn btn-small btn-ghost',
+    type: 'button',
+    text: '刷新自动状态',
+  });
+  refreshButton.addEventListener('click', () => { void refreshAutomationNow(refreshButton); });
+
+  const settingsLink = h('a', {
+    class: 'link-quiet',
+    href: 'connections.html',
+    target: '_blank',
+    rel: 'noopener noreferrer',
+    text: '连接设置',
+    title: '配置 local-a / local-b 的本机地址与 CSS 选择器',
+  });
+
+  const panel = h('section', {
+    class: 'manual-note',
+    attrs: { 'aria-label': '本机网页自动化' },
+  },
+    h('div', {},
+      h('strong', { text: '本机网页自动化' }),
+      statusEl,
+      seatListEl),
+    h('div', {}, startButton, stopButton, refreshButton, settingsLink));
+
+  state.automationPanel = {
+    sessionId: session.id,
+    seats,
+    statusEl,
+    seatListEl,
+    startButton,
+    stopButton,
+    refreshButton,
+  };
+  updateAutomationPanel();
+  return panel;
+}
+
+function updateAutomationPanel() {
+  const panel = state.automationPanel;
+  if (!panel || !panel.statusEl || !panel.statusEl.isConnected) return;
+  const session = state.session;
+  if (!session || session.id !== panel.sessionId) return;
+
+  const run = automationRun(session);
+  let summary = automationRunSummary(run);
+  if (state.automation.error) {
+    summary = `${summary} 读取自动化状态失败：${oneLine(state.automation.error, 120)}`;
+  }
+  if (state.automationRefreshPending) {
+    summary = `${summary} 有新的自动进展；结束当前编辑后会自动刷新。`;
+  }
+  panel.statusEl.textContent = summary;
+
+  panel.seatListEl.replaceChildren();
+  for (const provider of panel.seats) {
+    const seat = automationSeatState(run, provider);
+    const configured = automationConfig(provider) ? '' : ' · 未配置';
+    const detail = seat && seat.detail ? ` · ${oneLine(seat.detail, 120)}` : '';
+    panel.seatListEl.append(h('div', {
+      title: seat && seat.detail ? seat.detail : '',
+      text: `${providerName(provider)}（${provider}）：${automationSeatLabel(seat)}${configured}${detail}`,
+    }));
+  }
+
+  const configuredCount = panel.seats.filter((provider) => automationConfig(provider)).length;
+  const active = Boolean(run && run.enabled);
+  panel.startButton.hidden = active;
+  panel.startButton.disabled = state.automationBusy || configuredCount === 0;
+  panel.startButton.title = configuredCount === 0
+    ? '先在连接设置保存本机网页地址与 CSS 选择器'
+    : '显式开始自动派发；手动复制、粘贴和提交始终可用';
+  panel.stopButton.hidden = !active;
+  panel.stopButton.disabled = state.automationBusy;
+  panel.refreshButton.hidden = !active;
+  panel.refreshButton.disabled = state.automationBusy;
 }
 
 function renderSessionHeader(session) {
   const seats = session.providers.map((provider, index) => h('span', {
     class: `seat-meta seat-meta-${index === 0 ? 'a' : 'b'}`,
+    title: isAutomationSeat(provider)
+      ? automationConfig(provider)
+        ? '本机网页席位：可手动操作，也可在连接设置与显式开始后自动派发'
+        : '本机网页席位：尚未在连接设置保存地址，只能手动操作'
+      : '原网站席位：手动复制提示并粘贴回答',
   }, h('span', { class: 'seat-dot', attrs: { 'aria-hidden': 'true' } }),
-    `席 ${seatLetter(index)} · ${providerName(provider)}`));
+    `席 ${seatLetter(index)} · ${providerName(provider)}`,
+    h('span', { class: 'provider-tag', text: automationSeatMode(session, provider) })));
 
   const statusText = session.stage === 'done'
     ? '已结束'
@@ -1516,14 +2122,22 @@ function renderTaskCard(session, task, fallbackIndex) {
     text: statusLabel(task.status),
   });
 
+  const autoSeat = isAutomationSeat(providerId)
+    ? automationSeatState(automationRun(session), providerId)
+    : null;
   const header = h('div', { class: 'seat-top' },
     h('div', { class: 'seat-identity' },
       h('span', { class: `seat-badge${seat === 'B' ? ' seat-badge-b' : ''}`, text: seat }),
       h('div', {},
         h('div', { class: 'seat-name', text: name }),
-        h('div', { class: 'seat-sub', text: `${providerId || '未登记站点'} · 席 ${seat}` }))),
+        h('div', { class: 'seat-sub' },
+          `${providerId || '未登记站点'} · 席 ${seat}`,
+          h('span', { class: 'provider-tag', text: automationSeatMode(session, providerId) })))),
     h('div', { class: 'seat-status' },
       hasDraft && !editorOpen ? h('span', { class: 'draft-chip', text: '有草稿' }) : null,
+      autoSeat && automationSeatNeedsAction(autoSeat)
+        ? h('span', { class: 'draft-chip', text: '自动待处理', title: autoSeat.detail || '' })
+        : null,
       statusChip));
   card.append(header, renderPromptBox(task));
 
@@ -1968,6 +2582,165 @@ async function copyText(text) {
 
 /* ------------------------------ 结论与历史 ------------------------------ */
 
+const SOURCE_CITE_MS = 3200;
+const citeTimers = new WeakMap();
+
+function sourceAnchorId(sourceId) {
+  return `source-${String(sourceId || '').toLowerCase().replace(/[^a-z0-9_-]/g, '')}`;
+}
+
+function reportSourceIndex(session) {
+  const index = new Map();
+  for (const entry of session.history) {
+    if (entry.sourceId) index.set(entry.sourceId, entry);
+  }
+  for (const task of session.tasks) {
+    if (task.sourceId && !index.has(task.sourceId)) index.set(task.sourceId, task);
+  }
+  return index;
+}
+
+function highlightSource(sourceId) {
+  const target = document.getElementById(sourceAnchorId(sourceId));
+  if (!target) {
+    toast(`本场没有找到 ${sourceId} 的原文`, 'error');
+    return;
+  }
+  let smooth = true;
+  try {
+    smooth = !window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  } catch {
+    /* 保持默认滚动。 */
+  }
+  target.scrollIntoView({ behavior: smooth ? 'smooth' : 'auto', block: 'center' });
+  try {
+    target.focus({ preventScroll: true });
+  } catch {
+    /* 个别环境禁止脚本聚焦，滚动定位仍然有效。 */
+  }
+  target.classList.remove('is-cited');
+  void target.offsetWidth;
+  target.classList.add('is-cited');
+  const previous = citeTimers.get(target);
+  if (previous) clearTimeout(previous);
+  citeTimers.set(target, setTimeout(() => target.classList.remove('is-cited'), SOURCE_CITE_MS));
+}
+
+function reportCitation(sourceId) {
+  return h('a', {
+    class: 'report-cite',
+    href: `#${sourceAnchorId(sourceId)}`,
+    dataset: { sourceId },
+    title: `跳到 ${sourceId} 的原文`,
+    attrs: { 'aria-label': `跳到来源 ${sourceId} 的原文` },
+    text: `[${sourceId}]`,
+    onClick: (event) => {
+      event.preventDefault();
+      highlightSource(sourceId);
+    },
+  });
+}
+
+function appendReportInline(parent, text, sources) {
+  const value = String(text ?? '');
+  const token = /(\*\*[^*]+\*\*|`[^`]+`|\[S\d+\])/g;
+  let lastIndex = 0;
+  for (const match of value.matchAll(token)) {
+    if (match.index > lastIndex) parent.append(document.createTextNode(value.slice(lastIndex, match.index)));
+    const piece = match[0];
+    if (piece.startsWith('**') && piece.endsWith('**') && piece.length > 4) {
+      parent.append(h('strong', { text: piece.slice(2, -2) }));
+    } else if (piece.startsWith('`')) {
+      parent.append(h('code', { text: piece.slice(1, -1) }));
+    } else {
+      const sourceId = piece.slice(1, -1);
+      if (sources.has(sourceId)) parent.append(reportCitation(sourceId));
+      else parent.append(document.createTextNode(piece));
+    }
+    lastIndex = match.index + piece.length;
+  }
+  if (lastIndex < value.length) parent.append(document.createTextNode(value.slice(lastIndex)));
+}
+
+function reportParagraph(text, sources) {
+  const paragraph = h('p', { class: 'report-md-p' });
+  const lines = String(text ?? '').split('\n');
+  lines.forEach((line, index) => {
+    if (index) paragraph.append(h('br'));
+    appendReportInline(paragraph, line, sources);
+  });
+  return paragraph;
+}
+
+function reportHeading(level, text, sources) {
+  const depth = Math.max(1, Math.min(4, Number(level) || 1));
+  const tag = depth <= 2 ? 'h3' : depth === 3 ? 'h4' : 'h5';
+  const heading = h(tag, { class: `report-md-heading report-md-h${depth}` });
+  appendReportInline(heading, text, sources);
+  return heading;
+}
+
+function renderReportMarkdown(markdown, session) {
+  const root = h('div', { class: 'report-md' });
+  const sources = new Set(reportSourceIndex(session).keys());
+  const lines = String(markdown ?? '').split(/\r?\n/);
+  let index = 0;
+
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+
+    const heading = /^(#{1,4})\s+(.+)$/.exec(line);
+    if (heading) {
+      root.append(reportHeading(heading[1].length, heading[2].trim(), sources));
+      index += 1;
+      continue;
+    }
+
+    if (/^[-*]\s+/.test(line)) {
+      const list = h('ul', { class: 'report-md-list' });
+      while (index < lines.length && /^[-*]\s+/.test(lines[index])) {
+        const item = h('li', {});
+        appendReportInline(item, lines[index].replace(/^[-*]\s+/, ''), sources);
+        list.append(item);
+        index += 1;
+      }
+      root.append(list);
+      continue;
+    }
+
+    if (/^>\s?/.test(line)) {
+      const quoteLines = [];
+      while (index < lines.length && /^>\s?/.test(lines[index])) {
+        quoteLines.push(lines[index].replace(/^>\s?/, ''));
+        index += 1;
+      }
+      const quote = h('blockquote', { class: 'report-md-quote' });
+      quote.append(reportParagraph(quoteLines.join('\n'), sources));
+      root.append(quote);
+      continue;
+    }
+
+    const paragraphLines = [];
+    while (
+      index < lines.length
+      && lines[index].trim()
+      && !/^(#{1,4})\s+/.test(lines[index])
+      && !/^[-*]\s+/.test(lines[index])
+      && !/^>\s?/.test(lines[index])
+    ) {
+      paragraphLines.push(lines[index]);
+      index += 1;
+    }
+    root.append(reportParagraph(paragraphLines.join('\n'), sources));
+  }
+
+  return root;
+}
+
 function renderReport(session) {
   const reportText = session.report && session.report.trim() ? session.report.trim() : '';
   const actions = h('div', { class: 'report-actions' });
@@ -2003,7 +2776,13 @@ function renderReport(session) {
       actions));
 
   if (reportText) {
-    section.append(h('div', { class: 'report-body', text: reportText }));
+    section.append(renderReportMarkdown(reportText, session));
+    if (/\[S\d+\]/.test(reportText)) {
+      section.append(h('p', {
+        class: 'report-source-note',
+        text: '带方括号的编号可跳到下方「历次发言」的对应原文；点击后会高亮该条。',
+      }));
+    }
   } else {
     section.append(h('div', {
       class: 'report-empty',
@@ -2090,12 +2869,31 @@ function renderHistory(session) {
 
 function renderHistoryEntry(session, entry) {
   const seatIndex = session.providers.indexOf(entry.provider);
+  const sourceId = String(entry.sourceId || '').trim();
+  const anchorId = sourceId ? sourceAnchorId(sourceId) : '';
   const meta = h('div', { class: 'timeline-meta' },
     h('span', { class: 'timeline-seat', text: `席 ${seatLetter(seatIndex >= 0 ? seatIndex : 0)} · ${providerName(entry.provider)}` }),
     h('span', { text: statusLabel(entry.status) }));
   if (entry.stance) meta.append(stanceChip(entry.stance));
+  if (sourceId) {
+    meta.append(h('a', {
+      class: 'source-id',
+      href: `#${anchorId}`,
+      title: `${sourceId} 的原文位置`,
+      text: sourceId,
+      onClick: (event) => {
+        event.preventDefault();
+        highlightSource(sourceId);
+      },
+    }));
+  }
 
-  const item = h('article', { class: 'timeline-item' }, meta);
+  const item = h('article', {
+    class: 'timeline-item',
+    id: anchorId || null,
+    dataset: sourceId ? { sourceId } : null,
+    attrs: sourceId ? { tabindex: '-1' } : null,
+  }, meta);
 
   if (entry.status === 'skipped') {
     item.append(h('div', { class: 'timeline-answer is-muted', text: '该席在本阶段缺席（跳过）。' }));
@@ -2294,9 +3092,18 @@ function bindGlobalEvents() {
     });
   });
 
-  window.addEventListener('pagehide', flushStoredState);
+  window.addEventListener('pagehide', () => {
+    flushStoredState();
+    stopAutomationPolling();
+  });
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') flushStoredState();
+  });
+  document.addEventListener('focusout', () => {
+    if (!state.automationRefreshPending) return;
+    setTimeout(() => {
+      if (!automationEditingFocus()) void pollAutomation();
+    }, 120);
   });
 }
 
@@ -2318,6 +3125,7 @@ async function boot() {
     setSessions(reply.sessions);
     hideGlobalError();
     renderHistoryList();
+    await loadAutomationInfo({ silent: true });
 
     const hashId = readHashId();
     if (hashId) await openSession(hashId);

@@ -27,6 +27,10 @@
 //   allowlists. `create` needs exactly two distinct canonical lowercase provider
 //   ids from providers.js; `open` only opens a registry URL for a seat that is
 //   actually part of the session.
+// - `open` reuses the seat's bound tab when the `tabs` metadata permission shows
+//   its URL still belongs to the intended page (see `tabMatchesEntry`). It never
+//   reads page content, never queries unrelated tabs, and never navigates a tab
+//   that was repurposed elsewhere.
 //
 // Persistence: one IndexedDB database. Every read-modify-write command runs
 // through a promise queue *and* inside a single readwrite transaction, so two
@@ -34,8 +38,14 @@
 // failing mutator aborts the transaction, so no partial state is written.
 
 import { createSession, applyAction } from './core.js';
-import { PROVIDERS, isProviderId } from './providers.js';
+import { installAutomation } from './automation.js';
+import {
+  PROVIDERS,
+  AUTOMATION_PROVIDER_IDS,
+  isProviderId,
+} from './providers.js';
 
+const AUTOMATION_SEATS = new Set(AUTOMATION_PROVIDER_IDS);
 const STANCES = new Set(['agree', 'conditional', 'oppose']);
 const COMMAND_TYPES = new Set(['list', 'get', 'create', 'act', 'delete', 'open']);
 const ACTIONS = new Set(['answer', 'skip', 'pause', 'resume', 'finish']);
@@ -396,78 +406,87 @@ async function clearBindings(sessionId) {
 }
 
 /**
- * Chrome withholds a provider tab's URL unless the extension holds `tabs` or a
- * matching host permission (the current manifest has neither). To avoid
- * focusing a dedicated tab the user navigated elsewhere, remember the tabs we
- * opened during this worker lifetime and watch their load events: a tab is
- * reusable without a readable URL only after it completed its initial load and
- * before any later navigation starts. After a worker restart this memory is
- * empty, so the conservative path (open a fresh tab) is taken instead of
- * guessing. URL-readable tabs are always verified by origin at open time.
+ * Reuse decisions read tab metadata only. The manifest holds the `tabs`
+ * permission, which exposes `url`/`pendingUrl` for the bound tab but grants no
+ * page-content access (automation still needs `scripting` plus the optional
+ * loopback host permission). No `chrome.tabs.query` is used: the worker only
+ * inspects the tab id it bound for this session+seat, so an unrelated user tab
+ * is never touched.
+ *
+ * Verification is intentionally conservative:
+ * - scheme+host+port must match the intended entry origin exactly, so two
+ *   loopback seats on different ports are never confused;
+ * - if the configured entry URL names a seat (`?seat=A`, used when both loopback
+ *   seats share one fixture origin), the tab must name the same seat;
+ * - the tab's destination URL is the decisive one (`pendingUrl` while a
+ *   navigation is pending, otherwise `url`), so a tab mid-redirect to another
+ *   site is never focused even though its old page still matches;
+ * - a tab whose readable URL no longer matches, or whose URL is unreadable, is
+ *   never focused and never navigated: the stale binding is dropped and a fresh
+ *   dedicated tab is opened at the allowlisted entry URL.
+ *
+ * Because the binding lives in IndexedDB and re-verified from tab metadata,
+ * reuse keeps working after the MV3 worker restarts; no in-memory "we once
+ * opened it" state is required.
  */
-const seatTabState = new Map();
-
-function rememberSeatTab(tabId, sessionId, providerId) {
-  seatTabState.set(tabId, { sessionId, providerId, phase: 'loading' });
-}
-
-function seatTabIsTrusted(tabId, sessionId, providerId) {
-  const seat = seatTabState.get(tabId);
-  if (!seat) return false;
-  if (seat.sessionId !== sessionId || seat.providerId !== providerId) return false;
-  return seat.phase === 'ready';
-}
-
-function watchSeatTabs() {
-  if (typeof chrome === 'undefined' || !chrome.tabs) return;
-  if (chrome.tabs.onUpdated) {
-    chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-      const seat = seatTabState.get(tabId);
-      if (!seat) return;
-      if (changeInfo.status === 'complete') {
-        if (seat.phase === 'loading') seat.phase = 'ready';
-        return;
-      }
-      if (changeInfo.status === 'loading' && seat.phase === 'ready') {
-        // A load after the seat page was ready may be another site entirely;
-        // stop treating this tab as reusable without a URL check.
-        seat.phase = 'dirty';
-      }
-    });
-  }
-  if (chrome.tabs.onRemoved) {
-    chrome.tabs.onRemoved.addListener((tabId) => seatTabState.delete(tabId));
-  }
-  if (chrome.tabs.onReplaced) {
-    chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
-      seatTabState.delete(removedTabId);
-      seatTabState.delete(addedTabId);
-    });
-  }
-}
-
-watchSeatTabs();
-
-function readableTabUrl(tab) {
+function tabEntryUrl(tab) {
   if (!tab || typeof tab !== 'object') return '';
-  if (typeof tab.url === 'string' && tab.url) return tab.url;
+  // While a navigation is pending Chrome keeps the committed page in `url` and
+  // exposes the destination in `pendingUrl`. Trust the destination: it is the
+  // page the tab is actually becoming. A freshly created tab commonly reports
+  // `url: "about:blank"` plus the real `pendingUrl`, so `url` alone would
+  // wrongly look like a repurposed tab.
   if (typeof tab.pendingUrl === 'string' && tab.pendingUrl) return tab.pendingUrl;
+  if (typeof tab.url === 'string' && tab.url) return tab.url;
   return '';
 }
 
-function sameOrigin(left, right) {
+function originOf(url) {
   try {
-    return new URL(left).origin === new URL(right).origin;
+    return new URL(url).origin;
   } catch {
-    return false;
+    return '';
   }
 }
 
-async function focusTab(tab) {
-  await chrome.tabs.update(tab.id, { active: true });
-  if (Number.isInteger(tab.windowId) && chrome.windows && chrome.windows.update) {
+/** Compare scheme+host+port; `http://127.0.0.1:8765` ≠ `...:8766`. */
+function sameOrigin(left, right) {
+  const a = originOf(left);
+  const b = originOf(right);
+  return Boolean(a) && a === b;
+}
+
+/** Seat marker used by the shared loopback fixture (`?seat=A` / `?seat=B`). */
+function seatOf(url) {
+  try {
+    const value = new URL(url).searchParams.get('seat');
+    if (value === null) return null;
+    const seat = value.trim().toUpperCase();
+    return seat || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A tab is the intended seat tab only when the URL it is showing/becoming still
+ * belongs to the configured entry page. New-chat routes on the same origin
+ * (path/query changed) stay reusable; another site, another port or the other
+ * fixture seat does not.
+ */
+function tabMatchesEntry(tab, entryUrl) {
+  const url = tabEntryUrl(tab);
+  if (!url || !sameOrigin(url, entryUrl)) return false;
+  const expectedSeat = seatOf(entryUrl);
+  if (expectedSeat && seatOf(url) !== expectedSeat) return false;
+  return true;
+}
+
+async function focusTab(tab, tabsApi = chrome.tabs, windowsApi = chrome.windows) {
+  await tabsApi.update(tab.id, { active: true });
+  if (Number.isInteger(tab.windowId) && windowsApi && windowsApi.update) {
     try {
-      await chrome.windows.update(tab.windowId, { focused: true });
+      await windowsApi.update(tab.windowId, { focused: true });
     } catch {
       /* focusing the window is best effort */
     }
@@ -475,27 +494,53 @@ async function focusTab(tab) {
 }
 
 /**
- * Reuse the dedicated seat tab only when Chrome lets us prove it still points
- * at the provider origin.
- *
- * With the current manifest (extension has only `storage`), Chrome hides
- * `tab.url`/`pendingUrl` for provider tabs. An unreadable URL therefore means
- * "unverified", not "matches". The tab is reused only when this worker watched
- * it complete its initial load and start no later navigation (see
- * `seatTabState`); otherwise focusing it would treat a tab the user (or the
- * site) navigated elsewhere as the seat page — the hijacking case this function
- * must avoid. In that case the stale binding is dropped and a fresh dedicated
- * tab is opened at the allowlisted entry URL, leaving the user's navigated tab
- * untouched. Adding a `tabs`/host permission later makes origin reuse work even
- * after a worker restart, with no other change here.
+ * One in-flight open per session+seat. Two clicks before the first tab appears
+ * join the same attempt, so a slow provider page can not produce two
+ * conversations. After the worker restarts this map is empty again; the
+ * persisted binding plus readable tab metadata is what then prevents a
+ * duplicate (see `tabMatchesEntry`).
  */
-async function openProviderTab(sessionId, providerId) {
-  const provider = PROVIDERS[providerId];
+const pendingOpens = new Map();
+
+async function openProviderTab(sessionId, providerId, configuredUrl = '', overrides = {}) {
   const key = bindingKey(sessionId, providerId);
+  const inFlight = pendingOpens.get(key);
+  if (inFlight) {
+    // Same session+seat already opening: share that attempt. A failure is
+    // reported to both callers; the user can click again.
+    return inFlight;
+  }
+  const attempt = openProviderTabOnce(sessionId, providerId, configuredUrl, key, overrides);
+  pendingOpens.set(key, attempt);
+  try {
+    return await attempt;
+  } finally {
+    if (pendingOpens.get(key) === attempt) pendingOpens.delete(key);
+  }
+}
+
+/**
+ * Reuse the bound seat tab only when its readable metadata still proves it is
+ * the configured entry page; otherwise leave that tab untouched and open a
+ * fresh one. `overrides` exists for the Node regression test (fake tabs and
+ * binding store); the extension always uses the real Chrome APIs.
+ */
+async function openProviderTabOnce(sessionId, providerId, configuredUrl, key, overrides) {
+  const provider = PROVIDERS[providerId];
+  if (!provider) throw new ArenaError('未知或不规范的席位标识');
+  const tabsApi = overrides.tabs || chrome.tabs;
+  const store = overrides.bindings || {
+    get: getBinding,
+    set: setBinding,
+    drop: dropBinding,
+  };
+  const targetUrl = typeof configuredUrl === 'string' && configuredUrl
+    ? configuredUrl
+    : provider.url;
 
   let binding = null;
   try {
-    binding = await getBinding(key);
+    binding = await store.get(key);
   } catch {
     binding = null;
   }
@@ -503,62 +548,45 @@ async function openProviderTab(sessionId, providerId) {
   if (binding && Number.isInteger(binding.tabId)) {
     let tab = null;
     try {
-      tab = await chrome.tabs.get(binding.tabId);
+      // Only the tab bound to this session+seat is inspected; never query all
+      // tabs, so the user's other windows are out of reach.
+      tab = await tabsApi.get(binding.tabId);
     } catch {
       tab = null;
     }
 
-    if (tab && Number.isInteger(tab.id)) {
-      const url = readableTabUrl(tab);
-      if (url && sameOrigin(url, provider.url)) {
-        await focusTab(tab);
-        await setBinding(key, {
-          ...binding,
-          provider: providerId,
-          sessionId,
-          entryUrl: provider.url,
-          lastOpenedAt: Date.now(),
-        });
-        return tab.id;
-      }
-      if (!url && seatTabIsTrusted(tab.id, sessionId, providerId)) {
-        await focusTab(tab);
-        await setBinding(key, {
-          ...binding,
-          provider: providerId,
-          sessionId,
-          entryUrl: provider.url,
-          lastOpenedAt: Date.now(),
-        });
-        return tab.id;
-      }
-      // Readable mismatch: the seat tab now shows another site. Unreadable and
-      // untrusted: we cannot prove it is still the provider tab. In both cases,
-      // never yank/focus it; discard the binding and open a clean tab below.
-      seatTabState.delete(tab.id);
-      try {
-        await dropBinding(key);
-      } catch {
-        /* the fresh tab below is still the safe outcome */
-      }
-    } else {
-      if (Number.isInteger(binding.tabId)) seatTabState.delete(binding.tabId);
-      try {
-        await dropBinding(key);
-      } catch {
-        /* closed tab: fall through to a fresh one */
-      }
+    try { await chrome.storage.local.set({ ['dbg.' + Date.now()]: { step: 'get', binding: binding.tabId, url: tab && tab.url, pendingUrl: tab && tab.pendingUrl, status: tab && tab.status, match: tab && tabMatchesEntry(tab, targetUrl) } }); } catch {}
+    if (tab && Number.isInteger(tab.id) && tabMatchesEntry(tab, targetUrl)) {
+      await focusTab(tab, tabsApi, overrides.windows);
+      await store.set(key, {
+        ...binding,
+        provider: providerId,
+        sessionId,
+        entryUrl: targetUrl,
+        lastOpenedAt: Date.now(),
+      });
+      return tab.id;
+    }
+
+    // Closed, unreadable, another origin or another fixture seat: this is no
+    // longer provably the seat tab. Never focus or navigate it; forget the
+    // binding and open a clean tab at the allowlisted entry URL.
+    try {
+      await store.drop(key);
+    } catch {
+      /* the fresh tab below is still the safe outcome */
     }
   }
 
-  const tab = await chrome.tabs.create({ url: provider.url, active: true });
+  try { await chrome.storage.local.set({ ['dbg.' + Date.now()]: { step: 'create-before', targetUrl } }); } catch {}
+  const tab = await tabsApi.create({ url: targetUrl, active: true });
+  try { await chrome.storage.local.set({ ['dbg.' + Date.now()]: { step: 'created', id: tab && tab.id, url: tab && tab.url, pendingUrl: tab && tab.pendingUrl } }); } catch {}
   if (!tab || !Number.isInteger(tab.id)) throw new ArenaError('无法打开网页标签');
-  rememberSeatTab(tab.id, sessionId, providerId);
-  await setBinding(key, {
+  await store.set(key, {
     tabId: tab.id,
     provider: providerId,
     sessionId,
-    entryUrl: provider.url,
+    entryUrl: targetUrl,
     openedAt: Date.now(),
     lastOpenedAt: Date.now(),
   });
@@ -570,6 +598,7 @@ async function openProviderTab(sessionId, providerId) {
 // ---------------------------------------------------------------------------
 
 let queueTail = Promise.resolve();
+let automationApi = null;
 
 /** Serialize every command so two UI windows can not interleave writes. */
 function serialize(task) {
@@ -646,6 +675,31 @@ async function commandDelete(message) {
   return {};
 }
 
+/**
+ * Local seats have no meaningful public entry URL: the user's saved
+ * automation.config address is the only real target. Refuse to guess
+ * `http://localhost/` (port 80) when nothing was saved.
+ */
+async function configuredLocalEntryUrl(provider) {
+  if (!automationApi) {
+    throw new ArenaError('自动化后台尚未就绪，请重新加载扩展后再试');
+  }
+  let info;
+  try {
+    info = await automationApi.info();
+  } catch (error) {
+    throw new ArenaError(`无法读取本机连接设置：${errorMessage(error)}`);
+  }
+  const config = info && info.configs ? info.configs[provider] : null;
+  const url = config && typeof config.url === 'string' ? config.url.trim() : '';
+  if (!url) {
+    throw new ArenaError(
+      `本机席位 ${provider} 尚未配置网页地址；请先在“连接设置”保存 local-a / local-b 的实际地址与 CSS 选择器`,
+    );
+  }
+  return url;
+}
+
 async function commandOpen(message) {
   const id = requireToken(message.id, 'id');
   if (!isProviderId(message.provider)) {
@@ -658,7 +712,10 @@ async function commandOpen(message) {
     if (!session.providers.includes(provider)) {
       throw new ArenaError('该席位不在本场名单中');
     }
-    await openProviderTab(session.id, provider);
+    const entryUrl = AUTOMATION_SEATS.has(provider)
+      ? await configuredLocalEntryUrl(provider)
+      : '';
+    await openProviderTab(session.id, provider, entryUrl);
     return { session };
   });
 }
@@ -704,8 +761,29 @@ function isTrustedSender(sender) {
 // Wiring
 // ---------------------------------------------------------------------------
 
+// automation.js owns every automation.* message and validates its own sender.
+// It only writes through the same two command paths used by the UI, so the
+// stored session remains the single source of truth.
+if (typeof chrome !== 'undefined' && chrome.runtime) {
+  automationApi = installAutomation({
+    getSession: async (id) => (await commandGet({ id })).session,
+    act: async (id, action, payload) => (await commandAct({ id, action, payload })).session,
+  });
+}
+
 if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage) {
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (
+      message
+      && typeof message === 'object'
+      && typeof message.type === 'string'
+      && message.type.startsWith('automation.')
+    ) {
+      // Not ours: do not answer, do not keep the channel open, and do not
+      // shadow automation.js's own listener.
+      return false;
+    }
+
     let replied = false;
     const reply = (value) => {
       if (replied) return;
@@ -740,3 +818,13 @@ if (typeof chrome !== 'undefined' && chrome.action && chrome.action.onClicked) {
     }
   });
 }
+
+// Test surface for tests/tab-reuse.mjs. A service worker ignores exports; the
+// real wiring above is unchanged.
+export {
+  openProviderTab,
+  tabMatchesEntry,
+  tabEntryUrl,
+  sameOrigin,
+  seatOf,
+};

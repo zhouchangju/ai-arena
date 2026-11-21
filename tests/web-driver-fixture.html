@@ -1,0 +1,697 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Arena · Web Driver 夹具</title>
+<style>
+  :root {
+    --ink: #1c1f24;
+    --muted: #6b7280;
+    --line: #e3e6ea;
+    --paper: #f6f4ef;
+    --card: #ffffff;
+    --accent: #2f6f5e;
+    --accent-soft: #e7f1ed;
+    --warn: #9a5b22;
+    --warn-soft: #f8efe2;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  }
+  header {
+    padding: 28px 28px 18px;
+    max-width: 1120px;
+    margin: 0 auto;
+  }
+  .kicker {
+    font-size: 12px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0 0 8px;
+  }
+  h1 {
+    font-size: 24px;
+    line-height: 1.3;
+    margin: 0 0 8px;
+    font-weight: 650;
+  }
+  h1 .seat-tag {
+    display: inline-block;
+    margin-left: 8px;
+    padding: 2px 9px;
+    border-radius: 999px;
+    background: var(--accent);
+    color: #fff;
+    font-size: 13px;
+    vertical-align: 3px;
+  }
+  .lede {
+    margin: 0;
+    color: #434a54;
+    max-width: 760px;
+  }
+  .seat-nav { margin-top: 14px; display: flex; gap: 8px; flex-wrap: wrap; }
+  .seat-nav a {
+    color: var(--accent);
+    text-decoration: none;
+    border: 1px solid #c9dbd4;
+    background: #fff;
+    border-radius: 8px;
+    padding: 4px 11px;
+    font-size: 13px;
+  }
+  .seat-nav a.current { background: var(--accent); color: #fff; border-color: var(--accent); }
+  main {
+    max-width: 1120px;
+    margin: 0 auto;
+    padding: 0 28px 48px;
+    display: grid;
+    grid-template-columns: minmax(0, 1.55fr) minmax(290px, 1fr);
+    gap: 20px;
+    align-items: start;
+  }
+  .stage, .panel {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    box-shadow: 0 1px 2px rgba(23, 26, 31, .04);
+  }
+  .stage { display: flex; flex-direction: column; min-height: 560px; }
+  .stage-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--line);
+  }
+  .badge {
+    font-size: 12px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .badge.busy { background: var(--warn-soft); color: var(--warn); }
+  .meta-line { color: var(--muted); font-size: 12px; }
+  .log {
+    flex: 1;
+    overflow-y: auto;
+    padding: 18px 16px 8px;
+    max-height: 60vh;
+    min-height: 300px;
+  }
+  .turn { margin: 0 0 18px; }
+  .turn .meta { font-size: 12px; color: var(--muted); margin: 0 0 4px; }
+  .turn .msg {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    border-radius: 12px;
+    padding: 10px 13px;
+    border: 1px solid var(--line);
+    background: #fbfbfa;
+  }
+  .turn.user .msg {
+    background: #eef3f7;
+    border-color: #d7e2ea;
+  }
+  .turn.answer .msg {
+    background: #fff;
+    border-color: #e6e3da;
+  }
+  .turn.copy .meta { color: #a0a6af; }
+  .turn.copy .msg { opacity: .62; border-style: dashed; }
+  .turn.streaming .msg::after {
+    content: "▍";
+    color: var(--accent);
+    margin-left: 2px;
+  }
+  .composer {
+    border-top: 1px solid var(--line);
+    padding: 12px 16px 14px;
+  }
+  #composer {
+    width: 100%;
+    resize: vertical;
+    min-height: 74px;
+    border: 1px solid #ccd2d8;
+    border-radius: 10px;
+    padding: 10px 12px;
+    font: inherit;
+    background: #fff;
+    color: var(--ink);
+  }
+  #composer:focus { outline: 2px solid #bcd8ce; outline-offset: 1px; }
+  .actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 10px;
+    flex-wrap: wrap;
+  }
+  button {
+    font: inherit;
+    font-size: 14px;
+    border-radius: 9px;
+    border: 1px solid #ccd2d8;
+    background: #fff;
+    color: var(--ink);
+    padding: 7px 15px;
+    cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: #f4f6f5; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  #send { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600; }
+  #send:hover:not(:disabled) { background: #275f50; }
+  #stop { background: #fff6f4; border-color: #e2b4a8; color: #a33b23; }
+  .done-marker {
+    margin-left: auto;
+    font-size: 12px;
+    color: var(--accent);
+    background: var(--accent-soft);
+    border-radius: 999px;
+    padding: 3px 10px;
+  }
+  #hint { margin: 8px 0 0; font-size: 12px; color: var(--warn); min-height: 1.2em; }
+  .panel { padding: 18px; }
+  .panel h2 {
+    font-size: 13px;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0 0 10px;
+    font-weight: 650;
+  }
+  .panel h2:not(:first-child) { margin-top: 22px; }
+  .field { margin-bottom: 10px; }
+  .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 3px; }
+  select {
+    width: 100%;
+    font: inherit;
+    font-size: 14px;
+    padding: 6px 8px;
+    border-radius: 8px;
+    border: 1px solid #ccd2d8;
+    background: #fff;
+  }
+  .panel .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .panel .row button { flex: 1 1 40%; font-size: 13px; padding: 6px 10px; }
+  pre {
+    margin: 0;
+    background: #faf9f5;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-size: 11.5px;
+    line-height: 1.55;
+    overflow-x: auto;
+    color: #39404a;
+  }
+  details { margin-top: 14px; }
+  summary { cursor: pointer; font-size: 13px; color: var(--accent); }
+  details p, details li { color: #454c56; font-size: 13px; }
+  details ol { padding-left: 20px; margin: 8px 0 0; }
+  .note {
+    font-size: 12px;
+    color: var(--muted);
+    background: #faf9f5;
+    border-radius: 9px;
+    padding: 9px 11px;
+    margin: 0;
+  }
+  .foot {
+    max-width: 1120px;
+    margin: 0 auto;
+    padding: 0 28px 40px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  code { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: .92em; }
+  @media (max-width: 860px) {
+    main { grid-template-columns: 1fr; padding: 0 16px 40px; }
+    header { padding: 20px 16px 14px; }
+    .foot { padding: 0 16px 30px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <p class="kicker">AI Arena · tests only</p>
+  <h1>Web Driver 夹具<span class="seat-tag" id="seat-label">A 席</span></h1>
+  <p class="lede">
+    本地、确定性的“网页版 AI”替身，用来验证 <code>extension/web-driver.js</code> 的
+    填写、发送、读取、完成判断与各种失败关闭。回答由本地哈希生成，带 <code>[FIXTURE]</code> 标记，
+    每轮都有一行可直接解析的 <code>STANCE: agree|conditional|oppose</code> 立场；本页不推断任何人或模型的意图。
+  </p>
+  <nav class="seat-nav" aria-label="席位">
+    <a id="seat-a" href="?seat=A">A 席</a>
+    <a id="seat-b" href="?seat=B">B 席</a>
+    <span class="meta-line">两席用两个标签页打开；每席各自一个 taskId。</span>
+  </nav>
+</header>
+
+<main>
+  <section class="stage" aria-label="会话">
+    <div class="stage-head">
+      <span class="badge" id="state">就绪</span>
+      <span class="meta-line" id="counts">0 轮</span>
+    </div>
+    <div class="log" id="log" role="log" aria-live="polite"></div>
+    <div class="composer">
+      <textarea id="composer" rows="3" placeholder="输入本轮提示……（Enter 发送，Shift+Enter 换行）"></textarea>
+      <div class="actions">
+        <button id="send" type="button">发送</button>
+        <button id="stop" type="button" hidden>停止</button>
+        <div id="done" class="done-marker" hidden>生成完成</div>
+      </div>
+      <p id="hint" role="status"></p>
+    </div>
+  </section>
+
+  <aside class="panel">
+    <h2>测试参数</h2>
+    <div class="field">
+      <label for="speed">生成速度</label>
+      <select id="speed">
+        <option value="normal">normal（约 0.7 秒）</option>
+        <option value="slow">slow（约 5 秒，便于观察 pending）</option>
+      </select>
+    </div>
+    <div class="field">
+      <label for="fail">失败注入 / 完成信号</label>
+      <select id="fail">
+        <option value="none">none：stop + done 都出现</option>
+        <option value="nostop">nostop：只有 done 标记</option>
+        <option value="nodone">nodone：只有 stop 消失</option>
+        <option value="nosignal">nosignal：两者都没有（驱动应保持 pending）</option>
+        <option value="duplicate">duplicate：先重放上一轮旧消息</option>
+        <option value="stale">stale：回答复制上一轮文本</option>
+        <option value="empty">empty：完成但回答为空</option>
+        <option value="reorder">reorder：回答排在用户消息之前</option>
+      </select>
+    </div>
+    <p class="note" id="mode-note">正常模式：stop 出现后消失，并出现 done 标记。</p>
+
+    <h2>操作</h2>
+    <div class="row">
+      <button id="draft" type="button">注入旧草稿</button>
+      <button id="example" type="button">填入示例问题</button>
+      <button id="reset" type="button">清空会话</button>
+    </div>
+
+    <h2>驱动选择器</h2>
+    <pre id="selectors">{
+  "input": "#composer",
+  "send": "#send",
+  "user": "#log .turn.user .msg",
+  "answer": "#log .turn.answer .msg",
+  "stop": "#stop",
+  "done": "#done",
+  "container": "#log"
+}</pre>
+
+    <details>
+      <summary>验收步骤</summary>
+      <ol>
+        <li>装扩展后在该标签页注入 <code>extension/web-driver.js</code>；工作台用 <code>frameId: 0</code> 发消息。</li>
+        <li><code>arena.web.probe</code> 应返回 <code>ready</code>，并显示当前草稿是否为空。</li>
+        <li><code>arena.web.submit</code> 使用上面选择器与一个 taskId；返回 <code>submitted</code> 后轮询 <code>arena.web.read</code>。</li>
+        <li>用 slow 观察 <code>pending</code>；用 nostop / nodone 验证两种完成证据；用 nosignal 验证永不误判。</li>
+        <li>用 duplicate / stale / reorder / empty 验证旧文本、错序与空回答都被拒绝。</li>
+        <li>先注入旧草稿再提交不同 prompt，应返回 <code>draft-conflict</code> 且草稿不被覆盖。</li>
+        <li>刷新页面后对旧 taskId 调 <code>arena.web.read</code>，应返回 <code>unknown</code>。</li>
+      </ol>
+    </details>
+  </aside>
+</main>
+
+<p class="foot">
+  夹具仅存在于 <code>tests/</code>。无外部请求、无账号、无真实模型；回答内容由 <code>seat + round + prompt</code> 的本地哈希决定。
+  <code>STANCE:</code> 是本页唯一可解析的立场行（只取 agree / conditional / oppose 之一），其余文字只是测试素材。
+</p>
+
+<script>
+(function () {
+  'use strict';
+
+  var VALID_FAIL = ['none', 'nostop', 'nodone', 'nosignal', 'duplicate', 'stale', 'empty', 'reorder'];
+  var params = new URLSearchParams(location.search);
+  var seatParam = String(params.get('seat') || 'A').trim().toUpperCase();
+  var seat = (seatParam === 'B' || seatParam === '2') ? 'B' : 'A';
+  var fail = String(params.get('fail') || 'none').toLowerCase();
+  if (VALID_FAIL.indexOf(fail) === -1) fail = 'none';
+  var speed = String(params.get('speed') || 'normal').toLowerCase() === 'slow' ? 'slow' : 'normal';
+
+  var logEl = document.getElementById('log');
+  var composer = document.getElementById('composer');
+  var sendBtn = document.getElementById('send');
+  var stopBtn = document.getElementById('stop');
+  var doneMarker = document.getElementById('done');
+  var stateBadge = document.getElementById('state');
+  var countsEl = document.getElementById('counts');
+  var hintEl = document.getElementById('hint');
+  var speedSel = document.getElementById('speed');
+  var failSel = document.getElementById('fail');
+  var modeNote = document.getElementById('mode-note');
+  var seatLabel = document.getElementById('seat-label');
+  var seatA = document.getElementById('seat-a');
+  var seatB = document.getElementById('seat-b');
+
+  var round = 0;
+  var generating = false;
+  var lastPair = null;
+  var timers = [];
+
+  var MODE_NOTES = {
+    none: '正常：stop 出现后消失，并出现 done 标记。',
+    nostop: '不出现 stop，只靠 done 标记完成。',
+    nodone: '不出现 done 标记，只靠 stop 消失 + 稳定采样完成。',
+    nosignal: '既无 stop 也无 done：驱动必须保持 pending，不能猜完成。',
+    duplicate: '发送前先重放上一轮的旧用户/回答消息，测试旧文本与顺序拒绝。',
+    stale: '本轮回答复制上一轮的文本，测试 equal-old 拒绝（需先完成一轮）。',
+    empty: '完成但回答文本为空，测试 answer-empty 拒绝。',
+    reorder: '回答节点故意排在用户消息之前，测试“对应且更晚的回答”校验。'
+  };
+
+  // ---- 确定性内容 ----
+  function fnv1a(text) {
+    var hash = 2166136261 >>> 0;
+    for (var i = 0; i < text.length; i += 1) {
+      hash ^= text.charCodeAt(i);
+      hash = Math.imul(hash, 16777619) >>> 0;
+    }
+    return hash >>> 0;
+  }
+
+  var STANCES = ['agree', 'conditional', 'oppose'];
+  var CLAIMS = [
+    '在给定前提下，我更倾向前一种做法，因为它把失败代价限制在可回滚的范围内。',
+    '结论取决于失败成本；如果代价不可逆，保守方案更合理。',
+    '我不同意题设的默认假设，应该先把可验证的指标和边界条件写清楚。',
+    '两种做法并非互斥，可以先做低成本的并行验证，再按证据收敛。'
+  ];
+  var BASES = [
+    '依据：同一批输入下，先验证最小闭环能更早暴露接口与数据问题。',
+    '依据：仅凭单次成功样本不足以外推，至少要覆盖失败路径和回滚路径。',
+    '依据：把工作量拆成可观测的小步，能在不增加承诺的前提下降低返工。',
+    '依据：若关键约束来自外部，先确认约束的真实来源，再谈方案优劣。'
+  ];
+  var COUNTERS = [
+    '反例：如果验证成本远高于一次失败的成本，这条推理就不成立。',
+    '反例：在强时限下，过度验证会错过唯一可用的窗口。',
+    '反例：当数据不可得时，“先定义指标”会变成拖延。',
+    '反例：并行验证可能引入额外协调成本，反而拖慢收敛。'
+  ];
+  var NEXT = [
+    '下一步：给出一个可重复的最小实验，并记录失败条件。',
+    '下一步：先列出不可逆代价，再决定是否采用保守路线。',
+    '下一步：把结论拆成“Conditional / Rejected”两栏，逐条给出证据。',
+    '下一步：先做一次成本上界估算，再决定要不要并行。'
+  ];
+
+  function excerpt(prompt) {
+    var firstLine = String(prompt).split('\n')[0].replace(/\s+/g, ' ').trim();
+    if (!firstLine) return '（空提示）';
+    return firstLine.length > 24 ? firstLine.slice(0, 24) + '…' : firstLine;
+  }
+
+  function firstSourceId(prompt) {
+    var match = /\[(S\d+)\s*·/.exec(String(prompt));
+    return match ? match[1] : '';
+  }
+
+  function draftVersion(prompt) {
+    var match = /版本\s*v(\d+)/.exec(String(prompt));
+    return match ? match[1] : '1';
+  }
+
+  function buildAnswer(prompt, seatName, roundIndex) {
+    var source = String(prompt);
+    var seed = fnv1a(seatName + '|' + roundIndex + '|' + prompt);
+    var id = ('0000000' + seed.toString(16)).slice(-8);
+    var label = '[FIXTURE seat=' + seatName + ' round=' + roundIndex + ' id=' + id + ']';
+
+    // Real "起草任务": cite an actual prior [S#] source that is present in the
+    // prompt. Never invent S-numbers, or the core correctly rejects the draft.
+    if (source.indexOf('【起草任务】') !== -1) {
+      var sourceId = firstSourceId(source);
+      var cite = sourceId ? ' [' + sourceId + ']' : '';
+      return [
+        label,
+        '## 候选结论 v' + draftVersion(source),
+        '建议：先做可回滚的最小闭环，再按实际证据决定是否扩大范围。' + cite,
+        '成立条件：失败代价可回滚，且验证成本低于一次失败的成本。' + cite,
+        '最强反例：如果时限非常强或验证成本更高，先验证反而会错过窗口。',
+        '已解决：两席都要求把失败路径和回滚路径写清。' + cite,
+        '未解决争点：仍需一次可重复实验确认验证成本。',
+        '来源：' + (sourceId || '材料未标注可核实来源') + '。'
+      ].join('\n');
+    }
+
+    // Real vote prompt from core.js: the candidate is the only text to judge.
+    // Emit exactly one strict marker line, so it is accepted rather than
+    // guessed at. The rest of the answer is still ordinary reasoning.
+    if (/【候选结论\s*·\s*版本\s*v\d+/.test(source)
+        && source.indexOf('agree：明确同意') !== -1) {
+      return [
+        label,
+        'STANCE: agree',
+        '理由：候选结论完整覆盖了成立条件、最强反例与未解决争点，我愿意接受这一版。',
+        '条件：如果后续实验证明验证成本高于失败成本，我会改判。'
+      ].join('\n');
+    }
+
+    // Independent and critique prompts keep the original sample behavior,
+    // including support/unclear counterexamples that must never be read as
+    // agreement. Only the exact vote marker above may count as a stance.
+    var stance = STANCES[seed % STANCES.length];
+    return [
+      label,
+      'STANCE: ' + stance,
+      'CLAIM: ' + CLAIMS[seed % CLAIMS.length] + '（关于「' + excerpt(prompt) + '」）',
+      'BASIS: ' + BASES[(seed >>> 3) % BASES.length],
+      'COUNTER: ' + COUNTERS[(seed >>> 5) % COUNTERS.length],
+      'NEXT: ' + NEXT[(seed >>> 7) % NEXT.length]
+    ].join('\n');
+  }
+
+  // ---- 渲染 ----
+  function setState(text, busy) {
+    stateBadge.textContent = text;
+    stateBadge.className = 'badge' + (busy ? ' busy' : '');
+  }
+
+  function updateCounts() {
+    countsEl.textContent = round + ' 轮';
+  }
+
+  function refreshSend() {
+    sendBtn.disabled = generating || !composer.value.trim();
+  }
+
+  function appendTurn(role, text, metaText, isCopy) {
+    var turn = document.createElement('div');
+    turn.className = 'turn ' + role + (isCopy ? ' copy' : '');
+    var meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.textContent = metaText;
+    var msg = document.createElement('div');
+    msg.className = 'msg';
+    msg.textContent = text || '';
+    turn.appendChild(meta);
+    turn.appendChild(msg);
+    logEl.appendChild(turn);
+    logEl.scrollTop = logEl.scrollHeight;
+    return { turn: turn, msg: msg };
+  }
+
+  function clearTimers() {
+    for (var i = 0; i < timers.length; i += 1) {
+      clearTimeout(timers[i]);
+      clearInterval(timers[i]);
+    }
+    timers = [];
+  }
+
+  function schedule(fn, ms) {
+    var id = setTimeout(fn, ms);
+    timers.push(id);
+    return id;
+  }
+
+  function seatText() {
+    return seat + ' 席';
+  }
+
+  // ---- 发送与生成 ----
+  function finishGeneration(answerTurn, prompt, fullText, mode) {
+    answerTurn.turn.classList.remove('streaming');
+    stopBtn.hidden = true;
+    generating = false;
+    if (mode !== 'nodone' && mode !== 'nosignal') {
+      doneMarker.hidden = false;
+    }
+    if (mode === 'stale' && lastPair) {
+      lastPair = { prompt: prompt, answer: lastPair.answer };
+    } else if (mode !== 'empty') {
+      lastPair = { prompt: prompt, answer: fullText };
+    }
+    setState('已完成');
+    updateCounts();
+    refreshSend();
+  }
+
+  function startGeneration(prompt, mode, pace) {
+    generating = true;
+    sendBtn.disabled = true;
+    doneMarker.hidden = true;
+    hintEl.textContent = '';
+    round += 1;
+    updateCounts();
+    setState('生成中', true);
+
+    if (mode === 'duplicate' && lastPair) {
+      appendTurn('user', lastPair.prompt, '你 · 旧轮复制', true);
+      appendTurn('answer', lastPair.answer, seatText() + ' · 旧轮复制', true);
+    }
+
+    var userTurn = appendTurn('user', prompt, '你 · 第 ' + round + ' 轮');
+    var fullText = '';
+    if (mode === 'stale' && lastPair) fullText = lastPair.answer;
+    else if (mode !== 'empty') fullText = buildAnswer(prompt, seat, round);
+
+    var answerTurn = appendTurn('answer', '', seatText() + ' · 第 ' + round + ' 轮');
+    if (mode === 'reorder') {
+      logEl.insertBefore(answerTurn.turn, userTurn.turn);
+    }
+
+    if (mode !== 'nostop' && mode !== 'nosignal') {
+      stopBtn.hidden = false;
+      stopBtn.disabled = false;
+    }
+
+    answerTurn.turn.classList.add('streaming');
+
+    if (!fullText.length) {
+      schedule(function () {
+        finishGeneration(answerTurn, prompt, fullText, mode);
+      }, 260);
+      return;
+    }
+
+    var chunkCount = pace === 'slow' ? 16 : 5;
+    var interval = pace === 'slow' ? 350 : 130;
+    var step = Math.max(1, Math.ceil(fullText.length / chunkCount));
+    var position = 0;
+
+    var timer = setInterval(function () {
+      position = Math.min(fullText.length, position + step);
+      answerTurn.msg.textContent = fullText.slice(0, position);
+      logEl.scrollTop = logEl.scrollHeight;
+      if (position >= fullText.length) {
+        clearInterval(timer);
+        schedule(function () {
+          finishGeneration(answerTurn, prompt, fullText, mode);
+        }, 200);
+      }
+    }, interval);
+    timers.push(timer);
+  }
+
+  function onSend() {
+    var prompt = composer.value;
+    if (!prompt.trim() || generating) return;
+    if (fail === 'stale' && (!lastPair || !lastPair.answer)) {
+      hintEl.textContent = 'stale 模式需要先完成至少一轮（且上一轮回答非空）；本次未发送。';
+      return;
+    }
+    composer.value = '';
+    refreshSend();
+    startGeneration(prompt, fail, speed);
+  }
+
+  // ---- 事件 ----
+  sendBtn.addEventListener('click', onSend);
+
+  composer.addEventListener('keydown', function (event) {
+    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+      event.preventDefault();
+      onSend();
+    }
+  });
+
+  composer.addEventListener('input', refreshSend);
+
+  stopBtn.addEventListener('click', function () {
+    if (!generating) return;
+    clearTimers();
+    generating = false;
+    stopBtn.hidden = true;
+    var streaming = document.querySelectorAll('.turn.streaming');
+    for (var i = 0; i < streaming.length; i += 1) streaming[i].classList.remove('streaming');
+    setState('已停止');
+    refreshSend();
+    hintEl.textContent = '手动停止：当前文本不完整；驱动只能凭 stop 消失与稳定采样判断，必要时由人接管。';
+  });
+
+  document.getElementById('draft').addEventListener('click', function () {
+    composer.value = '上一轮遗留的草稿：这是一段与本轮新提示不同的文字，驱动不应覆盖它。';
+    refreshSend();
+    hintEl.textContent = '已注入非空草稿。此时用不同 prompt 提交，应得到 draft-conflict。';
+  });
+
+  document.getElementById('example').addEventListener('click', function () {
+    composer.value = '请比较“先发一版再迭代”和“先做完再发布”两种策略，并明确你的立场（agree / conditional / oppose）。';
+    refreshSend();
+    hintEl.textContent = '';
+  });
+
+  document.getElementById('reset').addEventListener('click', function () {
+    clearTimers();
+    generating = false;
+    round = 0;
+    lastPair = null;
+    logEl.textContent = '';
+    composer.value = '';
+    stopBtn.hidden = true;
+    doneMarker.hidden = true;
+    setState('就绪');
+    updateCounts();
+    refreshSend();
+    hintEl.textContent = '';
+  });
+
+  function syncConfig() {
+    speed = speedSel.value === 'slow' ? 'slow' : 'normal';
+    fail = failSel.value;
+    modeNote.textContent = MODE_NOTES[fail] || MODE_NOTES.none;
+    var query = '?seat=';
+    seatA.href = query + 'A&speed=' + speed + '&fail=' + fail;
+    seatB.href = query + 'B&speed=' + speed + '&fail=' + fail;
+  }
+
+  speedSel.addEventListener('change', syncConfig);
+  failSel.addEventListener('change', syncConfig);
+
+  // ---- 初始化 ----
+  seatLabel.textContent = seatText();
+  document.title = 'AI Arena · Web Driver 夹具 · ' + seatText();
+  if (seat === 'A') seatA.classList.add('current');
+  else seatB.classList.add('current');
+  speedSel.value = speed;
+  failSel.value = fail;
+  syncConfig();
+  setState('就绪');
+  updateCounts();
+  refreshSend();
+})();
+</script>
+</body>
+</html>
