@@ -97,3 +97,15 @@ bombadil browser inspect "$arena_evidence/baseline-current-spec.bin"
 **资料**　本机证据在 `~/.local/state/ai-arena/live-2026-11-22/`。三席轨迹为 `three-seat-verified.bin`，合成报告为 `smoke-verified/report.md`，同目录有 `session.json`、每一席的待办和回填。用 `bombadil browser inspect` 查看轨迹。真实运行入口为 `python3 tests/bombadil_acceptance.py <新轨迹路径> --seconds 900 --live-dir <新本机目录>`。目录内出现真实待办后，经 ego lite 向对应席发送提示，回复按同名 JSON 附上 `promptSha256` 与 `text`；表态还要记录明确的 `stance`。同一次运行的结论和导出保存在该目录。合成演练的回填脚本是证据目录中的 `simulate_handoff.py`，只用于验证接线。
 
 **分工与停止**　OpenCode Go / DeepSeek V4.1 Flash high 承担引擎、后台和界面改动。UI 执行者在产出后触发 Go 周额度上限，已停止派工并核对现有改动。Codex 完成测试接线、复验、证据记录和本地提交。本人完成 DeepSeek 登录后可接回同一 ego lite 任务空间，并开始真实场次。
+
+## 2026-11-22 · 第七轮 · 三席真实讨论与导出
+
+**目标与接线**　G1–G4。本人完成 DeepSeek 登录后接回 ego lite 任务空间 9。Bombadil 驱动 Arena 测试入口建场、抄录待办、提交原文与明确立场；ego lite 在 ChatGPT、Gemini、DeepSeek 的三个原站对话里发送与采集。题目是一个两人笔记应用团队如何分配两个周末的合成例子。独立作答的三份提示 SHA-256 一致，后续提示由 Arena 生成。全场完成 10 次发送与回填，独立回答 3 份、质询 3 份、候选 1 份、表态 3 份。
+
+**结论与分歧**　ChatGPT 起草 v1（S7），三席都明确选择有条件同意（S8–S10）。报告状态为「有条件一致」。共同建议是首周末验证桌面漏检并用小样本测手机采集，区分索引与同步故障，次周末只修损失明显且可在期限内解决的一处。若手机是主要录入端，已出现可复现的采集中断，且修复价值更高，则优先手机。互评把「先修搜索」改成「先验证搜索，再决定修复对象」。ChatGPT 与 Gemini 要求缩短用户可读部分，Gemini 要求记录新增笔记的主要来源端，DeepSeek 要求预先定义判定规则并避免把 5 人小样本当作损失估计。上述条件保留在原始表态，v1 未经过修订后的再次确认。
+
+**障碍与修复**　Gemini 的历史消息 DOM 在每个非空行两端加了显示空格，造成发送核验假失败。本机交接脚本只去掉这一层空格，复核发送前编辑器原文和发送后的消息。ChatGPT 在跟进时同时保留隐藏的旧编辑器与可见编辑器，并在长回合末尾添加「…显示更多」。脚本改为核对可见编辑器，并只移除显示控件后缀，因此保留长提示且不用重发。DeepSeek 用发送后的对应用户消息和完成后可见的操作区绑定回答。三家回答取自原站可见正文，表格以纯文本转写。上述修复都在本机交接脚本中完成，本轮产品代码沿用 `690df4e`。
+
+**验收证据**　Bombadil 轨迹 383 个状态、零属性违规，观测到结论后按预定方式退出，运行进程返回 0。隔离浏览器的新原生扩展页独立读回状态并触发「导出 Markdown」。逐条比对发送记录、网页捕获正文与保存原文，10 个来源编号覆盖 S1–S10，三份表态的候选版本和摘要均相同。导出 97,505 字节，SHA-256 为 `d65b35a05e93b8acd8a04a2ae1100d6d2c12341fe4c1c68113c5d0b0368e7adc`。这场验证了真实账号链路；模型质量比较仍需用既定的六题盲评。
+
+**复盘入口**　导出 `~/.local/state/ai-arena/live-2026-11-22/real-three-seat/report.md`。同目录的 `session.json`、`requests/`、`sent/`、`observed/`、`replies/` 可逐轮核对。轨迹和日志在上一层 `real-three-seat.bin` 和 `real-three-seat.log`，可用 `bombadil browser inspect` 查看。脚本使用三个 Agent 对话标签，结束时将任务空间交还本人并保留一个用户标签。
