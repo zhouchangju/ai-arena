@@ -117,6 +117,8 @@ def main() -> int:
                 "--disable-background-networking",
                 "--disable-sync",
                 "--no-proxy-server",
+                # Block DNS even if Chromium starts an extension-created tab before routing attaches.
+                "--host-resolver-rules=MAP * ~NOTFOUND",
             ],
         )
         context.route("https://chatgpt.com/**", lambda route: (

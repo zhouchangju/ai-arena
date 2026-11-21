@@ -2827,6 +2827,11 @@ function renderEditor(session, task, { mode, draft, hasDraft, errorEl }) {
     attrs: { 'aria-label': `${name} 的回答原文` },
   });
 
+  /* 「清除草稿」只按此刻的草稿显示：文字或立场任一非空即可清除。
+   * 输入和选择立场时即时同步按钮，不重绘输入框、不抢焦点。 */
+  const hasLiveDraft = () => Boolean(textarea.value.trim() || state.stanceChoice[task.id]);
+  let syncClearButton = () => {};
+
   if (session.stage === 'vote') {
     editor.append(h('span', { class: 'field-label', text: '明确立场' }));
     const stanceGroup = h('div', {
@@ -2852,6 +2857,7 @@ function renderEditor(session, task, { mode, draft, hasDraft, errorEl }) {
           item.setAttribute('aria-pressed', String(active));
         }
         updateDraftForTask(session, task, textarea.value, value);
+        syncClearButton();
         noteEl.textContent = '草稿已保存';
         setTaskError(task.id, '');
       });
@@ -2882,6 +2888,7 @@ function renderEditor(session, task, { mode, draft, hasDraft, errorEl }) {
   });
   textarea.addEventListener('input', () => {
     updateDraftForTask(session, task, textarea.value, state.stanceChoice[task.id] || '');
+    syncClearButton();
     noteEl.textContent = '草稿已保存';
     setTaskError(task.id, '');
   });
@@ -2891,27 +2898,36 @@ function renderEditor(session, task, { mode, draft, hasDraft, errorEl }) {
 
   const actionWrap = h('div', { class: 'editor-actions' });
 
-  if (hasDraft) {
-    actionWrap.append(h('button', {
-      class: 'btn btn-small btn-ghost',
-      type: 'button',
-      text: '清除草稿',
-      onClick: async () => {
-        const confirmed = await confirmDialog({
-          title: '清除这一席的草稿？',
-          body: '只清除这段没提交的本地文本，已保存的回答不动。',
-          confirmLabel: '清除草稿',
-          danger: true,
-        });
-        if (!confirmed) return;
-        deleteDraft(session, task);
-        state.dismissedDraftEditors.delete(task.id);
-        state.showEditor[task.id] = task.status === 'answered' ? 'edit' : 'new';
-        render();
-        toast('草稿已清除');
-      },
-    }));
-  }
+  /* 按钮常驻，只切换显示：首次输入后立刻能清除，删空文字后自动隐藏。 */
+  const clearButton = h('button', {
+    class: 'btn btn-small btn-ghost',
+    type: 'button',
+    text: '清除草稿',
+    hidden: !hasDraft,
+    onClick: async () => {
+      const confirmed = await confirmDialog({
+        title: '清除这一席的草稿？',
+        /* 投票席的草稿含立场与理由，只提「文本」会漏掉立场，确认语要按阶段说清。 */
+        body: session.stage === 'vote'
+          ? '清除本席未提交的本地立场和理由，已保存的回答不动。'
+          : '只清除这段没提交的本地文本，已保存的回答不动。',
+        confirmLabel: '清除草稿',
+        danger: true,
+      });
+      if (!confirmed) return;
+      deleteDraft(session, task);
+      /* 立场也是草稿的一部分：确认清除后立场一并归零；取消则两者都不动。 */
+      delete state.stanceChoice[task.id];
+      state.dismissedDraftEditors.delete(task.id);
+      state.showEditor[task.id] = task.status === 'answered' ? 'edit' : 'new';
+      render();
+      toast('草稿已清除');
+    },
+  });
+  actionWrap.append(clearButton);
+  syncClearButton = () => {
+    clearButton.hidden = !hasLiveDraft();
+  };
 
   actionWrap.append(h('button', {
     class: 'btn btn-small',
@@ -2919,7 +2935,8 @@ function renderEditor(session, task, { mode, draft, hasDraft, errorEl }) {
     text: '收起',
     onClick: () => {
       delete state.showEditor[task.id];
-      if (hasDraft) state.dismissedDraftEditors.add(task.id);
+      /* 按点击当下的草稿判断：刚输入、尚未重绘的草稿也要收起，避免立刻重开。 */
+      if (hasLiveDraft()) state.dismissedDraftEditors.add(task.id);
       render();
     },
   }));

@@ -121,6 +121,7 @@ def main() -> int:
                 "--disable-background-networking",
                 "--disable-sync",
                 "--no-proxy-server",
+                "--host-resolver-rules=MAP * ~NOTFOUND",
             ],
         )
         ba.install_network_guard(context, attempts)
@@ -208,25 +209,17 @@ def main() -> int:
             check("The first next seat is marked in its card", page.locator("article.seat-card.is-next").count() == 1)
             shot(page, out, "04_session_pending")
 
-            # Copying the prompt should turn the next step into "paste the answer back".
-            if next_step.count() == 1:
-                page.bring_to_front()
-                step_action = next_step.get_by_role("button", name="复制并打开原页")
-                if step_action.count() == 0:
-                    step_action = next_step.get_by_role("button", name="复制提示并打开原页")
-                step_action.first.click()
-                try:
-                    ba.wait_until(lambda: "粘回" in page.locator("[aria-label='当前可执行的下一步']").inner_text(timeout=4000), "next step paste prompt")
-                    check("After copying, the next step asks for the pasted answer", True)
-                    page.bring_to_front()
-                    shot(page, out, "04b_next_step_paste")
-                except Exception:
-                    check("After copying, the next step asks for the pasted answer", False, "next step did not switch")
-                for extra in context.pages:
-                    if extra is not page:
-                        extra.close()
-            else:
-                check("After copying, the next step asks for the pasted answer", False, "no next-step strip in this build")
+            # Exercise the copy-only action here; guidance_acceptance verifies the compound handoff.
+            first_seat = page.locator("article.seat-card.is-next")
+            first_seat.locator("details.task-more summary").click()
+            page.bring_to_front()
+            first_seat.get_by_role("button", name="复制提示", exact=True).click()
+            ba.wait_until(
+                lambda: "粘回" in next_step.inner_text(timeout=4000),
+                "next step paste prompt",
+            )
+            check("After copying, the next step asks for the pasted answer", True)
+            shot(page, out, "04b_next_step_paste")
 
             # ---------- 4. first answer: pending remainder stays legible ----------
             session = runtime.get(session_id)
@@ -464,7 +457,7 @@ def main() -> int:
             # ---------- 11. health ----------
             check("No uncaught page errors", not page_errors, "; ".join(page_errors[:3]))
             hosts = ba.external_request_hosts(attempts)
-            check("No external HTTP(S) request attempted", not hosts, ", ".join(hosts[:5]))
+            check("No external HTTP(S) request attempted", not hosts, ", ".join(attempts[:5]))
 
             summary = {
                 "label": args.label,

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Focused real-browser regression for three G1/G3/G4 UX repairs.
+"""Focused real-browser regression for G1–G4 UX repairs.
 
-Covers only:
+Covers:
 
 1. A skipped seat says "已跳过，本轮不计入结论" instead of promising that a
    late answer can be added. An existing local draft stays visible and
@@ -12,6 +12,8 @@ Covers only:
    first; the "two seats max" error appears only after a real third click.
 3. With the editor and "更多操作" both open, a card exposes exactly one
    "跳过这一席" button.
+4. A new draft collapses and resumes intact. Clearing a vote draft resets
+   both its text and stance, while cancel preserves both.
 
 Runs the unpacked extension in an isolated Chromium profile (no login, no
 external HTTP(S)). Run from the repository root:
@@ -92,6 +94,67 @@ def expand_details(node) -> None:
 
 def card_for_task(ui, task: dict[str, Any]):
     return ui.task_card(task)
+
+
+def check_draft_editor(page, ui, runtime):
+    print("\n[3] Collapse and clear answer drafts")
+    page.locator("#new-session").click()
+    for provider_id in ui.selection_snapshot()["pressed"]:
+        ui.select_provider(ui.by_id[provider_id])
+    session_id, _ = ui.create_debate("草稿回归：是否先验证需求？", ["chatgpt", "claude"])
+    seat = runtime.get(session_id)["tasks"][0]
+    card = ui.open_task_editor(seat)
+    field = card.locator("textarea.answer-input")
+    clear = card.get_by_role("button", name="清除草稿", exact=True)
+    check("Empty editor has no clear action", not clear.is_visible())
+    field.fill(DRAFT_TOKEN)
+    check("First draft exposes clear without changing focus",
+          clear.is_visible() and field.evaluate("el => el === document.activeElement"))
+    card.get_by_role("button", name="收起", exact=True).click()
+    resume = card.get_by_role("button", name="继续草稿", exact=True)
+    collapsed = not field.is_visible() and resume.is_visible()
+    check("First draft collapses immediately", collapsed)
+    if collapsed:
+        resume.click()
+    check("Reopening restores the draft exactly", field.input_value() == DRAFT_TOKEN)
+    field.fill("")
+    check("Manually emptying text hides clear", not clear.is_visible())
+    card.get_by_role("button", name="收起", exact=True).click()
+    check("Empty editor collapses with a fresh start", not field.is_visible() and not resume.is_visible())
+
+    answers = {seat: "先验证使用频率，依据 [S1] 和 [S2]。" for seat in ("chatgpt", "claude")}
+    for stage in ("independent", "critique", "proposal"):
+        ui.answer_stage(session_id, stage, answers)
+    vote = ui.wait_for_stage(session_id, "vote")["tasks"][0]
+    card = ui.open_task_editor(vote)
+    field = card.locator("textarea.answer-input")
+    clear = card.get_by_role("button", name="清除草稿", exact=True)
+    picked = card.locator(".stance-btn[aria-pressed=true]")
+    card.get_by_role("button", name="反对", exact=True).click()
+    check("Selecting a stance alone exposes clear", clear.is_visible())
+    field.fill(DRAFT_TOKEN)
+    page.reload()
+    card.locator(".stance-btn").first.wait_for()
+    check("Reload restores both reason and stance",
+          field.input_value() == DRAFT_TOKEN and picked.inner_text() == "反对")
+
+    dialog = page.locator("dialog.confirm")
+    clear.click()
+    confirmation = dialog.locator(".confirm-body").inner_text()
+    check("Vote clear dialog names both fields", "立场" in confirmation and "理由" in confirmation)
+    dialog.get_by_role("button", name="取消", exact=True).click()
+    check("Cancel preserves both reason and stance",
+          field.input_value() == DRAFT_TOKEN and picked.inner_text() == "反对")
+    clear.click()
+    dialog.get_by_role("button", name="清除草稿", exact=True).click()
+    check("Confirm resets reason, stance and clear action",
+          field.input_value() == "" and picked.count() == 0 and not clear.is_visible())
+
+    field.fill("仍待验证。")
+    card.get_by_role("button", name="记录表态", exact=True).click()
+    check("Reason alone cannot submit the cleared stance",
+          card.locator(".task-error").is_visible()
+          and runtime.get(session_id)["tasks"][0]["status"] == "pending")
 
 
 def main() -> int:
@@ -431,6 +494,8 @@ def main() -> int:
             reopen(page, ui, question)
             export_path, exported = ui.export_markdown(out_dir)
             check("Exported Markdown excludes the unsubmitted draft", DRAFT_TOKEN not in exported, str(export_path))
+
+            check_draft_editor(page, ui, runtime)
         except BaseException as exc:  # keep the failure visible after the browser closes
             failure = exc
         finally:

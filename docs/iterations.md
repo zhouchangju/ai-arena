@@ -54,3 +54,32 @@
 **失败与修正**　第一稿小屏历史占位太大；玻璃素材首稿像平面色块，第二次用实际光照渲染。复核还发现跳过后错误承诺可以补录、换成员提示与操作冲突、展开编辑时重复跳过及可选控件泄露 null。已逐项修复并回放。未提交草稿和已提交更正分开保存。
 
 **验收与停止**　57 个核心及标签用例通过。独立 Chromium 回放通过 61 项手动流程、39 项交互与外观检查、37 项操作修复验证、25 项回答更正验证；补充条件与本机自动接力也通过。复验覆盖浅色、深色、390px 窄屏、提交状态、重新打开、逐席确认与引用跳转。本机自动接力依然使用预授回环权限的测试副本与确定性页面。本轮只对比参考项目的实际界面、入口与代码，没有用真实账号重测公网自动收发。01:01 自检已确认仍有周额度，并核对活跃执行者；交付后已停止本轮派工和自检。
+
+## 2026-11-22 · 第五轮 · Bombadil 属性测试与草稿修复
+
+**目标**　G1–G4，重点是 G2/G3/G4。用户应能收起和恢复刚录入的草稿；清除表态草稿应同时清掉立场与理由，避免下次仅输入理由就沿用旧表态。用合成双席讨论探索暂停、恢复、回填、清除、刷新、投票与报告，再到真实扩展页逐步核对故障。
+
+**安装与接线**　安装 Apple Silicon 官方发布的 Bombadil 0.8.0 到 `~/.local/bin/bombadil`。GitHub 发布件 SHA-256 为 `2ea26a68ac9b5296a8828ff138fb17a3343f7e8cf50647e9d1a81074505f995c`，本地核对一致。上游的 URL 规则只接受 HTTP(S) 和 file，`chrome-extension://` 默认报 invalid scheme，`<all_urls>` 也不包含扩展协议。测试入口以 Chromium 路由在回环地址提供原工作台文件，将受限的消息转给同一测试浏览器里的真实 MV3 后台。独立配置无登录态，未匹配的 HTTP(S) 请求会被拦截。这一入口改变了页面的来源和消息传输，真实扩展页另用原生消息回归。 [发布版本](https://github.com/antithesishq/bombadil/releases/tag/v0.8.0) · [上游 URL 匹配实现](https://github.com/antithesishq/bombadil/blob/v0.8.0/lib/bombadil-browser/src/match_pattern.rs)
+
+| 问题 | 修前证据 | 改动与复验 |
+|---|---|---|
+| 首次粘贴后点「收起」时编辑器立即弹回 | `baseline-current-spec.bin` 第 24 状态触发 `draftCollapsesAndResumes`。渲染时的草稿标记早于首次输入。 | 按点击时的草稿状态收起。输入文字或选立场后即时显示「清除草稿」，删空后隐藏，输入焦点保留。真实扩展页核对收起、继续草稿及原文字节一致。 |
+| 确认清除草稿后，表态仍沿用旧立场 | `pre-06.bin` 第 205 状态触发 `clearResetsTextAndStance`。保存的草稿已被删除，界面内存仍持有原立场。 | 取消保留原样。确认清除时同时清空未提交的理由与立场，确认文案按阶段说明。真实扩展页核对刷新恢复、取消、确认及仅补理由时仍需重新选立场。 |
+| UX 走查对预期的供应商导航存在计数竞争 | 原脚本主动点击交接，随后又校验零外部请求。一次复验中扩展新建标签的首个导航早于 Playwright 拦截，访问了 ChatGPT 公共入口；测试配置没有登录态，提示仅复制到剪贴板。 | UX 走查用「复制提示」检查下一步；专用交接用例继续检查真实剪贴板和标签复用。两个脚本都增加 Chromium DNS 阻断以覆盖新建标签的时序。 |
+
+**验收**　基线为 `4a9d0b8`。同一套 Bombadil 规格在基线重新触发收起违规，修复后分别在 1280×800 和 390×800 探索 35 秒，最终的 `final-desktop.bin` 和 `final-narrow.bin` 分别记录 444 与 470 个状态，均为零违规。两次都走过独立作答、交叉质询、候选与逐席确认，桌面到达「全体一致」，窄屏到达「仍有明确反对」。两次分别触发 12 和 14 次清除确认。同一份定向浏览器回归在基线为 42/49，修复后为 49/49。手动主流程 61/61，核心和标签 57/57，UX 走查 39/39，回答更正 25/25，补充条件与交接 13/13。本机自动双席通过，实际七次唯一提交。补充条件脚本早期运行在关闭时有 Playwright 路由清理日志。启用 DNS 阻断的最终复验验证了复制内容和标签复用，模拟页面的路由命中为零。
+
+**复盘**　Bombadil 的价值是交错操作能露出普通直线用例漏掉的草稿状态。修前和修后分别尝试二进制轨迹重放，两个重放均因异步界面渲染时点改变了当时可选动作而中断。因此保留原轨迹供检查，并用真实扩展页的短重现步骤确认前后差异。试验还暴露了通用 SDK 与浏览器 SDK 的同名接口差异，规格现从 `@antithesishq/bombadil/browser` 导入浏览器自定义动作，加载期间显式等待。当前轨迹数是探索量，无法替代真实供应商账号试用、原生授权框体验和六题质量盲评。
+
+**留档与复跑**　运行脚本需要 Python Playwright 和已安装的 Chromium，本次用 Chrome for Testing 159.0.8154.6。原始二进制轨迹、运行日志、浏览器截图、导出和 OpenCode 执行日志都在本机 `~/.local/state/ai-arena/bombadil-2026-11-22/`。二进制轨迹可用 `bombadil browser inspect` 查看带截图的步骤。新运行请使用新文件名，Bombadil 默认拒绝覆盖已有记录。
+
+```bash
+arena_evidence="$HOME/.local/state/ai-arena/bombadil-2026-11-22"
+python3 tests/bombadil_acceptance.py "$arena_evidence/recheck.bin" --seconds 35 --width 390
+python3 tests/ux_repairs.py --out "$arena_evidence/ux-recheck"
+python3 tests/browser_acceptance.py --out "$arena_evidence/browser-recheck"
+node --test tests/*.mjs
+bombadil browser inspect "$arena_evidence/baseline-current-spec.bin"
+```
+
+**分工和停止**　OpenCode Go 的 DeepSeek V4.1 Flash high 修复工作台草稿和确认文案。Codex 负责规格、真实扩展复验、记录和本地提交。Codex 周窗口仍有余量，Go 两次任务都在指定模型完成，CLI 未提供可核实的套餐剩余额度数字。本轮停止继续派工，测试浏览器和执行进程按次关闭。
