@@ -109,3 +109,9 @@ bombadil browser inspect "$arena_evidence/baseline-current-spec.bin"
 **验收证据**　Bombadil 轨迹 383 个状态、零属性违规，观测到结论后按预定方式退出，运行进程返回 0。隔离浏览器的新原生扩展页独立读回状态并触发「导出 Markdown」。逐条比对发送记录、网页捕获正文与保存原文，10 个来源编号覆盖 S1–S10，三份表态的候选版本和摘要均相同。导出 97,505 字节，SHA-256 为 `d65b35a05e93b8acd8a04a2ae1100d6d2c12341fe4c1c68113c5d0b0368e7adc`。这场验证了真实账号链路；模型质量比较仍需用既定的六题盲评。
 
 **复盘入口**　导出 `~/.local/state/ai-arena/live-2026-11-22/real-three-seat/report.md`。同目录的 `session.json`、`requests/`、`sent/`、`observed/`、`replies/` 可逐轮核对。轨迹和日志在上一层 `real-three-seat.bin` 和 `real-three-seat.log`，可用 `bombadil browser inspect` 查看。脚本使用三个 Agent 对话标签，结束时将任务空间交还本人并保留一个用户标签。
+
+## 2026-11-22 · Ego Lite 三站真实验收
+
+G1/G2/G3。工作区 10，使用三个新测试对话。接管后在 Gemini 已发送区看到了原题及回答，未重复发送。工作台显示可选三席，本次用同一场讨论完成 3 份独立回答、3 份交叉质询、1 份候选与 3 份同版本表态。三个公开网页均通过测试中转，刷新后仍有 10 条发言，最终状态为有条件一致。Markdown 已从界面实际下载。[本次完整导出](evidence/ego-three-site-live.md)
+
+未决问题：点击 ChatGPT 的复制并打开原页后，Ego 任务空间没有新增受管标签，本次通过空间里已有的三张测试页完成传递；弹出页归属原因待核实。另查到扩展在打开及复用绑定页时把调试信息按 dbg.时间戳 写入 chrome.storage.local，可能包含对话 URL。本次实际配置可见 2 个此类键。待移除持久化调试写入，再重复打开与复用动作验证。OpenCode Go 周窗口已用 100% 且 limited=true，按约定停止派工，没有使用积分，也未改产品代码。
