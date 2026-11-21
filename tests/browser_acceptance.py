@@ -525,24 +525,28 @@ class WorkspaceUI:
             raise AcceptanceError(
                 f"Entry form pressed seats {selected['pressed']!r}, expected {provider_ids!r}"
             )
-        if "2 / 2" not in selected["counter"]:
-            raise AcceptanceError(
-                f"Selection counter did not reach two seats: {selected['counter']!r}"
-            )
+        # A third seat is optional. A fourth must not replace the selected group.
+        available = [pid for pid in self.by_id if pid not in provider_ids]
+        added = available.pop(0) if len(provider_ids) == 2 and available else None
+        if added:
+            self.select_provider(self.by_id[added])
+        full = self.selection_snapshot()
+        expected_full = [pid for pid in full["ids"] if pid in [*provider_ids, added]]
+        if full["pressed"] != expected_full:
+            raise AcceptanceError(f"Third seat did not join: {full['pressed']!r}")
 
-        # A third seat must be refused instead of silently replacing one.
-        extra_pid = next((pid for pid in self.by_id if pid not in provider_ids), None)
-        extra_state = selected
+        extra_pid = available[0] if available else None
+        extra_state = full
         extra_error = ""
-        if extra_pid is not None:
+        if extra_pid:
             self.select_provider(self.by_id[extra_pid])
             extra_state = self.selection_snapshot()
             banner = first_visible(self.page, [".inline-error", "[role='alert']"])
             extra_error = (banner.inner_text(timeout=1500) if banner is not None else "").strip()
-            if extra_state["pressed"] != provider_ids:
-                raise AcceptanceError(
-                    f"A third seat changed the selection: {extra_state['pressed']!r}"
-                )
+            if extra_state["pressed"] != full["pressed"]:
+                raise AcceptanceError(f"Fourth seat changed the selection: {extra_state['pressed']!r}")
+        if added:
+            self.select_provider(self.by_id[added])
 
         self.start_button().click()
         reply = wait_until(
@@ -561,6 +565,7 @@ class WorkspaceUI:
         return session_id, {
             "selected": selected,
             "extra_provider": extra_pid,
+            "full": full,
             "after_extra": extra_state,
             "extra_error": extra_error,
         }
@@ -1142,7 +1147,7 @@ def run_ui_flow(
     initial = ui.selection_snapshot()
     logbook.check(
         "Entry form starts with no seat pressed and a zero counter",
-        initial["pressed"] == [] and "0 / 2" in initial["counter"],
+        initial["pressed"] == [] and "0 / 3" in initial["counter"],
         f"pressed={initial['pressed']!r} counter={initial['counter']!r}",
     )
     screenshot(page, out_dir, "00_initial_workspace")
@@ -1174,17 +1179,17 @@ def run_ui_flow(
     log("\n[3/8] Create a debate through the visible UI")
     session_id, seat_state = ui.create_debate(question, provider_ids)
     logbook.check(
-        "Selecting two seats updates the pressed state and the 2/2 counter",
+        "Selecting two seats updates pressed state and allows a third seat",
         seat_state["selected"]["pressed"] == provider_ids
-        and "2 / 2" in seat_state["selected"]["counter"],
+        and len(seat_state["full"]["pressed"]) == 3,
         f"pressed={seat_state['selected']['pressed']!r} counter={seat_state['selected']['counter']!r}",
     )
     logbook.check(
-        "A third seat is refused instead of replacing a selection",
+        "A fourth seat is refused instead of replacing a selection",
         seat_state["extra_provider"] is not None
-        and seat_state["after_extra"]["pressed"] == provider_ids
+        and seat_state["after_extra"]["pressed"] == seat_state["full"]["pressed"]
         and bool(seat_state["extra_error"]),
-        f"third={seat_state['extra_provider']!r} kept={seat_state['after_extra']['pressed']!r} "
+        f"fourth={seat_state['extra_provider']!r} kept={seat_state['after_extra']['pressed']!r} "
         f"notice={seat_state['extra_error']!r}",
     )
     session = runtime.get(session_id)

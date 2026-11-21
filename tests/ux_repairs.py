@@ -9,7 +9,7 @@ Covers:
    the stage advances into archived history. The draft never enters the
    session, the report or the exported Markdown.
 2. The recalled-pair hint tells the truth: change requires deselecting a seat
-   first; the "two seats max" error appears only after a real third click.
+   first once the group is full; a fourth click explains how to replace a seat.
 3. With the editor and "更多操作" both open, a card exposes exactly one
    "跳过这一席" button.
 4. A new draft collapses and resumes intact. Clearing a vote draft resets
@@ -256,33 +256,34 @@ def main() -> int:
 
             error = page.locator(".inline-error")
             check(
-                "No generic two-seat error before a third click",
+                "No seat limit error before a fourth click",
                 not error.is_visible(),
                 error.inner_text(timeout=1000) if error.count() else "",
             )
 
             ui.select_provider(by_id["gemini"])
-            ba.wait_until(lambda: error.is_visible(), "third-seat error", timeout=4.0)
+            ui.select_provider(by_id["deepseek"])
+            ba.wait_until(lambda: error.is_visible(), "fourth-seat error", timeout=4.0)
             error_text = error.inner_text(timeout=2000)
             check(
-                "Third click shows an actionable deselect-first error",
-                "先点一下已选的 AI" in error_text and "已选两席" in error_text,
+                "Fourth click shows an actionable deselect-first error",
+                "先点一下已选的 AI" in error_text and ("三" in error_text or "3" in error_text),
                 error_text.strip(),
             )
             selected = ui.selection_snapshot()
             check(
-                "Third click does not replace a recalled seat",
-                sorted(selected["pressed"]) == ["chatgpt", "claude"],
+                "Fourth click does not replace a selected seat",
+                sorted(selected["pressed"]) == ["chatgpt", "claude", "gemini"],
                 str(selected["pressed"]),
             )
 
             ui.select_provider(by_id["chatgpt"])  # deselect, per the hint
             ba.wait_until(lambda: not error.is_visible(), "error clears after deselect", timeout=4.0)
-            ui.select_provider(by_id["gemini"])
+            ui.select_provider(by_id["deepseek"])
             changed = ui.selection_snapshot()
             check(
                 "Deselect then click really changes the recalled pair",
-                sorted(changed["pressed"]) == ["claude", "gemini"] and "2 / 2" in changed["counter"],
+                sorted(changed["pressed"]) == ["claude", "deepseek", "gemini"],
                 f"{changed['pressed']} · {changed['counter']}",
             )
 

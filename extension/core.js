@@ -48,6 +48,19 @@ import { AUTOMATION_PROVIDER_IDS } from './providers.js';
 const STANCES = ['agree', 'conditional', 'oppose'];
 const PROVIDER_ID_RE = /^[a-z0-9]+(?:[-_][a-z0-9]+)*$/;
 
+/**
+ * Seats a session may hold. Two is the tested default; three is the supported
+ * ceiling for a real multi-model run. Every stage, prompt and report iterates
+ * `session.providers`, so a third seat is shared with all peers and must vote
+ * on the same candidate version like any other seat.
+ *
+ * Exported for the worker and for tests. UI code should not import the whole
+ * state machine just for these numbers; keep its own copy or move them to a
+ * tiny shared constant module.
+ */
+export const MIN_SEATS = 2;
+export const MAX_SEATS = 3;
+
 // A manually relayed answer may be corrected only inside the round it belongs
 // to, and only while another seat in that same round is still pending. Once
 // the round completes, its prompts are frozen and a correction would silently
@@ -77,15 +90,24 @@ const STANCE_LABELS = {
 };
 
 /**
- * Create the initial, independent-answer stage for exactly two distinct
- * canonical lowercase provider ids.
+ * Create the initial, independent-answer stage for two or three distinct
+ * canonical lowercase provider ids. The same opening prompt goes to every
+ * seat; nothing here assumes exactly two participants.
  */
 export function createSession(question, providers) {
   if (typeof question !== 'string' || question.trim().length === 0) {
     throw new Error('question must be a non-empty string');
   }
-  if (!Array.isArray(providers) || providers.length !== 2) {
-    throw new Error('providers must be exactly two distinct provider ids');
+  if (
+    !Array.isArray(providers) ||
+    providers.length < MIN_SEATS ||
+    providers.length > MAX_SEATS
+  ) {
+    throw new Error(
+      `providers must contain ${MIN_SEATS} or ${MAX_SEATS} distinct provider ids, got ${
+        Array.isArray(providers) ? providers.length : typeof providers
+      }`,
+    );
   }
 
   const seen = new Set();
@@ -121,7 +143,7 @@ export function createSession(question, providers) {
         'independent',
         session.round,
         provider,
-        // R02: the two seats must receive the exact same opening prompt.
+        // R02: every seat must receive the exact same opening prompt.
         // Seat identity lives on the task/record, never in this text.
         independentPrompt(question),
       ),
@@ -557,7 +579,7 @@ function advanceFromIndependent(session, completed) {
     );
     // A seat is absent only when it is missing from the eligible independent
     // answers. The recipient itself is not "missing" from its own opponent
-    // list: in a fully attended two-seat round nothing is absent.
+    // list: in a fully attended round nothing is absent, whatever the seat count.
     const missing = session.providers.filter(
       (candidate) => !eligible.includes(candidate),
     );

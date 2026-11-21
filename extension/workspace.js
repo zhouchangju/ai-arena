@@ -8,26 +8,29 @@ import { PROVIDERS, AUTOMATION_PROVIDER_IDS } from './providers.js';
  * 没有提交的内容写成回答。所有动态文本都通过 textContent 进入页面。
  * ------------------------------------------------------------------------- */
 
+const MIN_SEATS = 2;
+const MAX_SEATS = 3;
+
 const STAGES = [
   {
     key: 'independent',
     label: '独立作答',
-    desc: '两席拿到同一个问题，各自作答后才能进入下一步；这时彼此看不到对方的回答。',
+    desc: '每席拿到同一个问题，各自作答后才能进入下一步；这时彼此看不到对方的回答。',
   },
   {
     key: 'critique',
     label: '交叉质询',
-    desc: '把对方的具体主张交给这一席：指出最强依据和最有影响的反例，说明自己维持或修正了哪条主张。',
+    desc: '把其他席位的具体主张交给这一席：指出最强依据和最有影响的反例，说明自己维持或修正了哪条主张。',
   },
   {
     key: 'proposal',
     label: '候选结论',
-    desc: '一席起草候选结论：建议、依据、成立条件和最强反例，交给两席确认。',
+    desc: '一席起草候选结论：建议、依据、成立条件和最强反例，交给所有席位确认。',
   },
   {
     key: 'vote',
     label: '逐席确认',
-    desc: '两席对同一版候选结论表态。每位都明确同意、关键条件也写进去，才算全体一致。',
+    desc: '每席对同一版候选结论表态。每位都明确同意、关键条件也写进去，才算全体一致。',
   },
   {
     key: 'done',
@@ -709,7 +712,7 @@ function loadStoredState() {
         const ids = [];
         for (const value of rawCompose.providers) {
           const id = String(value || '').toLowerCase();
-          if (PROVIDER_BY_ID.has(id) && !ids.includes(id) && ids.length < 2) ids.push(id);
+          if (PROVIDER_BY_ID.has(id) && !ids.includes(id) && ids.length < MAX_SEATS) ids.push(id);
         }
         state.compose.providers = ids;
       }
@@ -738,7 +741,7 @@ function persistCompose() {
   }
 }
 
-/* 只记住「上一次实际开始讨论」的两席，供下一次首页直接沿用。它不创建
+/* 只记住「上一次实际开始讨论」的两席或三席，供下一次首页直接沿用。它不创建
  * 讨论、不发送任何内容，也不覆盖已经写了一半的首页草稿。第一次使用时
  * 没有记录，首页仍保持空白，由用户自己选。 */
 function loadLastPair() {
@@ -748,9 +751,9 @@ function loadLastPair() {
     const ids = [];
     for (const value of raw) {
       const id = String(value || '').toLowerCase();
-      if (PROVIDER_BY_ID.has(id) && !ids.includes(id) && ids.length < 2) ids.push(id);
+      if (PROVIDER_BY_ID.has(id) && !ids.includes(id) && ids.length < MAX_SEATS) ids.push(id);
     }
-    return ids.length === 2 ? ids : [];
+    return ids.length >= MIN_SEATS ? ids : [];
   } catch {
     return [];
   }
@@ -760,9 +763,9 @@ function rememberLastPair(providers) {
   const ids = [];
   for (const value of providers || []) {
     const id = String(value || '').toLowerCase();
-    if (PROVIDER_BY_ID.has(id) && !ids.includes(id) && ids.length < 2) ids.push(id);
+    if (PROVIDER_BY_ID.has(id) && !ids.includes(id) && ids.length < MAX_SEATS) ids.push(id);
   }
-  if (ids.length !== 2) return;
+  if (ids.length < MIN_SEATS) return;
   state.lastPair = ids;
   try {
     localStorage.setItem(LAST_PAIR_KEY, JSON.stringify(ids));
@@ -1244,12 +1247,19 @@ function homeSeatModeText(id) {
   return automationConfig(id) ? '自动' : '未连接，手动';
 }
 
+function joinProviderNames(providers) {
+  const names = (providers || []).map(providerName).filter(Boolean);
+  if (!names.length) return '';
+  if (names.length === 1) return names[0];
+  return `${names.slice(0, -1).join('、')} 和 ${names[names.length - 1]}`;
+}
+
 function recalledPairNote() {
-  if (state.lastPair.length !== 2) return '';
+  if (state.lastPair.length < MIN_SEATS) return '';
   const current = state.compose.providers;
-  if (current.length !== 2) return '';
-  if (current[0] !== state.lastPair[0] || current[1] !== state.lastPair[1]) return '';
-  return `沿用上次的 ${state.lastPair.map(providerName).join(' 和 ')}。换人先点一下已选的 AI。`;
+  if (current.length !== state.lastPair.length) return '';
+  if (current.some((id, index) => id !== state.lastPair[index])) return '';
+  return `沿用上次的 ${joinProviderNames(state.lastPair)}。换人先点一下已选的 AI。`;
 }
 
 function homeSeatStatusText() {
@@ -1260,33 +1270,43 @@ function homeSeatStatusText() {
 
 function homeSeatModeSummary() {
   const selected = state.compose.providers;
-  if (!selected.length) return '选两个不同的 AI 就能开始。';
+  if (!selected.length) return `选 ${MIN_SEATS} 或 ${MAX_SEATS} 个不同的 AI 就能开始。`;
 
   const parts = selected.map((id, index) =>
     `${seatLetter(index)} ${providerName(id)}：${homeSeatModeText(id)}`);
-  let text = parts.join(' · ');
+  const text = parts.join(' · ');
 
-  if (selected.length < 2) {
-    return `${text}。再选一位才能开始。`;
+  if (selected.length < MIN_SEATS) {
+    return `${text}。再选一位才能开始；最多 ${MAX_SEATS} 席。`;
   }
 
-  /* 两个原生站点都只能手动时，不再重复一遍 A/B 模式，保留一句下一步。 */
-  if (selected.length === 2 && selected.every((id) => !isAutomationSeat(id))) {
-    return '两位都手动：复制提示到原站，再粘贴回答。';
+  const ready = selected.length >= MAX_SEATS
+    ? `已经选满 ${MAX_SEATS} 席，可以开始。`
+    : `${MIN_SEATS} 席已就绪，可以开始；还能再加一席。`;
+
+  /* 全手动时不再重复一遍 A/B/C 模式，保留一句下一步。 */
+  if (selected.every((id) => !isAutomationSeat(id))) {
+    return `${ready}每席都手动：复制提示到原站，再粘贴回答。`;
   }
 
   if (selected.some(isAutomationSeat) && !state.automation.loaded) {
-    return `${text}。读完设置前可手动。`;
+    return `${text}。${ready}读完设置前可手动。`;
   }
 
   const autoReady = selected.filter((id) => isAutomationSeat(id) && automationConfig(id)).length;
   if (autoReady === 0) {
-    return `${text}。两席都手动：复制到原站，再粘贴回答。`;
+    return `${text}。${ready}本机席位未连接，按手动操作。`;
   }
   if (autoReady < selected.length) {
-    return `${text}。一位可自动，一位手动；创建后点「开始自动化」，不点就手动。`;
+    return `${text}。${ready}${autoReady} 席可自动，其余手动；创建后点「开始自动化」，不点就手动。`;
   }
-  return `${text}。两位都可自动；创建后点「开始自动化」，不点就手动。`;
+  return `${text}。${ready}每席都可自动；创建后点「开始自动化」，不点就手动。`;
+}
+
+function selectionCountText(count) {
+  if (count >= MAX_SEATS) return `${count} / ${MAX_SEATS} 已选 · 已满`;
+  if (count >= MIN_SEATS) return `${count} / ${MAX_SEATS} 已选 · 可开始`;
+  return `${count} / ${MAX_SEATS} 已选`;
 }
 
 function focusHomeQuestion() {
@@ -1412,8 +1432,8 @@ function renderHome() {
   }
 
   refs.selectionCount = h('span', {
-    class: `selection-count${state.compose.providers.length === 2 ? ' is-complete' : ''}`,
-    text: `${state.compose.providers.length} / 2 已选`,
+    class: `selection-count${state.compose.providers.length >= MIN_SEATS ? ' is-complete' : ''}`,
+    text: selectionCountText(state.compose.providers.length),
   });
 
   refs.seatStatus = h('p', {
@@ -1429,7 +1449,7 @@ function renderHome() {
       target: '_blank',
       rel: 'noopener noreferrer',
       text: '连接设置',
-      title: '配置本机 A / B 的网页地址和选择器',
+      title: '配置本机席位的网页地址和选择器',
     }),
     ...homeExtraLinks.map((link) => h('a', {
       class: 'link-quiet',
@@ -1443,8 +1463,8 @@ function renderHome() {
   refs.previewNames = h('strong', { text: previewNameText() });
   const flow = h('ol', { class: 'flow-steps' },
     h('li', {}, '第一轮同一个问题分别发给 ', refs.previewNames, '；各自回答，互相看不到。'),
-    h('li', {}, '两边答完，这里给每席生成质询，带上对方原话和出处。'),
-    h('li', {}, '候选结论出来后，两席对同一版表态；立场、理由和条件按席位保存。'),
+    h('li', {}, '每席答完，这里给各席生成质询，带上其他席位的原话和出处。'),
+    h('li', {}, '候选结论出来后，每席对同一版表态；立场、理由和条件按席位保存。'),
     h('li', {}, '最后导出结论，没解决的分歧也一起留着。'),
   );
 
@@ -1462,7 +1482,7 @@ function renderHome() {
           h('span', { class: 'kbd-hint', text: '⌘ / Ctrl + Enter 开始' }))),
       h('div', { class: 'home-seats' },
         h('div', { class: 'home-seat-head' },
-          h('h2', { class: 'home-seat-title', text: '选择两个 AI' }),
+          h('h2', { class: 'home-seat-title', text: '选择两个或三个 AI' }),
           refs.selectionCount),
         providerGrid,
         refs.seatStatus,
@@ -1513,7 +1533,8 @@ function providerChipTitle(provider) {
 }
 
 function homeAutomationSummary() {
-  const localSeats = state.compose.providers.filter(isAutomationSeat);
+  const selected = state.compose.providers;
+  const localSeats = selected.filter(isAutomationSeat);
   if (!localSeats.length) {
     return {
       tag: '手动',
@@ -1540,11 +1561,18 @@ function homeAutomationSummary() {
     return {
       tag: '部分可自动',
       strong: '要手动开始自动化',
-      span: '已连接的席位可自动，其他手动。创建后点「开始自动化」。',
+      span: '已连接的本机席位可自动，其他手动。创建后点「开始自动化」。',
+    };
+  }
+  if (configured.length < selected.length) {
+    return {
+      tag: '部分可自动',
+      strong: '自动只覆盖本机席位',
+      span: '其他席位仍手动。创建后点「开始自动化」，不点就全部手动。',
     };
   }
   return {
-    tag: localSeats.length === 2 ? '两席可自动' : '可自动',
+    tag: selected.length > localSeats.length ? '部分可自动' : '全部可自动',
     strong: '要手动开始自动化',
     span: '创建后点「开始自动化」才会发送；手动一直可用。',
   };
@@ -1577,9 +1605,9 @@ function refreshHomeAutomationHints() {
 
 function previewNameText() {
   const names = state.compose.providers.map(providerName);
-  if (names.length === 2) return `${names[0]} 与 ${names[1]}`;
+  if (names.length > 1) return `${names.slice(0, -1).join('、')} 与 ${names[names.length - 1]}`;
   if (names.length === 1) return `${names[0]} 与另一席`;
-  return '两席';
+  return `${MIN_SEATS} 到 ${MAX_SEATS} 席`;
 }
 
 function toggleProvider(id) {
@@ -1589,8 +1617,8 @@ function toggleProvider(id) {
   if (index >= 0) {
     state.compose.providers.splice(index, 1);
     clearHomeError();
-  } else if (state.compose.providers.length >= 2) {
-    showHomeError('已选两席。先点一下已选的 AI 取消，再换人。');
+  } else if (state.compose.providers.length >= MAX_SEATS) {
+    showHomeError(`已选满 ${MAX_SEATS} 席。先点一下已选的 AI 取消，再换人。`);
     return;
   } else {
     state.compose.providers.push(id);
@@ -1615,8 +1643,9 @@ function syncHomeSelection() {
     }
   }
   if (refs.selectionCount) {
-    refs.selectionCount.textContent = `${state.compose.providers.length} / 2 已选`;
-    refs.selectionCount.classList.toggle('is-complete', state.compose.providers.length === 2);
+    const count = state.compose.providers.length;
+    refs.selectionCount.textContent = selectionCountText(count);
+    refs.selectionCount.classList.toggle('is-complete', count >= MIN_SEATS);
   }
   if (refs.previewNames) refs.previewNames.textContent = previewNameText();
   refreshHomeAutomationHints();
@@ -1654,14 +1683,18 @@ async function startSession() {
     document.getElementById('question-input')?.focus();
     return;
   }
-  if (providers.length < 2) {
+  if (providers.length < MIN_SEATS) {
     showHomeError(providers.length === 0
-      ? '先选两个不同的 AI。'
-      : '再选一位才能开始。');
+      ? `先选 ${MIN_SEATS} 或 ${MAX_SEATS} 个不同的 AI。`
+      : `再选一位才能开始；最多 ${MAX_SEATS} 席。`);
     return;
   }
-  if (new Set(providers).size !== 2) {
-    showHomeError('两位不能是同一个网站。换一位。');
+  if (providers.length > MAX_SEATS) {
+    showHomeError(`最多 ${MAX_SEATS} 席。先取消一位再开始。`);
+    return;
+  }
+  if (new Set(providers).size !== providers.length) {
+    showHomeError('同一个网站只能放一席。换一位。');
     return;
   }
   for (const id of providers) {
@@ -1981,7 +2014,7 @@ function renderAutomationPanel(session) {
     target: '_blank',
     rel: 'noopener noreferrer',
     text: '连接设置',
-    title: '配置本机 A / B 的网页地址和选择器',
+    title: '配置本机席位的网页地址和选择器',
   });
 
   const panel = h('section', {
@@ -2048,16 +2081,19 @@ function updateAutomationPanel() {
 }
 
 function renderSessionHeader(session) {
-  const seats = session.providers.map((provider, index) => h('span', {
-    class: `seat-meta seat-meta-${index === 0 ? 'a' : 'b'}`,
-    title: isAutomationSeat(provider)
-      ? automationConfig(provider)
-        ? '本机席位：可以手动，也可以在连接设置后自动'
-        : '本机席位：还没保存地址，只能手动'
-      : '原站席位：手动复制提示、粘贴回答',
-  }, h('span', { class: 'seat-dot', attrs: { 'aria-hidden': 'true' } }),
-    `席 ${seatLetter(index)} · ${providerName(provider)}`,
-    h('span', { class: 'provider-tag', text: automationSeatMode(session, provider) })));
+  const seats = session.providers.map((provider, index) => {
+    const seat = seatLetter(index).toLowerCase();
+    return h('span', {
+      class: `seat-meta seat-meta-${seat}`,
+      title: isAutomationSeat(provider)
+        ? automationConfig(provider)
+          ? '本机席位：可以手动，也可以在连接设置后自动'
+          : '本机席位：还没保存地址，只能手动'
+        : '原站席位：手动复制提示、粘贴回答',
+    }, h('span', { class: 'seat-dot', attrs: { 'aria-hidden': 'true' } }),
+      `席 ${seatLetter(index)} · ${providerName(provider)}`,
+      h('span', { class: 'provider-tag', text: automationSeatMode(session, provider) }));
+  });
 
   const statusText = session.stage === 'done'
     ? '已结束'
@@ -2068,6 +2104,7 @@ function renderSessionHeader(session) {
       h('span', { text: '讨论' }),
       h('span', { class: 'dot-sep', attrs: { 'aria-hidden': 'true' }, text: '·' }),
       h('span', { class: session.paused ? 'status-paused' : '', text: statusText }),
+      h('span', { class: 'round-chip', text: `${session.providers.length} 席参与` }),
       session.stage !== 'done'
         ? h('span', { class: 'round-chip', text: `第 ${session.round} 轮` })
         : null),
@@ -2292,7 +2329,7 @@ function renderStage(session) {
 
   const section = h('section', { class: 'stage', attrs: { 'aria-labelledby': 'stage-title' } });
   const countLine = h('div', { class: 'stage-count' },
-    h('span', { text: `已收到 ${counts.answered} / ${tasks.length}` }),
+    h('span', { text: `本阶段 ${tasks.length} 席 · 已收到 ${counts.answered} / ${tasks.length}` }),
     counts.skipped ? h('span', { class: 'count-skip', text: `跳过 ${counts.skipped}` }) : null,
     counts.pending ? h('span', { class: 'count-pending', text: `待回答 ${counts.pending}` }) : null);
 
@@ -2535,6 +2572,7 @@ function renderTaskCard(session, task, fallbackIndex, nextTaskId) {
   const providerId = String(task.provider || '').toLowerCase();
   const seatIndex = session.providers.indexOf(providerId);
   const seat = seatLetter(seatIndex >= 0 ? seatIndex : fallbackIndex);
+  const seatClass = `seat-${seat.toLowerCase()}`;
   const name = providerName(providerId);
   const draft = getDraft(session, task);
   const hasDraft = Boolean(draft && (String(draft.text || '').trim() || draft.stance));
@@ -2553,7 +2591,7 @@ function renderTaskCard(session, task, fallbackIndex, nextTaskId) {
       `is-${task.status}`,
       editorOpen || correcting ? 'is-editing' : '',
       isNext ? 'is-next' : '',
-      seat === 'A' ? 'seat-a' : 'seat-b',
+      seatClass,
     ].filter(Boolean).join(' '),
     dataset: { taskId: task.id, provider: providerId },
   });
@@ -2568,7 +2606,7 @@ function renderTaskCard(session, task, fallbackIndex, nextTaskId) {
     : null;
   const header = h('div', { class: 'seat-top' },
     h('div', { class: 'seat-identity' },
-      h('span', { class: `seat-badge${seat === 'B' ? ' seat-badge-b' : ''}`, text: seat }),
+      h('span', { class: `seat-badge seat-badge-${seat.toLowerCase()}`, text: seat }),
       h('div', {},
         h('div', { class: 'seat-name', text: name }),
         h('div', { class: 'seat-sub' },
@@ -2660,7 +2698,7 @@ function renderTaskCard(session, task, fallbackIndex, nextTaskId) {
         class: 'btn btn-small',
         type: 'button',
         text: '改正录入',
-        title: '仅本轮另一席尚未提交时可用；保存后本席仍只算一条回答',
+        title: '仅本轮其他席位尚未提交时可用；保存后本席仍只算一条回答',
       });
       correction.addEventListener('click', () => {
         state.correctionBase[task.id] = typeof task.answer === 'string' ? task.answer : '';
@@ -2769,7 +2807,9 @@ function renderAnswerBlock(session, task, isNext) {
     class: 'answer-note',
     text: isNext
       ? '这一席是当前下一步；收到回答后粘贴到这里提交。'
-      : '同一轮的另一席；两席都收到后才进入下一阶段。',
+      : session.stage === 'proposal'
+        ? '这一席负责起草候选结论；收到后交给所有席位确认。'
+        : '同一轮的其他席位；每席都收到后才进入下一阶段。',
   });
 }
 
@@ -3000,7 +3040,7 @@ function renderCorrectionEditor(session, task, errorEl) {
   const footer = h('div', { class: 'editor-foot' });
   footer.append(h('span', {
     class: 'draft-note',
-    text: '只有本轮另一席仍未提交时才能保存；过期或重复提交会被后台拒绝。',
+    text: '只要本轮还有待答席位就能保存；过期或重复提交会被后台拒绝。',
   }));
 
   const actionWrap = h('div', { class: 'editor-actions' });
@@ -3697,7 +3737,7 @@ function renderReport(session) {
 function renderStanceSummary(session) {
   const rows = deriveStances(session);
   const wrap = h('div', { class: 'stance-summary' },
-    h('h3', { class: 'stance-title', text: '逐席确认' }),
+    h('h3', { class: 'stance-title', text: `逐席确认（${rows.length} 席）` }),
     h('p', {
       class: 'stance-rule',
       text: '缺席、沉默和无法解析的表态都不计为同意。每位都明确同意，且关键条件已写入，才算全体一致。',
@@ -3739,7 +3779,7 @@ function renderHistory(session) {
       h('div', {},
         h('p', { class: 'report-kicker', text: '原文保留' }),
         h('h2', { class: 'history-title', id: 'history-title', text: '历次发言' })),
-      h('span', { class: 'history-note', text: '按轮次与阶段保存' })));
+      h('span', { class: 'history-note', text: '按轮次、阶段与席位保存' })));
 
   if (!entries.length) {
     section.append(h('div', {
@@ -3868,7 +3908,7 @@ function buildMarkdown(session) {
   lines.push('## 讨论信息', '');
   const seats = sessionProviderList(session).map((provider, index) =>
     `席 ${seatLetter(index)} ${providerName(provider)}（${provider}）`);
-  lines.push(`- 参与席位：${seats.join('；') || '未登记'}`);
+  lines.push(`- 参与席位（${seats.length}）：${seats.join('；') || '未登记'}`);
   lines.push(`- 当前阶段：${stageInfo(session.stage).label}${session.stage !== 'done' ? ` · 第 ${session.round} 轮` : ''}`);
   lines.push(`- 状态：${session.paused ? '已暂停' : session.stage === 'done' ? '已结束' : '进行中'}`);
   lines.push(`- 更新时间：${formatAbsolute(session.updatedAt)}`);

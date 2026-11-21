@@ -88,10 +88,10 @@ test('createSession validates question, provider count, duplicates and canonical
   assert.throws(() => createSession('', PROVIDERS), /non-empty/);
   assert.throws(() => createSession('   ', PROVIDERS), /non-empty/);
   assert.throws(() => createSession(123, PROVIDERS), /non-empty/);
-  assert.throws(() => createSession(QUESTION, ['chatgpt']), /two distinct/);
+  assert.throws(() => createSession(QUESTION, ['chatgpt']), /2 or 3 distinct/);
   assert.throws(
-    () => createSession(QUESTION, ['chatgpt', 'claude', 'gemini']),
-    /two distinct/,
+    () => createSession(QUESTION, ['chatgpt', 'claude', 'gemini', 'deepseek']),
+    /2 or 3 distinct/,
   );
   assert.throws(
     () => createSession(QUESTION, ['chatgpt', 'chatgpt']),
@@ -105,11 +105,44 @@ test('createSession validates question, provider count, duplicates and canonical
     () => createSession(QUESTION, ['chat gpt', 'claude']),
     /canonical lowercase/,
   );
-  assert.throws(() => createSession(QUESTION, 'chatgpt,claude'), /two distinct/);
+  assert.throws(() => createSession(QUESTION, 'chatgpt,claude'), /2 or 3 distinct/);
 
   // Hyphens and digits are part of the canonical id vocabulary.
   const session = createSession(QUESTION, ['chat-gpt4', 'claude']);
   assert.deepEqual(session.providers, ['chat-gpt4', 'claude']);
+});
+
+test('three seats each receive both peers and all must vote on the same candidate', () => {
+  const providers = ['chatgpt', 'gemini', 'deepseek'];
+  let session = createSession(QUESTION, providers);
+  const originals = ['IDEA_ALPHA', 'IDEA_BETA', 'IDEA_GAMMA'];
+  assert.equal(new Set(session.tasks.map((task) => task.prompt)).size, 1);
+  for (const [index, provider] of providers.entries()) {
+    session = answerFor(session, provider, originals[index]);
+    assert.equal(session.stage, index === 2 ? 'critique' : 'independent');
+  }
+  for (const [index, provider] of providers.entries()) {
+    const task = pendingTask(session, provider);
+    const peerMaterial = task.prompt.split('【对方材料】')[1]?.split('【')[0];
+    assert.ok(peerMaterial);
+    for (const [peerIndex, original] of originals.entries()) {
+      assert.equal(peerMaterial.includes(original), peerIndex !== index);
+    }
+    session = answerFor(session, provider, `Review from ${provider}: each peer has a testable assumption.`);
+  }
+  session = answerFor(session, session.tasks[0].provider, 'Candidate [S1], [S2], [S3].');
+  assert.deepEqual(session.tasks.map((task) => task.provider), providers);
+  assert.equal(new Set(session.tasks.map((task) => task.proposalDigest)).size, 1);
+  session = answerFor(session, 'chatgpt', 'I agree.', { stance: 'agree' });
+  session = answerFor(session, 'gemini', 'I agree.', { stance: 'agree' });
+  assert.equal(session.stage, 'vote');
+  const missingSeat = skipFor(session, 'deepseek');
+  assert.equal(missingSeat.stage, 'done');
+  assert.match(missingSeat.report, /部分完成/);
+  assert.doesNotMatch(missingSeat.report, /全体一致/);
+  const unanimous = answerFor(session, 'deepseek', 'I agree.', { stance: 'agree' });
+  assert.equal(unanimous.stage, 'done');
+  assert.match(unanimous.report, /全体一致/);
 });
 
 test('createSession starts with only pending independent tasks and no demo answers', () => {

@@ -178,7 +178,7 @@ def main() -> int:
             for pid in ("chatgpt", "claude"):
                 page.locator(f"button.provider-option[data-provider-id='{pid}']").click()
             snapshot = ui.selection_snapshot()
-            check("Two seats show 2 / 2 and pressed state", snapshot["pressed"] == ["chatgpt", "claude"] and "2 / 2" in snapshot["counter"], snapshot["counter"])
+            check("Two selected seats show their pressed state", snapshot["pressed"] == ["chatgpt", "claude"], snapshot["counter"])
             shot(page, out, "02_home_selected")
 
             page.reload(wait_until="domcontentloaded")
@@ -187,7 +187,7 @@ def main() -> int:
             restored_snapshot = ui.selection_snapshot()
             check(
                 "Returning user gets the typed question and both seats back",
-                restored == question and restored_snapshot["pressed"] == ["chatgpt", "claude"] and "2 / 2" in restored_snapshot["counter"],
+                restored == question and restored_snapshot["pressed"] == ["chatgpt", "claude"],
                 f"question_restored={restored == question} pressed={restored_snapshot['pressed']}",
             )
             shot(page, out, "03_home_returning")
@@ -330,14 +330,9 @@ def main() -> int:
             )
             shot(page, out, "14_home_recall")
             page.locator("button.provider-option[data-provider-id='gemini']").click()
-            body_text = page.locator("body").inner_text()
-            third_error = page.locator(".inline-error").inner_text() if page.locator(".inline-error").is_visible() else ""
-            resolved = not ("最多两席" in third_error and "改选直接点其他成员" in body_text)
-            check(
-                "Changing a recalled pair works the way the recall note says",
-                resolved,
-                f"error={third_error!r}",
-            )
+            selected = ui.selection_snapshot()["pressed"]
+            check("A third seat can join the recalled pair",
+                  selected == ["chatgpt", "claude", "gemini"], str(selected))
             shot(page, out, "14b_home_third_seat")
             page.set_viewport_size({"width": 420, "height": 800})
             overflow = page.evaluate("() => document.documentElement.scrollWidth - document.documentElement.clientWidth")

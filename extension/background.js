@@ -25,9 +25,9 @@
 // - Only this extension's own workspace.html page may send commands. Provider
 //   pages and external senders are rejected; no onMessageExternal bridge exists.
 // - Command names, ids, actions and provider ids are validated against fixed
-//   allowlists. `create` needs exactly two distinct canonical lowercase provider
-//   ids from providers.js; `open` only opens a registry URL for a seat that is
-//   actually part of the session.
+//   allowlists. `create` needs two or three distinct canonical lowercase
+//   provider ids from providers.js; `open` only opens a registry URL for a seat
+//   that is actually part of the session.
 // - `open` reuses the seat's bound tab when the `tabs` metadata permission shows
 //   its URL still belongs to the intended page (see `tabMatchesEntry`). It never
 //   reads page content, never queries unrelated tabs, and never navigates a tab
@@ -38,7 +38,7 @@
 // workspace windows or a double click can not lose each other's update. A
 // failing mutator aborts the transaction, so no partial state is written.
 
-import { createSession, applyAction } from './core.js';
+import { createSession, applyAction, MIN_SEATS, MAX_SEATS } from './core.js';
 import { installAutomation } from './automation.js';
 import {
   PROVIDERS,
@@ -112,8 +112,8 @@ function requireTaskId(value) {
 }
 
 function requireProviders(value) {
-  if (!Array.isArray(value) || value.length !== 2) {
-    throw new ArenaError('本版本需要恰好两个参与席位');
+  if (!Array.isArray(value) || value.length < MIN_SEATS || value.length > MAX_SEATS) {
+    throw new ArenaError(`本版本需要 ${MIN_SEATS} 或 ${MAX_SEATS} 个参与席位`);
   }
   const providers = value.map((provider) => {
     if (!isProviderId(provider)) {
@@ -123,7 +123,9 @@ function requireProviders(value) {
     }
     return provider;
   });
-  if (providers[0] === providers[1]) throw new ArenaError('两个席位不能相同');
+  if (new Set(providers).size !== providers.length) {
+    throw new ArenaError('参与席位不能重复');
+  }
   return providers;
 }
 
