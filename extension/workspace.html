@@ -4,42 +4,48 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>判断台 · AI Arena</title>
+  <title>AI Arena</title>
   <link rel="stylesheet" href="workspace.css">
+  <link rel="stylesheet" href="provider-marks.css">
+  <link rel="stylesheet" href="glass-material.css">
+  <link rel="stylesheet" href="history-nav.css">
+  <link rel="stylesheet" href="task-actions.css">
 </head>
 <body>
   <div class="app">
-    <aside class="sidebar" aria-label="历史场次">
+    <aside class="sidebar" aria-label="我的讨论">
       <div class="brand">
         <span class="seal" aria-hidden="true">判</span>
         <span class="brand-copy">
-          <span class="brand-title">判断台</span>
-          <span class="brand-sub">AI ARENA · 本地</span>
+          <span class="brand-title">AI Arena</span>
+          <span class="brand-sub">本机讨论</span>
         </span>
       </div>
 
       <button class="new-session" id="new-session" type="button">
         <span class="new-session-mark" aria-hidden="true">＋</span>
-        <span>新的判断</span>
+        <span>新讨论</span>
+      </button>
+
+      <button class="history-nav-toggle" id="history-nav-toggle" type="button"
+        aria-expanded="false" aria-controls="history-nav-panel" hidden>
+        <span>历史</span>
+        <span class="history-nav-caret" aria-hidden="true"></span>
       </button>
 
       <div class="history-head">
-        <span>历史场次</span>
+        <span>我的讨论</span>
         <span class="history-count" id="history-count">0</span>
       </div>
 
       <div class="search">
-        <input id="history-search" type="search" placeholder="查找问题" autocomplete="off" aria-label="查找历史场次">
+        <input id="history-search" type="search" placeholder="查找讨论" autocomplete="off" aria-label="查找我的讨论">
       </div>
 
       <div class="history-list" id="history-list" aria-live="polite"></div>
 
       <div class="sidebar-foot">
-        <p>记录保存在本机浏览器，导出后可离线阅读。</p>
-        <p>删除场次只影响本机记录，不改变各网站历史。</p>
-        <p>
-          <a class="btn btn-small btn-on-dark" href="connections.html" target="_blank" rel="noopener noreferrer">连接设置 · 本机网页</a>
-        </p>
+        <p>记录存在这个浏览器里，删除不影响网站上的对话。</p>
       </div>
     </aside>
 
@@ -57,8 +63,9 @@
 
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 
-  <noscript>这个工作台需要启用 JavaScript。</noscript>
+  <noscript>需要启用 JavaScript。</noscript>
 
   <script type="module" src="workspace.js"></script>
+  <script type="module" src="history-nav.js"></script>
 </body>
 </html>

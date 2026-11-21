@@ -22,6 +22,12 @@
  * are copied into `history` with their stage and round; history entries are
  * never rewritten.
  *
+ * A manual public seat may correct its saved answer in place during the
+ * current independent or critique round, but only while another seat in that
+ * round is still pending. The correction keeps `originalAnswer`, `answeredAt`,
+ * `correctedAt` and the replaced texts in `corrections`; it never creates a
+ * second answer or changes a prompt that was already issued.
+ *
  * Stages:
  *   independent -> critique -> proposal -> vote -> done
  * A vote with explicit opposition runs one targeted critique round
@@ -37,8 +43,17 @@
  * even when every seat clicked agree.
  */
 
+import { AUTOMATION_PROVIDER_IDS } from './providers.js';
+
 const STANCES = ['agree', 'conditional', 'oppose'];
 const PROVIDER_ID_RE = /^[a-z0-9]+(?:[-_][a-z0-9]+)*$/;
+
+// A manually relayed answer may be corrected only inside the round it belongs
+// to, and only while another seat in that same round is still pending. Once
+// the round completes, its prompts are frozen and a correction would silently
+// change material another seat already received.
+const CORRECTABLE_STAGES = new Set(['independent', 'critique']);
+const AUTOMATION_SEATS = new Set(AUTOMATION_PROVIDER_IDS);
 
 // Where a paused user may add a condition, and which newly constructed task
 // prompts carry it. Vote prompts are excluded on purpose: a vote must stay on
@@ -120,9 +135,10 @@ export function createSession(question, providers) {
  * Apply one user or coordinator action and return the next session.
  *
  * action:
- *   'answer' payload { taskId, text, stance?, version?, stage?, round? }
- *   'skip'   payload { taskId }
- *   'guide'  payload { text }          (only while paused, independent/critique)
+ *   'answer'  payload { taskId, text, stance?, version?, stage?, round? }
+ *   'correct' payload { taskId, text, previousText, stage?, round? }
+ *   'skip'    payload { taskId }
+ *   'guide'   payload { text }          (only while paused, independent/critique)
  *   'pause' | 'resume' | 'finish'
  */
 export function applyAction(session, action, payload = {}) {
@@ -177,6 +193,18 @@ export function applyAction(session, action, payload = {}) {
     }
     actAnswer(next, payload);
     advanceWhilePossible(next);
+    touch(next, session);
+    return next;
+  }
+
+  if (action === 'correct') {
+    if (session.stage === 'done') {
+      throw new Error('session is done; no further corrections are accepted');
+    }
+    // A correction replaces one saved answer in place. It never advances the
+    // stage, never creates a second answer record and never rewrites a frozen
+    // prompt, so the pending count is unchanged by design.
+    actCorrect(next, payload);
     touch(next, session);
     return next;
   }
@@ -281,7 +309,103 @@ function actAnswer(session, payload) {
 
   task.status = 'answered';
   task.answer = text;
+  // Kept apart from any later correction: the submission time never changes
+  // when the text is corrected in the same round.
+  task.answeredAt = Math.max(Date.now(), Number(session.updatedAt) || 0);
   if (session.stage === 'vote') task.stance = stance;
+}
+
+/**
+ * Replace one already saved answer in place.
+ *
+ * The caller must name the exact text it believes is saved (`previousText`).
+ * A second window, a stale card or a repeated click then fails instead of
+ * overwriting someone else's correction. Only this one task record changes;
+ * the stage, every prompt and every other answer stay untouched. The first
+ * submitted text is kept in `originalAnswer` and each replacement keeps the
+ * text it replaced plus its own timestamp in `corrections`, so no answer is
+ * counted twice and the original remains recoverable.
+ */
+function actCorrect(session, payload) {
+  if (!CORRECTABLE_STAGES.has(session.stage)) {
+    throw new Error(
+      `answers cannot be corrected in the ${session.stage} stage; correcting is limited to current independent or critique rounds`,
+    );
+  }
+
+  const task = requireCurrentTask(session, payload.taskId);
+
+  if (AUTOMATION_SEATS.has(task.provider)) {
+    throw new Error(
+      `task "${task.id}" belongs to an automated seat; its saved answer is only changed by the seat's own reply`,
+    );
+  }
+  if (task.status === 'skipped') {
+    throw new Error(
+      `task "${task.id}" was skipped; a skip is not a saved answer and cannot be corrected`,
+    );
+  }
+  if (task.status !== 'answered') {
+    throw new Error(
+      `task "${task.id}" has no saved answer yet; submit the answer instead of correcting it`,
+    );
+  }
+
+  // A correction is safe only while the rest of this round is still open. If
+  // every other seat has answered (or skipped), the round has already frozen
+  // and a later prompt may carry the text we are about to replace.
+  const others = session.tasks.filter((candidate) => candidate.id !== task.id);
+  if (!others.some((candidate) => candidate.status === 'pending')) {
+    throw new Error(
+      `this ${session.stage} round is already frozen: no other seat is still pending, so a correction would rewrite material already sent onward`,
+    );
+  }
+
+  // Optional coordinates let a stale card fail before it touches the record.
+  if (payload.stage !== undefined && payload.stage !== session.stage) {
+    throw new Error(
+      `stale correction: expected stage "${session.stage}", got "${String(payload.stage)}"`,
+    );
+  }
+  if (payload.round !== undefined && payload.round !== session.round) {
+    throw new Error(
+      `stale correction: expected round ${session.round}, got "${String(payload.round)}"`,
+    );
+  }
+
+  if (
+    typeof payload.previousText !== 'string' ||
+    payload.previousText !== task.answer
+  ) {
+    throw new Error(
+      'stale correction: the saved answer is no longer the text this edit started from; reopen the latest saved answer and correct that',
+    );
+  }
+
+  const text = payload.text;
+  if (typeof text !== 'string' || text.trim().length === 0) {
+    throw new Error(
+      'corrected text must be a non-empty string; incomplete corrections are not accepted',
+    );
+  }
+  if (text === task.answer) {
+    throw new Error('the corrected text is identical to the saved answer; nothing was changed');
+  }
+
+  const at = Math.max(
+    Date.now(),
+    Number(task.answeredAt) || 0,
+    Array.isArray(task.corrections) && task.corrections.length > 0
+      ? Number(task.corrections[task.corrections.length - 1].at) || 0
+      : 0,
+  );
+
+  // The first submitted text is never overwritten by a later correction.
+  if (typeof task.originalAnswer !== 'string') task.originalAnswer = task.answer;
+  if (!Array.isArray(task.corrections)) task.corrections = [];
+  task.corrections.push({ previousText: task.answer, text, at });
+  task.answer = text;
+  task.correctedAt = at;
 }
 
 function actSkip(session, payload) {

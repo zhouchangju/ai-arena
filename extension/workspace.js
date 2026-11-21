@@ -12,27 +12,27 @@ const STAGES = [
   {
     key: 'independent',
     label: '独立作答',
-    desc: '两席拿到相同题面，各自完成后才能进入下一阶段。此时彼此看不到对方的回答。',
+    desc: '两席拿到同一个问题，各自作答后才能进入下一步；这时彼此看不到对方的回答。',
   },
   {
     key: 'critique',
     label: '交叉质询',
-    desc: '把对方的具体主张交给这一席：指出最强依据、最有影响的反例，并说明自己维持或修正了哪条主张。',
+    desc: '把对方的具体主张交给这一席：指出最强依据和最有影响的反例，说明自己维持或修正了哪条主张。',
   },
   {
     key: 'proposal',
     label: '候选结论',
-    desc: '由指定席位起草一版候选结论，写清建议、依据、成立条件与最强反例，供两席确认。',
+    desc: '一席起草候选结论：建议、依据、成立条件和最强反例，交给两席确认。',
   },
   {
     key: 'vote',
     label: '逐席确认',
-    desc: '两席对同一版候选结论明确表态。只有每位都明确同意且关键条件已纳入，才构成全体一致。',
+    desc: '两席对同一版候选结论表态。每位都明确同意、关键条件也写进去，才算全体一致。',
   },
   {
     key: 'done',
     label: '结论',
-    desc: '按当前记录交付结论。存在实质反对、缺席或未纳入的条件时，保留这些状态。',
+    desc: '按现有记录给出结论。有实质反对、缺席或没写进去的条件，都照实保留。',
   },
 ];
 
@@ -61,8 +61,8 @@ const AUTOMATION_SEAT_LABELS = {
   probing: '检查页面',
   dispatching: '提交中',
   waiting: '等待回答',
-  answered: '已写入本场',
-  stale: '已过期，需人工核对',
+  answered: '已写入讨论',
+  stale: '已过期，要人工核对',
   'session-paused': '讨论已暂停',
   paused: '需要处理',
   unconfigured: '未配置',
@@ -71,6 +71,7 @@ const AUTOMATION_SEAT_LABELS = {
 
 const DRAFTS_KEY = 'aiArena.workspace.drafts.v1';
 const COMPOSE_KEY = 'aiArena.workspace.compose.v1';
+const LAST_PAIR_KEY = 'aiArena.workspace.lastPair.v1';
 const DRAFT_MAX_AGE = 30 * 24 * 60 * 60 * 1000;
 
 const viewEl = document.getElementById('view');
@@ -88,12 +89,17 @@ const state = {
   listFilter: '',
   session: null,
   compose: { question: '', providers: [] },
+  lastPair: [],
   drafts: {},
   showEditor: {},
+  /* 打开「改正录入」时看到的原文；提交时作为预期旧文本交给后台拒绝过期覆盖。 */
+  correctionBase: {},
   dismissedDraftEditors: new Set(),
   stanceChoice: {},
   taskErrors: {},
   taskErrorEls: new Map(),
+  promptCopied: {},
+  nextStepPanel: null,
   homeRefs: null,
   pendingCreate: false,
   toastTimer: null,
@@ -242,7 +248,7 @@ function automationNeedsAction(run) {
 
 function automationSeatMode(session, provider) {
   const id = String(provider || '').toLowerCase();
-  if (!isAutomationSeat(id)) return '手动中转';
+  if (!isAutomationSeat(id)) return '手动';
   const run = automationRun(session);
   const seat = automationSeatState(run, id);
   if (run && run.enabled) {
@@ -281,17 +287,17 @@ function automationRunSignature(run) {
 }
 
 function automationRunSummary(run) {
-  if (!run) return '未启用。本场仍可手动复制、粘贴和提交。';
+  if (!run) return '没有启用自动。可以手动复制、粘贴和提交。';
   if (run.enabled) {
     const needs = automationNeedsAction(run);
     if (needs > 0) {
-      return `运行中，但有 ${needs} 席需要你处理。未处理的席位不会继续自动派发。`;
+      return `自动运行中，有 ${needs} 席要你处理；没处理的席位不会继续自动发送。`;
     }
-    return '运行中：只驱动已配置的本机席位；手动操作始终可用。';
+    return '自动运行中，只驱动已配置的本机席位；手动操作一直可用。';
   }
-  if (run.completed) return '本场已结束，自动驱动也随之停止。';
-  if (run.stoppedAt) return '已停止自动驱动；原页保留，可继续手动操作。';
-  return '未启用。本场仍可手动复制、粘贴和提交。';
+  if (run.completed) return '讨论已结束，自动也停了。';
+  if (run.stoppedAt) return '自动已停止，原页还在，可以继续手动操作。';
+  return '没有启用自动。可以手动复制、粘贴和提交。';
 }
 
 /* ------------------------------ 小工具 ------------------------------ */
@@ -427,7 +433,7 @@ function runtimeAvailable() {
 function callBackground(message) {
   return new Promise((resolve, reject) => {
     if (!runtimeAvailable()) {
-      reject(new Error('未检测到扩展后台。请从 Chrome 的扩展页打开 workspace.html。'));
+      reject(new Error('没有检测到扩展后台。请从 Chrome 扩展页打开，不要直接打开文件。'));
       return;
     }
 
@@ -481,7 +487,7 @@ function callBackground(message) {
 
 async function fetchSession(id) {
   const reply = await callBackground({ type: 'get', id });
-  if (!reply.session) throw new Error('后台没有返回场次内容。');
+  if (!reply.session) throw new Error('后台没有返回讨论内容。');
   return reply.session;
 }
 
@@ -492,7 +498,7 @@ async function ensureSession(reply, id) {
 
 async function actSession(action, payload) {
   const current = state.session;
-  if (!current) throw new Error('当前没有打开的场次。');
+  if (!current) throw new Error('当前没有打开的讨论。');
   const message = { type: 'act', id: current.id, action };
   if (payload !== undefined) message.payload = payload;
   const reply = await callBackground(message);
@@ -621,7 +627,7 @@ async function startAutomation(button) {
     state.automationSignature = automationRunSignature(automationRun(state.session));
     await refreshSessionQuietly();
     ensureAutomationPolling();
-    toast('已开始本机自动化：只驱动已配置的席位，手动操作始终可用');
+    toast('已开始自动：只驱动配置好的本机席位，手动操作一直可用');
   } catch (error) {
     toast(friendlyError(error, '无法开始自动化'), 'error');
   } finally {
@@ -647,7 +653,7 @@ async function stopAutomation(button) {
     await callBackground({ type: 'automation.stop', id: session.id });
     stopAutomationPolling();
     await loadAutomationInfo({ silent: true });
-    toast('已停止自动驱动；原页保留，可继续手动操作');
+    toast('自动已停止，原页还在');
   } catch (error) {
     toast(friendlyError(error, '无法停止自动化'), 'error');
   } finally {
@@ -711,6 +717,9 @@ function loadStoredState() {
   } catch {
     state.compose = { question: '', providers: [] };
   }
+
+  state.lastPair = loadLastPair();
+  maybeRecallLastPair();
 }
 
 function persistDrafts() {
@@ -729,6 +738,47 @@ function persistCompose() {
   }
 }
 
+/* 只记住「上一次实际开始讨论」的两席，供下一次首页直接沿用。它不创建
+ * 讨论、不发送任何内容，也不覆盖已经写了一半的首页草稿。第一次使用时
+ * 没有记录，首页仍保持空白，由用户自己选。 */
+function loadLastPair() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(LAST_PAIR_KEY) || 'null');
+    if (!Array.isArray(raw)) return [];
+    const ids = [];
+    for (const value of raw) {
+      const id = String(value || '').toLowerCase();
+      if (PROVIDER_BY_ID.has(id) && !ids.includes(id) && ids.length < 2) ids.push(id);
+    }
+    return ids.length === 2 ? ids : [];
+  } catch {
+    return [];
+  }
+}
+
+function rememberLastPair(providers) {
+  const ids = [];
+  for (const value of providers || []) {
+    const id = String(value || '').toLowerCase();
+    if (PROVIDER_BY_ID.has(id) && !ids.includes(id) && ids.length < 2) ids.push(id);
+  }
+  if (ids.length !== 2) return;
+  state.lastPair = ids;
+  try {
+    localStorage.setItem(LAST_PAIR_KEY, JSON.stringify(ids));
+  } catch {
+    /* 只影响下次是否沿用，不影响本次讨论。 */
+  }
+}
+
+function maybeRecallLastPair() {
+  if (!state.lastPair.length) return;
+  if (state.compose.providers.length) return;
+  if (state.compose.question.trim()) return;
+  state.compose.providers = state.lastPair.slice();
+  persistCompose();
+}
+
 function flushStoredState() {
   persistDrafts();
   persistCompose();
@@ -740,6 +790,14 @@ function draftKey(session, task) {
 
 function getDraft(session, task) {
   return state.drafts[draftKey(session, task)] || null;
+}
+
+/* 阶段推进后，被跳过的任务只剩 history 里的快照；用它的 stage/round/id
+ * 还原同一个草稿键，保证刷新后仍能只读找回。 */
+function draftForHistoryEntry(session, entry) {
+  if (!session || !entry) return null;
+  const key = [session.id, entry.stage, String(entry.round), String(entry.id)].join('::');
+  return state.drafts[key] || null;
 }
 
 function saveDraft(key, patch) {
@@ -792,6 +850,15 @@ function normalizeTask(raw, fallbackIndex = 0) {
   const id = String(raw.id || '').trim();
   if (!id) return null;
   const status = ['pending', 'answered', 'skipped'].includes(raw.status) ? raw.status : 'pending';
+  const corrections = Array.isArray(raw.corrections)
+    ? raw.corrections
+      .filter((entry) => entry && typeof entry === 'object')
+      .map((entry) => ({
+        previousText: typeof entry.previousText === 'string' ? entry.previousText : '',
+        text: typeof entry.text === 'string' ? entry.text : '',
+        at: Number.isFinite(Number(entry.at)) ? Number(entry.at) : 0,
+      }))
+    : [];
   return {
     id,
     provider: String(raw.provider || '').toLowerCase(),
@@ -800,6 +867,11 @@ function normalizeTask(raw, fallbackIndex = 0) {
     answer: typeof raw.answer === 'string' ? raw.answer : '',
     stance: STANCE_LABELS[raw.stance] ? raw.stance : undefined,
     sourceId: typeof raw.sourceId === 'string' ? raw.sourceId.trim() : '',
+    /* 更正留存：首次提交原文、每次替换前后的文本与时间；只作出处，不再计一条回答。 */
+    originalAnswer: typeof raw.originalAnswer === 'string' ? raw.originalAnswer : '',
+    corrections,
+    answeredAt: Number.isFinite(Number(raw.answeredAt)) ? Number(raw.answeredAt) : 0,
+    correctedAt: Number.isFinite(Number(raw.correctedAt)) ? Number(raw.correctedAt) : 0,
     _index: fallbackIndex,
   };
 }
@@ -843,6 +915,8 @@ function normalizeSession(raw) {
     history: Array.isArray(raw.history) ? raw.history.map(normalizeHistoryEntry).filter(Boolean) : [],
     guidance: normalizeGuidance(raw.guidance),
     report: typeof raw.report === 'string' ? raw.report : '',
+    /* 核心写入的结束原因；只用于结论区状态显示，不参与任何判断。 */
+    stopReason: typeof raw.stopReason === 'string' ? raw.stopReason : '',
     updatedAt: Number.isFinite(Number(raw.updatedAt)) ? Number(raw.updatedAt) : Date.now(),
   };
 }
@@ -1055,7 +1129,10 @@ function goHome() {
   state.stanceChoice = {};
   state.taskErrors = {};
   state.taskErrorEls = new Map();
+  state.promptCopied = {};
+  state.nextStepPanel = null;
   setHash('');
+  maybeRecallLastPair();
   renderHome();
   renderHistoryList();
   void loadAutomationInfo({ silent: true });
@@ -1079,7 +1156,7 @@ function renderHistoryList() {
     } else {
       listEl.append(
         h('div', { class: 'sidebar-error' },
-          h('p', { text: '历史读取失败。' }),
+          h('p', { text: '读取讨论失败。' }),
           h('p', { class: 'sidebar-error-detail', text: state.listError }),
           h('button', {
             class: 'btn btn-small btn-on-dark',
@@ -1093,7 +1170,7 @@ function renderHistoryList() {
   }
 
   if (!state.sessions.length) {
-    listEl.append(h('div', { class: 'sidebar-empty', text: '还没有场次。写下第一个要判断的问题。' }));
+    listEl.append(h('div', { class: 'sidebar-empty', text: '暂无讨论' }));
     return;
   }
 
@@ -1103,7 +1180,7 @@ function renderHistoryList() {
     : state.sessions;
 
   if (!sessions.length) {
-    listEl.append(h('div', { class: 'sidebar-empty', text: '没有匹配的问题。' }));
+    listEl.append(h('div', { class: 'sidebar-empty', text: '没有匹配的讨论。' }));
     return;
   }
 
@@ -1157,40 +1234,59 @@ function registerHomeLink(link) {
 
 function homeSeatTag(id) {
   if (!isAutomationSeat(id)) return '';
-  if (!state.automation.loaded) return '本机';
+  if (!state.automation.loaded) return '';
   return automationConfig(id) ? '自动' : '';
 }
 
 function homeSeatModeText(id) {
-  if (!isAutomationSeat(id)) return '手动中转';
-  if (!state.automation.loaded) return '本机（读取设置中）';
-  return automationConfig(id) ? '本机可自动' : '本机未配置，按手动继续';
+  if (!isAutomationSeat(id)) return '手动';
+  if (!state.automation.loaded) return '读取设置中';
+  return automationConfig(id) ? '自动' : '未连接，手动';
+}
+
+function recalledPairNote() {
+  if (state.lastPair.length !== 2) return '';
+  const current = state.compose.providers;
+  if (current.length !== 2) return '';
+  if (current[0] !== state.lastPair[0] || current[1] !== state.lastPair[1]) return '';
+  return `沿用上次的 ${state.lastPair.map(providerName).join(' 和 ')}。换人先点一下已选的 AI。`;
 }
 
 function homeSeatStatusText() {
+  const recall = recalledPairNote();
+  const summary = homeSeatModeSummary();
+  return recall ? `${recall}${summary}` : summary;
+}
+
+function homeSeatModeSummary() {
   const selected = state.compose.providers;
-  if (!selected.length) return '尚未选择席位。选两席不同成员后即可开始；手动中转始终可用。';
+  if (!selected.length) return '选两个不同的 AI 就能开始。';
 
   const parts = selected.map((id, index) =>
     `${seatLetter(index)} ${providerName(id)}：${homeSeatModeText(id)}`);
   let text = parts.join(' · ');
 
   if (selected.length < 2) {
-    return `${text}。还需再选一席，两席才能交换质疑。`;
+    return `${text}。再选一位才能开始。`;
+  }
+
+  /* 两个原生站点都只能手动时，不再重复一遍 A/B 模式，保留一句下一步。 */
+  if (selected.length === 2 && selected.every((id) => !isAutomationSeat(id))) {
+    return '两位都手动：复制提示到原站，再粘贴回答。';
   }
 
   if (selected.some(isAutomationSeat) && !state.automation.loaded) {
-    return `${text}。正在读取本机设置；完成前手动中转可用。`;
+    return `${text}。读完设置前可手动。`;
   }
 
   const autoReady = selected.filter((id) => isAutomationSeat(id) && automationConfig(id)).length;
   if (autoReady === 0) {
-    return `${text}。两席都按手动中转：复制提示、在原站取得回答，再粘贴回来。`;
+    return `${text}。两席都手动：复制到原站，再粘贴回答。`;
   }
   if (autoReady < selected.length) {
-    return `${text}。混合模式：自动席位需创建后显式开始，其余席位手动；自动未就绪时仍可手动完成。`;
+    return `${text}。一位可自动，一位手动；创建后点「开始自动化」，不点就手动。`;
   }
-  return `${text}。创建后需显式开始自动化；不开始就按手动完成。`;
+  return `${text}。两位都可自动；创建后点「开始自动化」，不点就手动。`;
 }
 
 function focusHomeQuestion() {
@@ -1236,15 +1332,12 @@ function renderHome() {
     charCount: null,
   };
 
-  refs.heroTag = h('span', { class: 'hero-tag', text: '手动中转' });
+  refs.heroTag = h('span', { class: 'hero-tag', hidden: true });
   const wrap = h('div', { class: 'wrap home' });
   wrap.append(
     h('header', { class: 'home-hero' },
-      h('div', { class: 'eyebrow-row' },
-        h('span', { class: 'eyebrow', text: '本地工作台' }),
-        refs.heroTag),
-      h('h1', { class: 'home-title', text: '把一个问题，交给两席独立判断。' }),
-      h('p', { class: 'home-lede', text: '两席先各自回答，再交换质疑，最后逐席确认同一版结论。可全程手动中转；本机席位配置后也可显式启用自动驱动。' })),
+      h('h1', { class: 'home-title', text: '想讨论什么？' }),
+      refs.heroTag),
   );
 
   /* 问题优先：打开首页即可直接输入。 */
@@ -1252,7 +1345,7 @@ function renderHome() {
     id: 'question-input',
     class: 'question-input',
     rows: 3,
-    placeholder: '例如：我的个人笔记工具值不值得先做移动端？我只有两个周末。',
+    placeholder: '我只有两个周末，个人笔记工具先做手机版，还是先把搜索做好？',
     spellcheck: false,
     autocomplete: 'off',
     dataset: { focusKey: 'question' },
@@ -1261,7 +1354,7 @@ function renderHome() {
       state.compose.question = event.target.value;
       persistCompose();
       if (refs.charCount) {
-        refs.charCount.textContent = `${Array.from(event.target.value).length} 字 · 会原样出现在两席提示中`;
+        refs.charCount.textContent = `${Array.from(event.target.value).length} 字`;
       }
       clearHomeError();
     },
@@ -1274,7 +1367,7 @@ function renderHome() {
   });
 
   refs.charCount = h('span', {
-    text: `${Array.from(state.compose.question).length} 字 · 会原样出现在两席提示中`,
+    text: `${Array.from(state.compose.question).length} 字`,
   });
 
   /* 两席选择器：紧凑的可切换按钮，保留 button.provider-option 和 aria-pressed。 */
@@ -1283,7 +1376,7 @@ function renderHome() {
     providerGrid.append(
       h('div', { class: 'inline-empty' },
         h('strong', { text: '没有读到站点清单。' }),
-        h('p', { text: '请重新加载扩展后再试；建场需要 extension/providers.js 提供至少两个站点。' })),
+        h('p', { text: '重新加载扩展后再试。站点清单至少要两个。' })),
     );
   } else {
     for (const provider of PROVIDER_LIST) {
@@ -1336,7 +1429,7 @@ function renderHome() {
       target: '_blank',
       rel: 'noopener noreferrer',
       text: '连接设置',
-      title: '配置本机 A / B 的网页地址与 CSS 选择器',
+      title: '配置本机 A / B 的网页地址和选择器',
     }),
     ...homeExtraLinks.map((link) => h('a', {
       class: 'link-quiet',
@@ -1349,27 +1442,27 @@ function renderHome() {
 
   refs.previewNames = h('strong', { text: previewNameText() });
   const flow = h('ol', { class: 'flow-steps' },
-    h('li', {}, '第一轮会把同一题面交给你复制到 ', refs.previewNames, '；两席各自独立回答，互相看不到。'),
-    h('li', {}, '首轮回答齐备后，工作台为每一席生成质询提示，里面包含对方的原话与出处。'),
-    h('li', {}, '候选结论出来后，两席对同一版本分别表态；立场、理由和条件都按席位保存。'),
-    h('li', {}, '最后由你导出结论，或保留仍未解决的分歧。'),
+    h('li', {}, '第一轮同一个问题分别发给 ', refs.previewNames, '；各自回答，互相看不到。'),
+    h('li', {}, '两边答完，这里给每席生成质询，带上对方原话和出处。'),
+    h('li', {}, '候选结论出来后，两席对同一版表态；立场、理由和条件按席位保存。'),
+    h('li', {}, '最后导出结论，没解决的分歧也一起留着。'),
   );
 
-  refs.manualNoteStrong = h('strong', { text: '本版全程手动中转' });
-  refs.manualNoteSpan = h('span', { text: '不自动登录、不自动发送，也不读取网页回答。复制、粘贴和提交都由你操作。' });
+  refs.manualNoteStrong = h('strong', { text: '全程手动' });
+  refs.manualNoteSpan = h('span', { text: '不自动登录、不自动发送，也不读网页回答。' });
   refs.manualNote = h('div', { class: 'manual-note' }, refs.manualNoteStrong, refs.manualNoteSpan);
 
   wrap.append(
-    h('section', { class: 'home-compose', attrs: { 'aria-label': '开始一场判断' } },
+    h('section', { class: 'home-compose', attrs: { 'aria-label': '开始一场讨论' } },
       h('div', { class: 'home-question' },
-        h('label', { class: 'home-field-label', for: 'question-input', text: '写下问题' }),
+        h('label', { class: 'home-field-label', for: 'question-input', text: '问题' }),
         questionInput,
         h('div', { class: 'field-foot' },
           refs.charCount,
           h('span', { class: 'kbd-hint', text: '⌘ / Ctrl + Enter 开始' }))),
       h('div', { class: 'home-seats' },
         h('div', { class: 'home-seat-head' },
-          h('h2', { class: 'home-seat-title', text: '选择两席' }),
+          h('h2', { class: 'home-seat-title', text: '选择两个 AI' }),
           refs.selectionCount),
         providerGrid,
         refs.seatStatus,
@@ -1382,24 +1475,22 @@ function renderHome() {
   refs.start = h('button', {
     class: 'btn btn-accent btn-large',
     type: 'button',
-    text: '开始判断',
-    title: '创建两席场次；⌘ / Ctrl + Enter 也可开始',
+    text: '开始讨论',
+    title: '创建讨论；⌘ / Ctrl + Enter 也能开始',
     onClick: () => { void startSession(); },
   });
 
   wrap.append(
     h('div', { class: 'start-row' },
-      refs.start,
-      h('p', { class: 'start-note', text: '创建后可随时暂停、补录或结束；记录保存在本机，也可导出为 Markdown。' })),
+      refs.start),
     refs.error,
     h('details', { class: 'home-guide' },
       h('summary', {},
-        h('span', { class: 'home-guide-title', text: '走完一场会发生什么' }),
-        h('span', { class: 'home-guide-hint', text: '4 步 · 可随时暂停' })),
+        h('span', { class: 'home-guide-title', text: '一场讨论怎么走' }),
+        h('span', { class: 'home-guide-hint', text: '4 步，随时可停' })),
       h('div', { class: 'home-guide-body' },
         h('div', { class: 'flow-card' }, flow),
         refs.manualNote)),
-    h('p', { class: 'home-foot', text: '每一轮的提示与回答原文会按席位保存，关闭工作台后仍能回到本场。' }),
   );
 
   state.homeRefs = refs;
@@ -1409,9 +1500,9 @@ function renderHome() {
 }
 
 function providerTagLabel(id) {
-  if (!isAutomationSeat(id)) return '手动中转';
-  if (!state.automation.loaded) return '本机 · 待检查配置';
-  return automationConfig(id) ? '本机自动 · 已配置' : '本机 · 未配置';
+  if (!isAutomationSeat(id)) return '手动';
+  if (!state.automation.loaded) return '本机，检查配置中';
+  return automationConfig(id) ? '本机自动' : '本机未配置';
 }
 
 function providerChipTitle(provider) {
@@ -1425,37 +1516,37 @@ function homeAutomationSummary() {
   const localSeats = state.compose.providers.filter(isAutomationSeat);
   if (!localSeats.length) {
     return {
-      tag: '手动中转',
-      strong: '本版全程手动中转',
-      span: '不自动登录、不自动发送，也不读取网页回答。复制、粘贴和提交都由你操作。',
+      tag: '手动',
+      strong: '全程手动',
+      span: '不自动登录、不自动发送，也不读网页回答。',
     };
   }
   if (!state.automation.loaded) {
     return {
-      tag: `${localSeats.length} 席本机`,
-      strong: '正在读取本机连接设置',
-      span: '读取完成前不会开始任何自动驱动；手动复制、粘贴和提交仍然可用。',
+      tag: '读取设置中',
+      strong: '正在读取设置',
+      span: '读完前不会自动；手动一直可用。',
     };
   }
   const configured = localSeats.filter((id) => automationConfig(id));
   if (!configured.length) {
     return {
-      tag: '本机未配置',
-      strong: '本机席位尚未连接',
-      span: '先在「连接设置」保存本机网页地址与 CSS 选择器。未配置时按手动中转处理。',
+      tag: '未连接设置',
+      strong: '本机席位没连接',
+      span: '去「连接设置」填网页地址和选择器；没填就按手动。',
     };
   }
   if (configured.length < localSeats.length) {
     return {
-      tag: '部分席可自动',
-      strong: '需显式开始自动化',
-      span: '已配置的本机席位可自动派发，其余席位仍需手动复制粘贴；创建场次后还要点击「开始自动化」。',
+      tag: '部分可自动',
+      strong: '要手动开始自动化',
+      span: '已连接的席位可自动，其他手动。创建后点「开始自动化」。',
     };
   }
   return {
-    tag: localSeats.length === 2 ? '两席可本机自动' : '可本机自动',
-    strong: '需显式开始自动化',
-    span: '已保存本机连接设置。创建场次后仍要点击「开始自动化」才会派发；手动复制、粘贴和提交始终可用。',
+    tag: localSeats.length === 2 ? '两席可自动' : '可自动',
+    strong: '要手动开始自动化',
+    span: '创建后点「开始自动化」才会发送；手动一直可用。',
   };
 }
 
@@ -1463,7 +1554,11 @@ function refreshHomeAutomationHints() {
   const refs = state.homeRefs;
   if (!refs) return;
   const summary = homeAutomationSummary();
-  if (refs.heroTag) refs.heroTag.textContent = summary.tag;
+  if (refs.heroTag) {
+    const generic = !state.compose.providers.length || summary.tag === '手动';
+    refs.heroTag.hidden = generic;
+    refs.heroTag.textContent = generic ? '' : summary.tag;
+  }
   if (refs.manualNoteStrong) refs.manualNoteStrong.textContent = summary.strong;
   if (refs.manualNoteSpan) refs.manualNoteSpan.textContent = summary.span;
   if (refs.seatStatus) refs.seatStatus.textContent = homeSeatStatusText();
@@ -1495,7 +1590,7 @@ function toggleProvider(id) {
     state.compose.providers.splice(index, 1);
     clearHomeError();
   } else if (state.compose.providers.length >= 2) {
-    showHomeError('最多选择两席。先取消一席，再选另一位。');
+    showHomeError('已选两席。先点一下已选的 AI 取消，再换人。');
     return;
   } else {
     state.compose.providers.push(id);
@@ -1546,7 +1641,7 @@ function setStartBusy(busy) {
   const button = state.homeRefs?.start;
   if (!button || !button.isConnected) return;
   button.disabled = busy;
-  button.textContent = busy ? '正在创建…' : '开始判断';
+  button.textContent = busy ? '正在创建…' : '开始讨论';
 }
 
 async function startSession() {
@@ -1555,23 +1650,23 @@ async function startSession() {
   const providers = state.compose.providers.map((id) => String(id).toLowerCase());
 
   if (!question) {
-    showHomeError('先写下要判断的问题，再开始。');
+    showHomeError('先写下问题。');
     document.getElementById('question-input')?.focus();
     return;
   }
   if (providers.length < 2) {
     showHomeError(providers.length === 0
-      ? '先选择两席不同的 AI。'
-      : '还需要再选一席：两席才能交换质疑。');
+      ? '先选两个不同的 AI。'
+      : '再选一位才能开始。');
     return;
   }
   if (new Set(providers).size !== 2) {
-    showHomeError('两席不能是同一个网站。请取消一位后重新选择。');
+    showHomeError('两位不能是同一个网站。换一位。');
     return;
   }
   for (const id of providers) {
     if (!PROVIDER_BY_ID.has(id)) {
-      showHomeError('站点清单里找不到其中一席，请重新选择。');
+      showHomeError('站点清单里找不到其中一位，重新选。');
       return;
     }
   }
@@ -1582,10 +1677,11 @@ async function startSession() {
 
   try {
     const reply = await callBackground({ type: 'create', question, providers });
-    if (!reply.session) throw new Error('后台没有返回新场次。');
+    if (!reply.session) throw new Error('后台没有返回新讨论。');
     const session = normalizeSession(reply.session);
-    if (!session) throw new Error('后台返回的场次数据不完整。');
+    if (!session) throw new Error('后台返回的讨论数据不完整。');
 
+    rememberLastPair(providers);
     state.compose = { question: '', providers: [] };
     persistCompose();
 
@@ -1595,12 +1691,14 @@ async function startSession() {
     state.dismissedDraftEditors = new Set();
     state.stanceChoice = {};
     state.taskErrors = {};
+    state.promptCopied = {};
+    state.nextStepPanel = null;
     upsertSessionSummary(session);
     setHash(session.id);
     render();
     renderHistoryList();
     window.scrollTo(0, 0);
-    toast('新场次已创建');
+    toast('讨论已创建');
     void reloadList({ silent: true });
   } catch (error) {
     showHomeError(friendlyError(error, '创建失败'));
@@ -1637,7 +1735,7 @@ async function openSession(id) {
   const token = loadToken;
   state.view = 'loading';
   state.automationPanel = null;
-  renderLoading('正在读取场次…');
+  renderLoading('正在读取讨论…');
 
   try {
     const [raw] = await Promise.all([
@@ -1646,7 +1744,7 @@ async function openSession(id) {
     ]);
     if (token !== loadToken) return;
     const session = normalizeSession(raw);
-    if (!session) throw new Error('后台返回的场次数据不完整。');
+    if (!session) throw new Error('后台返回的讨论数据不完整。');
 
     state.session = session;
     state.view = 'session';
@@ -1655,6 +1753,8 @@ async function openSession(id) {
     state.dismissedDraftEditors = new Set();
     state.stanceChoice = {};
     state.taskErrors = {};
+    state.promptCopied = {};
+    state.nextStepPanel = null;
     upsertSessionSummary(session);
     setHash(session.id);
     render();
@@ -1673,10 +1773,11 @@ async function openSession(id) {
       state.view = 'home';
       state.session = null;
       setHash('');
+      maybeRecallLastPair();
       renderHome();
       renderHistoryList();
     }
-    toast(friendlyError(error, '打开场次失败'), 'error');
+    toast(friendlyError(error, '打开讨论失败'), 'error');
   }
 }
 
@@ -1696,7 +1797,7 @@ function commitSession(session, { scroll = false } = {}) {
 
 function applySession(raw, options) {
   const session = normalizeSession(raw);
-  if (!session) throw new Error('后台返回的场次数据不完整。');
+  if (!session) throw new Error('后台返回的讨论数据不完整。');
   commitSession(session, options);
 }
 
@@ -1751,7 +1852,7 @@ async function finishSession(button) {
   if (!current) return;
   const confirmed = await confirmDialog({
     title: '结束这场讨论？',
-    body: '结束会保留已经收到的回答，未完成的席位记为缺席，不会被当作同意。之后仍可查看和导出本场记录。',
+    body: '结束后，已收到的回答保留，没完成的席位记为缺席，不算同意。之后还能查看和导出。',
     confirmLabel: '结束讨论',
   });
   if (!confirmed) return;
@@ -1773,7 +1874,7 @@ async function deleteCurrentSession(button) {
   const names = sessionProviderList(current).map(providerName).join('、') || '各网站';
   const confirmed = await confirmDialog({
     title: '删除本机记录？',
-    body: `“${oneLine(current.question, 80)}”\n\n只删除工作台在本机保存的记录，不影响 ${names} 中的历史对话。删除后不能从工作台恢复。`,
+    body: `“${oneLine(current.question, 80)}”\n\n只删本机记录，不影响 ${names} 里的对话。删除后不能恢复。`,
     confirmLabel: '删除记录',
     danger: true,
   });
@@ -1793,7 +1894,10 @@ async function deleteCurrentSession(button) {
       state.dismissedDraftEditors = new Set();
       state.stanceChoice = {};
       state.taskErrors = {};
+      state.promptCopied = {};
+      state.nextStepPanel = null;
       setHash('');
+      maybeRecallLastPair();
       renderHome();
       renderHistoryList();
       window.scrollTo(0, 0);
@@ -1816,6 +1920,7 @@ function renderSession() {
   state.homeRefs = null;
   state.taskErrorEls = new Map();
   state.automationPanel = null;
+  state.nextStepPanel = null;
 
   const wrap = h('div', { class: 'wrap session' });
   wrap.append(renderSessionHeader(session), renderStepper(session));
@@ -1876,15 +1981,15 @@ function renderAutomationPanel(session) {
     target: '_blank',
     rel: 'noopener noreferrer',
     text: '连接设置',
-    title: '配置 local-a / local-b 的本机地址与 CSS 选择器',
+    title: '配置本机 A / B 的网页地址和选择器',
   });
 
   const panel = h('section', {
     class: 'manual-note',
-    attrs: { 'aria-label': '本机网页自动化' },
+    attrs: { 'aria-label': '本机自动' },
   },
     h('div', {},
-      h('strong', { text: '本机网页自动化' }),
+      h('strong', { text: '本机自动' }),
       statusEl,
       seatListEl),
     h('div', {}, startButton, stopButton, refreshButton, settingsLink));
@@ -1911,7 +2016,7 @@ function updateAutomationPanel() {
   const run = automationRun(session);
   let summary = automationRunSummary(run);
   if (state.automation.error) {
-    summary = `${summary} 读取自动化状态失败：${oneLine(state.automation.error, 120)}`;
+    summary = `${summary} 读取自动状态失败：${oneLine(state.automation.error, 120)}`;
   }
   if (state.automationRefreshPending) {
     summary = `${summary} 有新的自动进展；结束当前编辑后会自动刷新。`;
@@ -1934,8 +2039,8 @@ function updateAutomationPanel() {
   panel.startButton.hidden = active;
   panel.startButton.disabled = state.automationBusy || configuredCount === 0;
   panel.startButton.title = configuredCount === 0
-    ? '先在连接设置保存本机网页地址与 CSS 选择器'
-    : '显式开始自动派发；手动复制、粘贴和提交始终可用';
+    ? '先在连接设置保存网页地址和选择器'
+    : '手动开始自动发送；复制、粘贴和提交一直可用';
   panel.stopButton.hidden = !active;
   panel.stopButton.disabled = state.automationBusy;
   panel.refreshButton.hidden = !active;
@@ -1947,9 +2052,9 @@ function renderSessionHeader(session) {
     class: `seat-meta seat-meta-${index === 0 ? 'a' : 'b'}`,
     title: isAutomationSeat(provider)
       ? automationConfig(provider)
-        ? '本机网页席位：可手动操作，也可在连接设置与显式开始后自动派发'
-        : '本机网页席位：尚未在连接设置保存地址，只能手动操作'
-      : '原网站席位：手动复制提示并粘贴回答',
+        ? '本机席位：可以手动，也可以在连接设置后自动'
+        : '本机席位：还没保存地址，只能手动'
+      : '原站席位：手动复制提示、粘贴回答',
   }, h('span', { class: 'seat-dot', attrs: { 'aria-hidden': 'true' } }),
     `席 ${seatLetter(index)} · ${providerName(provider)}`,
     h('span', { class: 'provider-tag', text: automationSeatMode(session, provider) })));
@@ -1960,7 +2065,7 @@ function renderSessionHeader(session) {
 
   return h('header', { class: 'session-head' },
     h('div', { class: 'session-eyebrow' },
-      h('span', { text: '本地场次' }),
+      h('span', { text: '讨论' }),
       h('span', { class: 'dot-sep', attrs: { 'aria-hidden': 'true' }, text: '·' }),
       h('span', { class: session.paused ? 'status-paused' : '', text: statusText }),
       session.stage !== 'done'
@@ -1980,7 +2085,7 @@ function renderSessionToolbar(session) {
     class: 'btn btn-ghost',
     type: 'button',
     text: '刷新状态',
-    title: '重新读取后台保存的场次',
+    title: '重新读取本机保存的讨论',
   });
   refreshButton.addEventListener('click', () => { void refreshSession(refreshButton); });
   toolbar.append(refreshButton);
@@ -1990,7 +2095,7 @@ function renderSessionToolbar(session) {
       class: 'btn',
       type: 'button',
       text: session.paused ? '继续讨论' : '暂停',
-      title: session.paused ? '恢复后续阶段推进' : '暂停后续阶段推进，已写草稿保留',
+      title: session.paused ? '继续推进后面的阶段' : '暂停后面的阶段，草稿保留',
     });
     pauseButton.addEventListener('click', () => { void togglePause(pauseButton); });
     toolbar.append(pauseButton);
@@ -1999,7 +2104,7 @@ function renderSessionToolbar(session) {
       class: 'btn',
       type: 'button',
       text: '结束讨论',
-      title: '保留当前回答并交付现有结果',
+      title: '保留现有回答，按当前结果结束',
     });
     finishButton.addEventListener('click', () => { void finishSession(finishButton); });
     toolbar.append(finishButton);
@@ -2054,7 +2159,7 @@ function renderPauseBanner(session) {
   return h('div', { class: 'pause-banner', role: 'status' },
     h('div', {},
       h('strong', { text: '已暂停' }),
-      h('span', { text: '后续阶段不会推进。你仍可查看和复制提示；草稿会保留，继续后可提交。' })),
+      h('span', { text: '后面的阶段不会推进。提示还能看、能复制；草稿保留，继续后可以提交。' })),
     button);
 }
 
@@ -2084,7 +2189,7 @@ function renderGuidance(session) {
     h('p', {
       class: 'guide-note',
       id: 'guide-note',
-      text: '只用于之后新建的任务，不会改动当前提示，也不会自动发送；已保存的条件随本场记录保留。',
+      text: '只用于之后新建的任务，不改当前提示，也不自动发送。条件随记录保存。',
     }));
 
   if (entries.length) {
@@ -2117,7 +2222,7 @@ function renderGuidance(session) {
       class: 'btn btn-small btn-strong',
       type: 'button',
       text: '保存条件',
-      title: '保存到本场记录，供之后新建的任务使用',
+      title: '保存到讨论记录，供之后新建的任务使用',
     });
     saveButton.addEventListener('click', () => {
       void saveGuidance(session, input, saveButton, errorEl);
@@ -2158,9 +2263,9 @@ async function saveGuidance(session, textarea, button, errorEl) {
   try {
     const raw = await actSession('guide', { text });
     const next = normalizeSession(raw);
-    if (!next) throw new Error('后台返回的场次数据不完整。');
+    if (!next) throw new Error('后台返回的讨论数据不完整。');
     commitSession(next);
-    toast('条件已保存：只用于之后新建的任务');
+    toast('条件已保存，只用于后面的任务');
   } catch (error) {
     if (button.isConnected) {
       button.disabled = false;
@@ -2178,6 +2283,7 @@ async function saveGuidance(session, textarea, button, errorEl) {
 function renderStage(session) {
   const info = stageInfo(session.stage);
   const tasks = session.tasks;
+  const nextTask = pickNextTask(session, tasks);
   const counts = {
     answered: tasks.filter((task) => task.status === 'answered').length,
     skipped: tasks.filter((task) => task.status === 'skipped').length,
@@ -2204,26 +2310,29 @@ function renderStage(session) {
     refresh.addEventListener('click', () => { void refreshSession(refresh); });
     section.append(
       h('div', { class: 'inline-empty' },
-        h('strong', { text: '当前阶段没有待处理任务。' }),
-        h('p', { text: '后台可能还在生成下一步。读取一次最新状态，或稍后再看。' }),
+        h('strong', { text: '这一阶段还没有任务。' }),
+        h('p', { text: '可能还在生成下一步。刷新看看，或稍后再看。' }),
         refresh),
     );
     return section;
   }
 
+  const nextStep = renderNextStep(session, nextTask);
+  if (nextStep) section.append(nextStep);
+
   const grid = h('div', { class: `seat-grid${tasks.length === 1 ? ' is-single' : ''}` });
   tasks.forEach((task, index) => {
-    grid.append(renderTaskCard(session, task, index));
+    grid.append(renderTaskCard(session, task, index, nextTask ? nextTask.id : ''));
   });
   section.append(grid);
 
   if (counts.pending === 0) {
-    const refresh = h('button', { class: 'btn btn-small', type: 'button', text: '刷新读取后台结果' });
+    const refresh = h('button', { class: 'btn btn-small', type: 'button', text: '刷新状态' });
     refresh.addEventListener('click', () => { void refreshSession(refresh); });
     section.append(
       h('div', { class: 'all-terminal-note' },
-        h('span', { text: '本轮任务都已结束。' }),
-        h('span', { text: '如果界面仍停在本阶段，可刷新读取后台推进结果。' }),
+        h('span', { text: '这一轮的任务都结束了。' }),
+        h('span', { text: '界面还停在这里，就刷新一次看看。' }),
         refresh),
     );
   }
@@ -2231,9 +2340,199 @@ function renderStage(session) {
   return section;
 }
 
-function renderTaskCard(session, task, fallbackIndex) {
+/* ------------------------------ 下一步 ------------------------------ */
+
+/* 只挑仍要手动中转的一席作为「下一步」：有草稿的先继续，否则按席位顺序。
+ * 自动席位由自动化面板负责，不在这里催；暂停时顶部暂停条优先。 */
+function pickNextTask(session, tasks) {
+  if (!session || !Array.isArray(tasks)) return null;
+  const pending = tasks.filter((task) => task.status === 'pending');
+  if (!pending.length) return null;
+  const manual = pending.filter((task) =>
+    seatOperatesManually(session, String(task.provider || '').toLowerCase()));
+  if (!manual.length) return null;
+  const withDraft = manual.find((task) => {
+    const draft = getDraft(session, task);
+    return draft && String(draft.text || '').trim();
+  });
+  return withDraft || manual[0];
+}
+
+function nextStepCopy(session, task) {
   const providerId = String(task.provider || '').toLowerCase();
-  const provider = providerById(providerId);
+  const index = session.providers.indexOf(providerId);
+  const label = `席 ${seatLetter(index >= 0 ? index : 0)} · ${providerName(providerId)}`;
+  const draft = getDraft(session, task);
+  if (draft && String(draft.text || '').trim()) {
+    return {
+      title: `下一步：继续填写 ${label}`,
+      body: '草稿已保存在本机；提交后这一席才算收到。',
+      action: '继续填写',
+      mode: 'draft',
+    };
+  }
+  if (state.promptCopied[task.id]) {
+    return {
+      title: `下一步：粘回 ${label} 的回答`,
+      body: '提示已复制。在原页发送、复制回答，回到这里粘贴提交。',
+      action: session.stage === 'vote' ? '记录表态' : '粘贴回答',
+      mode: 'paste',
+    };
+  }
+  const title = session.stage === 'critique'
+    ? `下一步：把质询提示发给 ${label}`
+    : session.stage === 'proposal'
+      ? `下一步：让 ${label} 起草候选结论`
+      : session.stage === 'vote'
+        ? `下一步：让 ${label} 明确表态`
+        : `下一步：把提示发给 ${label}`;
+  return {
+    title,
+    body: '复制提示并切到原页；拿到回答后回来粘贴提交。',
+    action: '复制并打开原页',
+    mode: 'handoff',
+  };
+}
+
+function buildNextStepChildren(session, task) {
+  const copy = nextStepCopy(session, task);
+  const action = h('button', {
+    class: 'btn btn-small btn-strong',
+    type: 'button',
+    text: copy.action,
+  });
+  action.addEventListener('click', () => {
+    if (copy.mode === 'handoff') void copyPromptAndOpen(session, task, action);
+    else openTaskFromStep(task);
+  });
+  return [
+    h('div', {},
+      h('strong', { text: copy.title }),
+      h('span', { text: copy.body })),
+    action,
+  ];
+}
+
+function renderNextStep(session, task) {
+  if (!task || session.paused) return null;
+  const strip = h('div', {
+    class: 'pause-banner',
+    role: 'status',
+    attrs: { 'aria-label': '当前可执行的下一步' },
+  });
+  strip.append(...buildNextStepChildren(session, task));
+  state.nextStepPanel = { container: strip, taskId: task.id };
+  return strip;
+}
+
+function updateNextStepPanel() {
+  const panel = state.nextStepPanel;
+  if (!panel || !panel.container || !panel.container.isConnected) return;
+  const session = state.session;
+  if (!session) return;
+  const task = session.tasks.find((item) => item.id === panel.taskId);
+  if (!task || task.status !== 'pending') return;
+  panel.container.replaceChildren(...buildNextStepChildren(session, task));
+}
+
+function markPromptCopied(taskId) {
+  if (!taskId) return;
+  state.promptCopied[taskId] = true;
+  updateNextStepPanel();
+}
+
+function taskCardElement(taskId) {
+  const value = String(taskId || '');
+  const escaped = (window.CSS && CSS.escape)
+    ? CSS.escape(value)
+    : value.replace(/["\\]/g, '\\$&');
+  return viewEl.querySelector(`article.seat-card[data-task-id="${escaped}"]`);
+}
+
+/* 显式点击「继续填写 / 粘贴回答」才定位；普通刷新和提交不会把正在编辑的
+ * 席位滚走。 */
+function openTaskFromStep(task) {
+  if (!task) return;
+  state.showEditor[task.id] = task.status === 'answered' ? 'edit' : 'new';
+  state.dismissedDraftEditors.delete(task.id);
+  render();
+  requestAnimationFrame(() => {
+    const card = taskCardElement(task.id);
+    if (!card) return;
+    card.scrollIntoView({ block: 'nearest' });
+    const input = card.querySelector('textarea.answer-input');
+    if (input) input.focus({ preventScroll: true });
+  });
+}
+
+/* 只有「本轮仍未冻结」的手动公共席位回答才允许改正录入。
+ * 后台 core 会按同样条件再校验一次，并以预期旧文本拒绝过期或重复提交。 */
+const CORRECTABLE_STAGES = new Set(['independent', 'critique']);
+
+function isCorrectedAnswer(task) {
+  return Boolean(task) && (
+    Number(task.correctedAt) > 0
+    || (Array.isArray(task.corrections) && task.corrections.length > 0)
+  );
+}
+
+function canCorrectTask(session, task) {
+  if (!session || !task) return false;
+  if (!CORRECTABLE_STAGES.has(session.stage)) return false;
+  if (task.status !== 'answered') return false;
+  if (!String(task.answer || '').trim()) return false;
+  if (isAutomationSeat(task.provider)) return false;
+  if (!session.tasks.some((item) => item.id === task.id)) return false;
+  return session.tasks.some((item) => item.id !== task.id && item.status === 'pending');
+}
+
+function revisionChip() {
+  return h('span', {
+    class: 'revision-chip',
+    text: '已更正',
+    title: '录入后被更正；首次提交原文仍保留在本席记录里',
+  });
+}
+
+/* 只展示出处，不把原文再算成一条回答。 */
+function renderRevisionDetails(task) {
+  if (!isCorrectedAnswer(task)) return null;
+  const original = typeof task.originalAnswer === 'string' ? task.originalAnswer : '';
+  if (!original.trim()) return null;
+  const corrections = Array.isArray(task.corrections) ? task.corrections : [];
+  const stamp = [];
+  if (Number(task.answeredAt) > 0) stamp.push(`首次提交 ${formatAbsolute(task.answeredAt)}`);
+  if (Number(task.correctedAt) > 0) stamp.push(`最近更正 ${formatAbsolute(task.correctedAt)}`);
+  if (corrections.length > 1) stamp.push(`共更正 ${corrections.length} 次`);
+
+  const details = h('details', { class: 'prompt-box prompt-box-revision' },
+    h('summary', {},
+      h('span', { text: '更正前后' }),
+      h('span', { class: 'prompt-hint', text: '首次原文保留' })));
+  if (stamp.length) {
+    details.append(h('p', { class: 'answer-note', text: stamp.join(' · ') }));
+  }
+  details.append(
+    h('pre', { class: 'prompt-text', text: original }),
+    h('div', { class: 'prompt-actions' },
+      h('button', {
+        class: 'btn btn-small',
+        type: 'button',
+        text: '复制首次原文',
+        onClick: async () => {
+          try {
+            await copyText(original);
+            toast('已复制首次提交原文');
+          } catch (error) {
+            toast(friendlyError(error, '复制失败'), 'error');
+          }
+        },
+      })));
+  return details;
+}
+
+function renderTaskCard(session, task, fallbackIndex, nextTaskId) {
+  const providerId = String(task.provider || '').toLowerCase();
   const seatIndex = session.providers.indexOf(providerId);
   const seat = seatLetter(seatIndex >= 0 ? seatIndex : fallbackIndex);
   const name = providerName(providerId);
@@ -2241,15 +2540,22 @@ function renderTaskCard(session, task, fallbackIndex) {
   const hasDraft = Boolean(draft && (String(draft.text || '').trim() || draft.stance));
   const dismissed = state.dismissedDraftEditors.has(task.id);
   const mode = state.showEditor[task.id];
-  const editorOpen = Boolean(mode) || (hasDraft && !dismissed);
+  const terminal = task.status !== 'pending';
+  /* 已回答、已跳过都是本轮终态：后台拒绝再次提交，不再自动展开草稿编辑器。 */
+  const editorOpen = !terminal && (Boolean(mode) || (hasDraft && !dismissed));
+  const correctable = canCorrectTask(session, task);
+  const correcting = correctable && mode === 'correct';
+  const isNext = Boolean(nextTaskId) && task.id === nextTaskId;
 
   const card = h('article', {
     class: [
       'seat-card',
       `is-${task.status}`,
-      editorOpen ? 'is-editing' : '',
+      editorOpen || correcting ? 'is-editing' : '',
+      isNext ? 'is-next' : '',
       seat === 'A' ? 'seat-a' : 'seat-b',
     ].filter(Boolean).join(' '),
+    dataset: { taskId: task.id, provider: providerId },
   });
 
   const statusChip = h('span', {
@@ -2269,71 +2575,130 @@ function renderTaskCard(session, task, fallbackIndex) {
           `${providerId || '未登记站点'} · 席 ${seat}`,
           h('span', { class: 'provider-tag', text: automationSeatMode(session, providerId) })))),
     h('div', { class: 'seat-status' },
-      hasDraft && !editorOpen ? h('span', { class: 'draft-chip', text: '有草稿' }) : null,
+      isNext ? h('span', { class: 'draft-chip', text: '下一步' }) : null,
+      hasDraft && !editorOpen && !terminal ? h('span', { class: 'draft-chip', text: '有草稿' }) : null,
       autoSeat && automationSeatNeedsAction(autoSeat)
         ? h('span', { class: 'draft-chip', text: '自动待处理', title: autoSeat.detail || '' })
         : null,
+      isCorrectedAnswer(task) ? revisionChip() : null,
       statusChip));
   card.append(header, renderPromptBox(task));
 
   const actions = h('div', { class: 'task-actions' });
 
-  if (task.status === 'pending' && seatOperatesManually(session, providerId)) {
-    actions.append(h('button', {
-      class: 'btn btn-small btn-accent',
-      type: 'button',
-      text: '复制提示并打开原页',
-      title: '一次点击：复制本轮提示并切到这一席的原页；已绑定的原页会复用当前标签',
-      dataset: { taskId: task.id },
-      onClick: (event) => copyPromptAndOpen(session, task, event.currentTarget),
-    }));
-  }
-
-  actions.append(
-    h('button', {
-      class: 'btn btn-small',
-      type: 'button',
-      text: '复制提示',
-      title: '复制本轮发送给这一席的完整提示',
-      onClick: () => copyPrompt(task),
-    }),
-  );
-
-  const openButton = h('button', {
+  /* 每个动作沿用原来的点击处理，只按席卡状态决定露在正面还是「更多操作」里。 */
+  const copyPromptButton = () => h('button', {
     class: 'btn btn-small',
     type: 'button',
-    text: '打开原站',
-    title: `使用已登录的浏览器打开 ${name}`,
+    text: '复制提示',
+    title: '复制本轮发送给这一席的完整提示',
+    onClick: () => copyPrompt(task),
   });
-  openButton.addEventListener('click', () => { void openProviderSite(session, task, openButton); });
-  actions.append(openButton);
 
-  if (provider?.url) {
-    actions.append(h('a', {
-      class: 'link-quiet',
-      href: provider.url,
-      target: '_blank',
-      rel: 'noopener noreferrer',
-      text: '站点首页',
-      title: '直接打开站点首页；对话可能需要重新选择',
-    }));
-  }
-
-  if (!editorOpen) {
-    const openEditor = h('button', {
-      class: 'btn btn-small btn-strong',
+  const openSiteButton = () => {
+    const button = h('button', {
+      class: 'btn btn-small',
       type: 'button',
-      text: hasDraft ? '继续草稿' : task.status === 'answered' ? '修改回答' : task.status === 'skipped' ? '补录回答' : '粘贴回答',
+      text: '打开原站',
+      title: `用已登录的浏览器打开 ${name}`,
     });
-    openEditor.addEventListener('click', () => {
-      state.showEditor[task.id] = task.status === 'answered' ? 'edit' : 'new';
+    button.addEventListener('click', () => { void openProviderSite(session, task, button); });
+    return button;
+  };
+
+  const editorButton = (label, variant = 'btn-strong') => {
+    const button = h('button', {
+      class: `btn btn-small${variant ? ` ${variant}` : ''}`,
+      type: 'button',
+      text: label,
+    });
+    button.addEventListener('click', () => {
+      state.showEditor[task.id] = 'new';
       state.dismissedDraftEditors.delete(task.id);
       render();
     });
-    actions.append(openEditor);
+    return button;
+  };
+
+  /* 退路动作收进原生 details：单独复制、直接打开、跳过都还在。 */
+  const moreActions = (...extra) => {
+    const details = h('details', { class: 'task-more' },
+      h('summary', { class: 'task-more-summary', text: '更多操作' }));
+    const body = h('div', { class: 'task-more-body' },
+      copyPromptButton(),
+      openSiteButton(),
+      ...extra);
+    if (!terminal && !editorOpen) body.append(renderSkipRow(session, task, null));
+    details.append(body);
+    return details;
+  };
+
+  if (terminal) {
+    /* 终态只留已保存内容与出处：不再提供修改、补录、跳过或再次提交。 */
+    if (task.status === 'answered') {
+      const savedText = typeof task.answer === 'string' ? task.answer : '';
+      if (savedText.trim()) {
+        actions.append(h('button', {
+          class: 'btn btn-small btn-strong',
+          type: 'button',
+          text: '复制回答',
+          title: '复制这一席已保存的回答原文',
+          onClick: async () => {
+            try {
+              await copyText(savedText);
+              toast('已复制回答原文');
+            } catch (error) {
+              toast(friendlyError(error, '复制失败'), 'error');
+            }
+          },
+        }));
+      }
+    }
+    if (correctable) {
+      /* 只有可改正时，才把入口收进「更多操作」，正面仍只留复制回答。 */
+      const correction = h('button', {
+        class: 'btn btn-small',
+        type: 'button',
+        text: '改正录入',
+        title: '仅本轮另一席尚未提交时可用；保存后本席仍只算一条回答',
+      });
+      correction.addEventListener('click', () => {
+        state.correctionBase[task.id] = typeof task.answer === 'string' ? task.answer : '';
+        state.showEditor[task.id] = 'correct';
+        setTaskError(task.id, '');
+        render();
+      });
+      actions.append(moreActions(correction));
+    } else {
+      actions.append(copyPromptButton(), openSiteButton());
+    }
+  } else if (seatOperatesManually(session, providerId)) {
+    /* 原生 append 会把 null 当文本插进去；这里统一走 appendChildren 过滤。 */
+    appendChildren(actions, [
+      h('button', {
+        class: 'btn btn-small btn-accent',
+        type: 'button',
+        text: '复制提示并打开原页',
+        title: '一次点完：复制本轮提示并切到这一席的原页；已绑定的原页会复用当前标签',
+        dataset: { taskId: task.id },
+        onClick: (event) => copyPromptAndOpen(session, task, event.currentTarget),
+      }),
+      editorOpen ? null : editorButton(hasDraft ? '继续草稿' : '粘贴回答'),
+      moreActions(),
+    ]);
+  } else {
+    /* 自动席位已在跑：不摆手动主按钮，说明状态，把接管入口放进「更多操作」。 */
+    const autoLabel = autoSeat ? automationSeatLabel(autoSeat) : '待命';
+    actions.append(
+      h('p', {
+        class: 'task-auto-note',
+        text: `本机自动：${autoLabel}。需要自己接手时展开「更多操作」。`,
+        title: autoSeat?.detail || '',
+      }),
+      moreActions(editorOpen ? null : editorButton(hasDraft ? '继续草稿' : '手动填写', '')));
   }
 
-  card.append(actions, renderAnswerBlock(session, task));
+  card.append(actions, renderAnswerBlock(session, task, isNext));
 
   const errorEl = h('div', {
     class: 'task-error',
@@ -2343,14 +2708,12 @@ function renderTaskCard(session, task, fallbackIndex) {
   });
   state.taskErrorEls.set(task.id, errorEl);
 
-  if (editorOpen) {
+  if (correcting) {
+    card.append(renderCorrectionEditor(session, task, errorEl));
+  } else if (editorOpen) {
     card.append(renderEditor(session, task, { mode, draft, hasDraft, errorEl }));
   } else {
     card.append(errorEl);
-  }
-
-  if (!editorOpen && task.status !== 'answered') {
-    card.append(renderSkipRow(session, task, null));
   }
 
   return card;
@@ -2377,26 +2740,70 @@ function renderPromptBox(task) {
   return details;
 }
 
-function renderAnswerBlock(session, task) {
+function renderAnswerBlock(session, task, isNext) {
   if (task.status === 'answered') {
     const block = h('div', { class: 'answer-block' });
     const head = h('div', { class: 'answer-head' },
       h('span', { class: 'answer-label', text: session.stage === 'vote' ? '本轮表态' : '已收到的原文' }));
     if (task.stance) head.append(stanceChip(task.stance));
+    if (isCorrectedAnswer(task)) head.append(revisionChip());
     const answer = task.answer && task.answer.trim()
       ? task.answer
       : '未保存回答文本。';
     block.append(head, h('div', { class: 'answer-text', text: answer }));
+    const revision = renderRevisionDetails(task);
+    if (revision) block.append(revision);
     return block;
   }
 
   if (task.status === 'skipped') {
-    return h('div', { class: 'answer-block is-muted' },
+    const block = h('div', { class: 'answer-block is-muted' },
       h('div', { class: 'answer-head' }, h('span', { class: 'answer-label', text: '本阶段缺席' })),
-      h('p', { class: 'answer-note', text: '这一席被标记为跳过。缺席不计为同意，仍可补录。' }));
+      h('p', { class: 'answer-note', text: '已跳过，本轮不计入结论。' }));
+    const draft = getDraft(session, task);
+    if (draft) block.append(renderUnsubmittedDraft(draft));
+    return block;
   }
 
-  return h('p', { class: 'answer-note', text: '等待你从原站取回回答，再粘贴到这里。' });
+  return h('p', {
+    class: 'answer-note',
+    text: isNext
+      ? '这一席是当前下一步；收到回答后粘贴到这里提交。'
+      : '同一轮的另一席；两席都收到后才进入下一阶段。',
+  });
+}
+
+/* 草稿只作本机只读留存：可看、可复制，但不会进入回答、逐席确认或报告。 */
+function renderUnsubmittedDraft(draft) {
+  const text = draft && typeof draft.text === 'string' ? draft.text : '';
+  const details = h('details', { class: 'prompt-box' },
+    h('summary', {},
+      h('span', { text: '未提交的草稿' }),
+      h('span', { class: 'prompt-hint', text: '只读 · 不计入结论' })));
+  if (text.trim()) {
+    details.append(
+      h('pre', { class: 'prompt-text', text }),
+      h('div', { class: 'prompt-actions' },
+        h('button', {
+          class: 'btn btn-small',
+          type: 'button',
+          text: '复制草稿原文',
+          onClick: async () => {
+            try {
+              await copyText(text);
+              toast('已复制草稿原文');
+            } catch (error) {
+              toast(friendlyError(error, '复制失败'), 'error');
+            }
+          },
+        })));
+  } else {
+    details.append(h('p', {
+      class: 'answer-note',
+      text: '这份草稿没有文字，只有未提交的立场。',
+    }));
+  }
+  return details;
 }
 
 function renderEditor(session, task, { mode, draft, hasDraft, errorEl }) {
@@ -2454,7 +2861,7 @@ function renderEditor(session, task, { mode, draft, hasDraft, errorEl }) {
     editor.append(stanceGroup);
     editor.append(h('span', {
       class: 'field-label',
-      text: '理由（必填，保存为本轮回答原文）',
+      text: '理由（必填，会存为回答原文）',
     }));
   } else {
     editor.append(h('span', {
@@ -2466,7 +2873,7 @@ function renderEditor(session, task, { mode, draft, hasDraft, errorEl }) {
   editor.append(textarea);
 
   if (session.paused) {
-    editor.append(h('p', { class: 'editor-paused-note', text: '已暂停：你可以继续编辑草稿，继续讨论后再提交。' }));
+    editor.append(h('p', { class: 'editor-paused-note', text: '已暂停：草稿可以继续改，继续讨论后再提交。' }));
   }
 
   const noteEl = h('span', {
@@ -2492,7 +2899,7 @@ function renderEditor(session, task, { mode, draft, hasDraft, errorEl }) {
       onClick: async () => {
         const confirmed = await confirmDialog({
           title: '清除这一席的草稿？',
-          body: '只清除这段尚未提交的本地文本，不会删除已经保存的回答。',
+          body: '只清除这段没提交的本地文本，已保存的回答不动。',
           confirmLabel: '清除草稿',
           danger: true,
         });
@@ -2548,6 +2955,68 @@ function renderEditor(session, task, { mode, draft, hasDraft, errorEl }) {
   return editor;
 }
 
+/* 改正录入只针对当前已收到的一条回答：预填最新原文，提交预期旧文本，
+ * 由后台拒绝别人已经改过或本轮已冻结的情况。 */
+function renderCorrectionEditor(session, task, errorEl) {
+  const editor = h('div', { class: 'answer-editor correction-editor' });
+  editor.append(h('span', {
+    class: 'field-label',
+    text: '改正录入：粘贴这一席更正后的完整原文',
+  }));
+
+  const textarea = h('textarea', {
+    class: 'answer-input correction-input',
+    rows: 6,
+    value: typeof task.answer === 'string' ? task.answer : '',
+    spellcheck: false,
+    autocomplete: 'off',
+    dataset: { focusKey: `correction:${task.id}` },
+    placeholder: editorPlaceholder(session.stage),
+    attrs: { 'aria-label': `${providerName(task.provider)} 的更正原文` },
+  });
+  editor.append(textarea);
+  editor.append(h('p', {
+    class: 'answer-note',
+    text: '保存后本席仍只算一条回答；下一阶段的提示会使用更正后的原文，首次提交原文保留在「更正前后」里。',
+  }));
+
+  const footer = h('div', { class: 'editor-foot' });
+  footer.append(h('span', {
+    class: 'draft-note',
+    text: '只有本轮另一席仍未提交时才能保存；过期或重复提交会被后台拒绝。',
+  }));
+
+  const actionWrap = h('div', { class: 'editor-actions' });
+  actionWrap.append(h('button', {
+    class: 'btn btn-small',
+    type: 'button',
+    text: '取消',
+    onClick: () => {
+      delete state.showEditor[task.id];
+      delete state.correctionBase[task.id];
+      setTaskError(task.id, '');
+      render();
+    },
+  }));
+
+  const submitButton = h('button', {
+    class: 'btn btn-small btn-strong',
+    type: 'button',
+    text: '保存更正',
+    disabled: session.paused,
+    title: session.paused ? '讨论已暂停，继续后可保存' : '',
+  });
+  actionWrap.append(submitButton);
+  footer.append(actionWrap);
+  editor.append(footer, errorEl);
+
+  submitButton.addEventListener('click', () => {
+    void submitCorrection(session, task, { textarea, submitButton });
+  });
+
+  return editor;
+}
+
 function renderSkipRow(session, task, submitButton) {
   const row = h('div', { class: 'skip-row' });
   const button = h('button', {
@@ -2555,7 +3024,7 @@ function renderSkipRow(session, task, submitButton) {
     type: 'button',
     text: task.status === 'skipped' ? '保持缺席' : '跳过这一席',
     disabled: session.paused || task.status === 'skipped',
-    title: session.paused ? '讨论已暂停，继续后可跳过' : '本阶段记为缺席，不会被当作同意',
+    title: session.paused ? '讨论已暂停，继续后可跳过' : '本阶段记为缺席，不算同意',
   });
   button.addEventListener('click', () => {
     void skipTask(session, task, button, submitButton);
@@ -2587,7 +3056,7 @@ async function submitTaskAnswer(session, task, { textarea, stance, submitButton,
   const current = state.session;
   if (!current) return;
   if (current.paused) {
-    setTaskError(task.id, '讨论已暂停。继续后再提交，你的草稿已经保留。');
+    setTaskError(task.id, '讨论已暂停。继续后再提交，草稿还在。');
     return;
   }
 
@@ -2602,7 +3071,7 @@ async function submitTaskAnswer(session, task, { textarea, stance, submitButton,
     return;
   }
   if (session.stage === 'vote' && !STANCE_LABELS[selectedStance]) {
-    setTaskError(task.id, '先选择明确立场：同意、有条件同意或反对。');
+    setTaskError(task.id, '先选明确立场：同意、有条件同意或反对。');
     return;
   }
 
@@ -2617,9 +3086,10 @@ async function submitTaskAnswer(session, task, { textarea, stance, submitButton,
     if (session.stage === 'vote') payload.stance = selectedStance;
     const raw = await actSession('answer', payload);
     const next = normalizeSession(raw);
-    if (!next) throw new Error('后台返回的场次数据不完整。');
+    if (!next) throw new Error('后台返回的讨论数据不完整。');
 
     deleteDraft(session, task);
+    delete state.promptCopied[task.id];
     state.dismissedDraftEditors.delete(task.id);
     commitSession(next);
     toast(session.stage === 'vote' ? '已记录本席表态' : '回答已提交');
@@ -2632,8 +3102,60 @@ async function submitTaskAnswer(session, task, { textarea, stance, submitButton,
   }
 }
 
-async function skipTask(session, task, skipButton, submitButton) {
+async function submitCorrection(session, task, { textarea, submitButton }) {
   const current = state.session;
+  if (!current) return;
+  if (current.paused) {
+    setTaskError(task.id, '讨论已暂停。继续后再保存更正，原文暂时不变。');
+    return;
+  }
+
+  const text = textarea.value.trim();
+  if (!text) {
+    setTaskError(task.id, '先粘贴这一席更正后的完整回答原文。');
+    textarea.focus();
+    return;
+  }
+  if (text === task.answer) {
+    setTaskError(task.id, '内容没有变化；直接取消即可。');
+    textarea.focus();
+    return;
+  }
+
+  /* 打开编辑器时看到的原文才是预期旧文本。后台只在它仍等于已保存回答时
+   * 接受，这样另一个窗口的更正或一次重复点击不会被静默覆盖。 */
+  const previousText = typeof state.correctionBase[task.id] === 'string'
+    ? state.correctionBase[task.id]
+    : (typeof task.answer === 'string' ? task.answer : '');
+
+  const oldText = submitButton.textContent;
+  submitButton.disabled = true;
+  submitButton.textContent = '保存中…';
+  textarea.readOnly = true;
+  setTaskError(task.id, '');
+
+  try {
+    const raw = await actSession('correct', {
+      taskId: task.id,
+      text,
+      previousText,
+      stage: current.stage,
+      round: current.round,
+    });
+    const next = normalizeSession(raw);
+    if (!next) throw new Error('后台返回的讨论数据不完整。');
+    delete state.correctionBase[task.id];
+    commitSession(next);
+    toast('已更正录入；下一阶段使用更正后的原文');
+  } catch (error) {
+    setTaskError(task.id, friendlyError(error, '更正失败，已保存原文未变'));
+    submitButton.disabled = false;
+    submitButton.textContent = oldText;
+    textarea.readOnly = false;
+  }
+}
+
+async function skipTask(session, task, skipButton, submitButton) {  const current = state.session;
   if (!current) return;
   if (current.paused) {
     setTaskError(task.id, '讨论已暂停，继续后再处理缺席。');
@@ -2641,9 +3163,13 @@ async function skipTask(session, task, skipButton, submitButton) {
   }
 
   const name = providerName(task.provider);
+  const existingDraft = getDraft(session, task);
+  const draftNote = existingDraft
+    ? '本机还留着这份未提交的草稿；跳过不会删除，之后可只读查看和复制，但不能再提交。'
+    : '当前没有未提交的草稿；跳过之后不能再补录或提交。';
   const confirmed = await confirmDialog({
     title: `跳过席 ${seatLetter(Math.max(0, session.providers.indexOf(task.provider)))}？`,
-    body: `${name} 在本阶段会被记为缺席。缺席不会被当作同意，尚未提交的草稿会保留。`,
+    body: `${name} 在这一阶段记为缺席，本轮不计入结论。${draftNote}`,
     confirmLabel: '跳过这一席',
   });
   if (!confirmed) return;
@@ -2656,10 +3182,11 @@ async function skipTask(session, task, skipButton, submitButton) {
   try {
     const raw = await actSession('skip', { taskId: task.id });
     const next = normalizeSession(raw);
-    if (!next) throw new Error('后台返回的场次数据不完整。');
+    if (!next) throw new Error('后台返回的讨论数据不完整。');
+    delete state.promptCopied[task.id];
     state.dismissedDraftEditors.add(task.id);
     commitSession(next);
-    toast('已记为缺席');
+    toast('已跳过，本轮不计入结论');
   } catch (error) {
     skipButton.disabled = false;
     skipButton.textContent = oldLabel;
@@ -2671,12 +3198,13 @@ async function skipTask(session, task, skipButton, submitButton) {
 async function copyPrompt(task) {
   const prompt = typeof task.prompt === 'string' ? task.prompt : '';
   if (!prompt.trim()) {
-    toast('这一席的提示原文为空，无法复制。', 'error');
+    toast('这一席没有提示原文，复制不了。', 'error');
     return;
   }
   try {
     await copyText(prompt);
-    toast('已复制这一席的提示');
+    markPromptCopied(task.id);
+    toast('已复制提示');
   } catch (error) {
     toast(friendlyError(error, '复制失败'), 'error');
   }
@@ -2699,7 +3227,7 @@ async function copyPromptAndOpen(session, task, button) {
   if (button && button.disabled) return;
   const prompt = typeof task.prompt === 'string' ? task.prompt : '';
   if (!prompt.trim()) {
-    toast('这一席的提示原文为空，无法复制。', 'error');
+    toast('这一席没有提示原文，复制不了。', 'error');
     return;
   }
 
@@ -2716,6 +3244,7 @@ async function copyPromptAndOpen(session, task, button) {
   } catch (error) {
     copyError = error;
   }
+  if (!copyError) markPromptCopied(task.id);
   try {
     await callBackground({ type: 'open', id: session.id, provider: task.provider });
   } catch (error) {
@@ -2732,11 +3261,11 @@ async function copyPromptAndOpen(session, task, button) {
     return;
   }
   if (!copyError) {
-    toast(friendlyError(openError, '提示已复制，但打开原页失败；可用「打开原站」重试'), 'error');
+    toast(friendlyError(openError, '提示已复制，原页没打开。可以点「打开原站」再试'), 'error');
     return;
   }
   if (!openError) {
-    toast(friendlyError(copyError, '未能复制提示，原页已打开；请回来点「复制提示」重试'), 'error');
+    toast(friendlyError(copyError, '提示没复制成功，原页已打开。回来点「复制提示」再试'), 'error');
     return;
   }
   toast(friendlyError(copyError, '复制与打开都失败'), 'error');
@@ -2810,7 +3339,7 @@ function reportSourceIndex(session) {
 function highlightSource(sourceId) {
   const target = document.getElementById(sourceAnchorId(sourceId));
   if (!target) {
-    toast(`本场没有找到 ${sourceId} 的原文`, 'error');
+    toast(`这场讨论没有找到 ${sourceId} 的原文`, 'error');
     return;
   }
   let smooth = true;
@@ -2948,6 +3477,77 @@ function renderReportMarkdown(markdown, session) {
   return root;
 }
 
+/* 以下只把报告拆成展示小节，报告原文、导出和判断都不变。 */
+const REPORT_STATUS_COPY = {
+  consensus: { label: '全体一致', tone: 'good', note: '每位都明确同意同一候选版本。' },
+  'conditional-agreement': { label: '有条件一致', tone: 'warn', note: '至少一席附加了条件，不等于无条件同意。' },
+  'unresolved-opposition': { label: '仍有明确反对', tone: 'warn', note: '当前版本未形成共识。' },
+  'partial-votes': { label: '部分完成', tone: 'warn', note: '有席位未对当前版本明确表态，不计为同意。' },
+  'partial-participation': { label: '部分完成', tone: 'warn', note: '参与席位不齐，不构成全体一致。' },
+  'no-cross-review': { label: '部分完成', tone: 'warn', note: '交叉质询未齐，不构成全体一致。' },
+  draft: { label: '草稿', tone: 'draft', note: '候选缺少可核实的出处编号，未形成可核验的一致。' },
+  'proposal-skipped': { label: '未形成候选', tone: 'draft', note: '候选结论没有完成，未进入有效表决。' },
+  'no-critique': { label: '部分完成', tone: 'warn', note: '缺少可用的质询材料。' },
+  partial: { label: '部分完成', tone: 'warn', note: '讨论未完整走完，不构成全体一致。' },
+  'no-answers': { label: '没有可用回答', tone: 'draft', note: '尚未收到可用的独立回答。' },
+  'user-finished': { label: '提前结束', tone: 'neutral', note: '讨论未走完，以下是阶段记录。' },
+};
+
+const REPORT_REASON_PREFIXES = {
+  全体一致: 'consensus',
+  有条件一致: 'conditional-agreement',
+  未解决分歧: 'unresolved-opposition',
+  部分完成: 'partial',
+  未形成结论: 'no-answers',
+  草稿: 'draft',
+};
+
+function reportSections(markdown) {
+  const sections = new Map();
+  let current = null;
+  for (const line of String(markdown ?? '').split(/\r?\n/)) {
+    const heading = /^##\s+(.+?)\s*$/.exec(line);
+    if (heading) {
+      current = { title: heading[1], lines: [] };
+      sections.set(current.title, current);
+      continue;
+    }
+    if (current) current.lines.push(line);
+  }
+  return sections;
+}
+
+function reportSectionText(section) {
+  if (!section) return '';
+  const lines = section.lines.slice();
+  while (lines.length && !lines[0].trim()) lines.shift();
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  return lines.join('\n');
+}
+
+/* 结束原因取核心写入的 stopReason；缺失时只按报告的状态行兜底。 */
+function reportReasonOf(session, sections) {
+  const reason = String(session.stopReason || '');
+  if (reason) return reason;
+  const statusLines = (sections.get('状态')?.lines || []).map((line) => line.trim());
+  const first = statusLines.find((line) => /^-\s+/.test(line));
+  const text = first ? first.replace(/^-\s+/, '') : '';
+  for (const [prefix, value] of Object.entries(REPORT_REASON_PREFIXES)) {
+    if (text.startsWith(prefix)) return value;
+  }
+  return '';
+}
+
+function reportConditions(sections) {
+  const section = sections.get('未解决分歧与附加条件');
+  if (!section) return [];
+  return section.lines
+    .map((line) => line.trim())
+    .filter((line) => /^[-*]\s+/.test(line))
+    .map((line) => line.replace(/^[-*]\s+/, ''))
+    .filter((text) => text && !/^当前版本没有记录到明确反对或附加条件。?$/.test(text));
+}
+
 function renderReport(session) {
   const reportText = session.report && session.report.trim() ? session.report.trim() : '';
   const actions = h('div', { class: 'report-actions' });
@@ -2957,7 +3557,7 @@ function renderReport(session) {
     type: 'button',
     text: '复制结论',
     disabled: !reportText,
-    title: reportText ? '复制结论文本' : '本场没有结论文本',
+    title: reportText ? '复制结论文本' : '没有结论文本',
     onClick: async () => {
       try {
         await copyText(reportText);
@@ -2978,22 +3578,98 @@ function renderReport(session) {
   const section = h('section', { class: 'report', attrs: { 'aria-labelledby': 'report-title' } },
     h('div', { class: 'report-head' },
       h('div', {},
-        h('p', { class: 'report-kicker', text: '本场记录' }),
+        h('p', { class: 'report-kicker', text: '记录' }),
         h('h2', { class: 'report-title', id: 'report-title', text: '结论' })),
       actions));
 
   if (reportText) {
-    section.append(renderReportMarkdown(reportText, session));
-    if (/\[S\d+\]/.test(reportText)) {
-      section.append(h('p', {
-        class: 'report-source-note',
-        text: '带方括号的编号可跳到下方「历次发言」的对应原文；点击后会高亮该条。',
+    const sections = reportSections(reportText);
+    const sources = new Set(reportSourceIndex(session).keys());
+    const reason = reportReasonOf(session, sections);
+    const status = REPORT_STATUS_COPY[reason]
+      || { label: '已结束', tone: 'neutral', note: '报告未标注一致结论，按记录使用。' };
+    const incomplete = reason !== 'consensus';
+    const answerLines = reportSectionText(sections.get('建议回答')).split('\n');
+    const metaText = (answerLines[0] || '').trim();
+    const hasProposal = /^候选版本\s+v\d+/i.test(metaText);
+    const bodyText = hasProposal
+      ? answerLines.slice(1).join('\n').trim()
+      : reportSectionText(sections.get('建议回答'));
+    const conditions = reportConditions(sections);
+
+    const answer = h('div', { class: 'report-answer' },
+      h('div', { class: 'report-answer-head' },
+        h('p', {
+          class: 'report-answer-label',
+          text: hasProposal ? (incomplete ? '候选建议' : '建议回答') : '当前状态',
+        }),
+        h('span', { class: `report-status is-${status.tone}`, text: status.label })),
+      h('p', { class: 'report-status-note', text: status.note }));
+
+    if (hasProposal) {
+      const meta = h('p', { class: 'report-answer-meta' });
+      appendReportInline(meta, metaText, sources);
+      answer.append(meta);
+    }
+
+    if (hasProposal && bodyText) {
+      const body = renderReportMarkdown(bodyText, session);
+      body.classList.add('report-answer-body');
+      answer.append(body);
+    } else if (!hasProposal) {
+      const material = sections.get('独立回答');
+      const materialCount = (material?.lines || [])
+        .filter((line) => /^###\s+\[S\d+\]/.test(line.trim())).length;
+      answer.append(h('p', {
+        class: 'report-partial-text',
+        text: bodyText || '尚无可用的候选结论。以下保留已收到的材料，供人工判断。',
+      }));
+      answer.append(h('p', {
+        class: 'report-partial-text',
+        text: materialCount > 0
+          ? `已收到 ${materialCount} 条独立回答，原文见下方「历次发言」或展开完整报告。`
+          : '没有可用的独立回答，逐席状态见下方。',
       }));
     }
+
+    section.append(answer);
+
+    if (conditions.length) {
+      const list = h('ul', { class: 'report-conditions-list' });
+      for (const text of conditions) {
+        const item = h('li', {});
+        appendReportInline(item, text, sources);
+        list.append(item);
+      }
+      section.append(h('div', { class: 'report-conditions' },
+        h('h3', { class: 'report-conditions-title', text: '尚未解决的条件与反对' }),
+        list));
+    }
+
+    const visibleText = [
+      hasProposal ? metaText : '',
+      hasProposal ? bodyText : (bodyText || ''),
+      conditions.join(' '),
+    ].join(' ');
+    if (/\[S\d+\]/.test(visibleText)) {
+      section.append(h('p', {
+        class: 'report-source-note',
+        text: '编号可跳到下面「历次发言」的对应原文。',
+      }));
+    }
+
+    const details = h('details', { class: 'report-details' },
+      h('summary', { class: 'report-details-summary', text: '完整报告与状态记录' }),
+      h('p', {
+        class: 'report-details-hint',
+        text: '未删改的完整 Markdown 报告，含上方建议回答与逐席记录。',
+      }));
+    details.append(renderReportMarkdown(reportText, session));
+    section.append(details);
   } else {
     section.append(h('div', {
       class: 'report-empty',
-      text: '本场已结束，但没有附上结论文本。逐席表态和历次发言仍保留在下面，也可以导出完整记录。',
+      text: '这场讨论已结束，但没有结论文本。逐席表态和发言仍在下面，可以导出。',
     }));
   }
 
@@ -3007,7 +3683,7 @@ function renderStanceSummary(session) {
     h('h3', { class: 'stance-title', text: '逐席确认' }),
     h('p', {
       class: 'stance-rule',
-      text: '缺席、沉默与无法解析的表态都不计为同意。只有每位参与者明确同意且关键条件已纳入，才构成全体一致。',
+      text: '缺席、沉默和无法解析的表态都不计为同意。每位都明确同意，且关键条件已写入，才算全体一致。',
     }));
 
   for (const row of rows) {
@@ -3051,7 +3727,7 @@ function renderHistory(session) {
   if (!entries.length) {
     section.append(h('div', {
       class: 'inline-empty',
-      text: '还没有已完成的发言。当前轮的回答会先显示在上面的席位卡片中。',
+      text: '还没有早先的发言。当前轮的回答在上面。',
     }));
     return section;
   }
@@ -3082,6 +3758,7 @@ function renderHistoryEntry(session, entry) {
     h('span', { class: 'timeline-seat', text: `席 ${seatLetter(seatIndex >= 0 ? seatIndex : 0)} · ${providerName(entry.provider)}` }),
     h('span', { text: statusLabel(entry.status) }));
   if (entry.stance) meta.append(stanceChip(entry.stance));
+  if (isCorrectedAnswer(entry)) meta.append(revisionChip());
   if (sourceId) {
     meta.append(h('a', {
       class: 'source-id',
@@ -3103,7 +3780,7 @@ function renderHistoryEntry(session, entry) {
   }, meta);
 
   if (entry.status === 'skipped') {
-    item.append(h('div', { class: 'timeline-answer is-muted', text: '该席在本阶段缺席（跳过）。' }));
+    item.append(h('div', { class: 'timeline-answer is-muted', text: '这一席在这一阶段缺席。' }));
   } else if (entry.answer && entry.answer.trim()) {
     item.append(h('div', { class: 'timeline-answer', text: entry.answer }));
   } else if (entry.status === 'pending') {
@@ -3111,6 +3788,12 @@ function renderHistoryEntry(session, entry) {
   } else {
     item.append(h('div', { class: 'timeline-answer is-muted', text: '未保存回答文本。' }));
   }
+
+  const revision = renderRevisionDetails(entry);
+  if (revision) item.append(revision);
+
+  const draft = draftForHistoryEntry(session, entry);
+  if (draft) item.append(renderUnsubmittedDraft(draft));
 
   if (entry.prompt) {
     item.append(h('details', { class: 'prompt-box prompt-box-history' },
@@ -3162,10 +3845,10 @@ function exportSession() {
 
 function buildMarkdown(session) {
   const lines = [];
-  lines.push('# 判断记录', '');
+  lines.push('# 讨论记录', '');
   lines.push('## 问题', '', session.question || '未填写问题', '');
 
-  lines.push('## 场次信息', '');
+  lines.push('## 讨论信息', '');
   const seats = sessionProviderList(session).map((provider, index) =>
     `席 ${seatLetter(index)} ${providerName(provider)}（${provider}）`);
   lines.push(`- 参与席位：${seats.join('；') || '未登记'}`);
@@ -3176,10 +3859,10 @@ function buildMarkdown(session) {
 
   lines.push('## 结论', '');
   const report = session.report && session.report.trim() ? session.report.trim() : '';
-  lines.push(report || '本场没有附上结论文本，只保留以下回答与表态记录。', '');
+  lines.push(report || '这场讨论没有结论文本，只保留下面的回答和表态。', '');
 
   lines.push('## 逐席确认', '');
-  lines.push('> 缺席、沉默与无法解析的表态都不计为同意。只有每位参与者明确同意且关键条件已纳入，才构成全体一致。', '');
+  lines.push('> 缺席、沉默和无法解析的表态都不计为同意。每位都明确同意，且关键条件已写入，才算全体一致。', '');
   const stances = deriveStances(session);
   if (!stances.length) lines.push('- 没有可列出的席位。');
   for (const row of stances) {
@@ -3212,6 +3895,11 @@ function buildMarkdown(session) {
           ? '尚未回答。'
           : entry.answer && entry.answer.trim() ? entry.answer : '未保存回答文本。';
       lines.push('**回答原文**', '', markdownBlock(answer), '');
+      if (isCorrectedAnswer(entry) && entry.originalAnswer && entry.originalAnswer.trim()) {
+        lines.push('**更正说明**', '');
+        lines.push(`- 首次提交：${formatAbsolute(entry.answeredAt)}；最近更正：${formatAbsolute(entry.correctedAt)}。这场讨论仍只把上面一条回答计为证据。`);
+        lines.push('', '**首次提交原文（保留，不计第二条回答）**', '', markdownBlock(entry.originalAnswer), '');
+      }
     }
   }
 
@@ -3252,14 +3940,14 @@ function markdownBlock(text) {
 }
 
 function exportFilename(session) {
-  const base = String(session.question || '未命名判断')
+  const base = String(session.question || '未命名讨论')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 32)
-    .replace(/[\\/:*?"<>|#%{}~&]/g, '-') || '未命名判断';
+    .replace(/[\\/:*?"<>|#%{}~&]/g, '-') || '未命名讨论';
   const now = new Date();
   const pad = (value) => String(value).padStart(2, '0');
-  return `判断台-${base}-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}.md`;
+  return `AI-Arena-${base}-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}.md`;
 }
 
 function downloadText(text, filename) {
@@ -3320,12 +4008,12 @@ async function boot() {
   renderHistoryList();
 
   if (!runtimeAvailable()) {
-    showGlobalError('未检测到扩展后台。请从 Chrome 的扩展页打开 workspace.html，而不是直接打开本地文件。');
+    showGlobalError('没有检测到扩展后台。请从 Chrome 的扩展页打开，不要直接打开本地文件。');
     renderHome();
     return;
   }
 
-  renderLoading('正在读取本地场次…');
+  renderLoading('正在读取本机记录…');
 
   try {
     const reply = await callBackground({ type: 'list' });
@@ -3341,7 +4029,7 @@ async function boot() {
     setSessions([]);
     state.listError = friendlyError(error);
     renderHistoryList();
-    showGlobalError(friendlyError(error, '读取场次失败'));
+    showGlobalError(friendlyError(error, '读取讨论失败'));
     renderHome();
   }
 }

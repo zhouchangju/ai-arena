@@ -311,6 +311,320 @@ test('unknown, duplicate, skipped and stale task ids are rejected', () => {
   );
 });
 
+// ---------------------------------------------------------------------------
+// Correcting a live manual answer
+// ---------------------------------------------------------------------------
+
+function liveAnswered(session, provider) {
+  const task = session.tasks.find(
+    (candidate) =>
+      candidate.provider === provider && candidate.status === 'answered',
+  );
+  assert.ok(task, `expected a live answered task for ${provider}`);
+  return task;
+}
+
+test('a live manual answer can be corrected in place and keeps its original', () => {
+  let session = start();
+  session = answerFor(session, 'chatgpt', 'ORIGINAL_ANSWER_A');
+  const task = liveAnswered(session, 'chatgpt');
+  const before = JSON.stringify(session);
+
+  session = applyAction(session, 'correct', {
+    taskId: task.id,
+    text: 'CORRECTED_ANSWER_A',
+    previousText: 'ORIGINAL_ANSWER_A',
+    stage: 'independent',
+    round: 1,
+  });
+
+  // applyAction is still pure: the input session was not edited.
+  assert.notEqual(JSON.stringify(session), before);
+  assert.equal(task.answer, 'ORIGINAL_ANSWER_A');
+
+  const correctedTask = liveAnswered(session, 'chatgpt');
+  assert.equal(correctedTask.id, task.id);
+  assert.equal(correctedTask.status, 'answered');
+  assert.equal(correctedTask.answer, 'CORRECTED_ANSWER_A');
+  assert.equal(correctedTask.originalAnswer, 'ORIGINAL_ANSWER_A');
+  assert.equal(correctedTask.corrections.length, 1);
+  assert.equal(correctedTask.corrections[0].previousText, 'ORIGINAL_ANSWER_A');
+  assert.equal(correctedTask.corrections[0].text, 'CORRECTED_ANSWER_A');
+  assert.ok(correctedTask.answeredAt > 0);
+  assert.ok(correctedTask.correctedAt >= correctedTask.answeredAt);
+  assert.equal(correctedTask.corrections[0].at, correctedTask.correctedAt);
+
+  // One answer record, one round: nothing was duplicated or advanced.
+  assert.equal(session.stage, 'independent');
+  assert.equal(session.round, 1);
+  assert.equal(session.history.length, 0);
+  assert.equal(
+    session.tasks.filter((candidate) => candidate.status === 'answered').length,
+    1,
+  );
+  assert.equal(
+    session.tasks.filter((candidate) => candidate.status === 'pending').length,
+    1,
+  );
+
+  // A second correction keeps the first submitted text and the in-between
+  // text separately, still as the same answer.
+  session = applyAction(session, 'correct', {
+    taskId: task.id,
+    text: 'CORRECTED_ANSWER_A_V2',
+    previousText: 'CORRECTED_ANSWER_A',
+  });
+  const twice = liveAnswered(session, 'chatgpt');
+  assert.equal(twice.answer, 'CORRECTED_ANSWER_A_V2');
+  assert.equal(twice.originalAnswer, 'ORIGINAL_ANSWER_A');
+  assert.equal(twice.corrections.length, 2);
+  assert.deepEqual(
+    twice.corrections.map((entry) => [entry.previousText, entry.text]),
+    [
+      ['ORIGINAL_ANSWER_A', 'CORRECTED_ANSWER_A'],
+      ['CORRECTED_ANSWER_A', 'CORRECTED_ANSWER_A_V2'],
+    ],
+  );
+  assert.ok(twice.correctedAt >= twice.corrections[0].at);
+});
+
+test('stale, concurrent and repeated corrections are rejected', () => {
+  let session = start();
+  session = answerFor(session, 'chatgpt', 'BASE_TEXT');
+  const task = liveAnswered(session, 'chatgpt');
+
+  // The expected previous text must be the one actually saved.
+  assert.throws(
+    () =>
+      applyAction(session, 'correct', {
+        taskId: task.id,
+        text: 'NEW_TEXT',
+        previousText: 'A_TEXT_THE_USER_NEVER_SAW',
+      }),
+    /stale correction/,
+  );
+  assert.throws(
+    () =>
+      applyAction(session, 'correct', {
+        taskId: task.id,
+        text: 'NEW_TEXT',
+      }),
+    /stale correction/,
+  );
+
+  // Window 1 corrects. A second window that still shows BASE_TEXT, and a
+  // repeated click from the same card, must not overwrite it.
+  const corrected = applyAction(session, 'correct', {
+    taskId: task.id,
+    text: 'WINDOW_ONE_TEXT',
+    previousText: 'BASE_TEXT',
+  });
+  for (const text of ['WINDOW_TWO_TEXT', 'WINDOW_ONE_TEXT']) {
+    assert.throws(
+      () =>
+        applyAction(corrected, 'correct', {
+          taskId: task.id,
+          text,
+          previousText: 'BASE_TEXT',
+        }),
+      /stale correction/,
+    );
+  }
+
+  // No-op and empty corrections are refused rather than counted.
+  assert.throws(
+    () =>
+      applyAction(corrected, 'correct', {
+        taskId: task.id,
+        text: 'WINDOW_ONE_TEXT',
+        previousText: 'WINDOW_ONE_TEXT',
+      }),
+    /identical/,
+  );
+  assert.throws(
+    () =>
+      applyAction(corrected, 'correct', {
+        taskId: task.id,
+        text: '   ',
+        previousText: 'WINDOW_ONE_TEXT',
+      }),
+    /non-empty/,
+  );
+
+  // Wrong stage/round coordinates fail before the text is touched.
+  assert.throws(
+    () =>
+      applyAction(corrected, 'correct', {
+        taskId: task.id,
+        text: 'OTHER_ROUND',
+        previousText: 'WINDOW_ONE_TEXT',
+        round: 2,
+      }),
+    /stale correction/,
+  );
+  assert.throws(
+    () =>
+      applyAction(corrected, 'correct', {
+        taskId: task.id,
+        text: 'OTHER_STAGE',
+        previousText: 'WINDOW_ONE_TEXT',
+        stage: 'critique',
+      }),
+    /stale correction/,
+  );
+  assert.equal(liveAnswered(corrected, 'chatgpt').answer, 'WINDOW_ONE_TEXT');
+});
+
+test('a correction is refused once the round has frozen or advanced', () => {
+  // Both seats answered while paused: nothing is pending, so the round is
+  // frozen even though its tasks are still in `tasks`.
+  let paused = start();
+  paused = applyAction(paused, 'pause');
+  paused = answerFor(paused, 'chatgpt', 'PAUSED_A');
+  paused = answerFor(paused, 'claude', 'PAUSED_B');
+  assert.equal(paused.stage, 'independent');
+  assert.ok(paused.tasks.every((task) => task.status === 'answered'));
+  assert.throws(
+    () =>
+      applyAction(paused, 'correct', {
+        taskId: liveAnswered(paused, 'chatgpt').id,
+        text: 'TOO_LATE',
+        previousText: 'PAUSED_A',
+      }),
+    /already frozen/,
+  );
+
+  // After the stage advances the old task is history and stale.
+  let advanced = start();
+  advanced = answerFor(advanced, 'chatgpt', 'STAGE_ONE');
+  const oldId = liveAnswered(advanced, 'chatgpt').id;
+  advanced = answerFor(advanced, 'claude', 'STAGE_ONE_B');
+  assert.equal(advanced.stage, 'critique');
+  assert.throws(
+    () =>
+      applyAction(advanced, 'correct', {
+        taskId: oldId,
+        text: 'LATE_CORRECTION',
+        previousText: 'STAGE_ONE',
+      }),
+    /stale submission/,
+  );
+});
+
+test('corrections are forbidden for votes, proposals, skipped seats, pending seats and automated seats', () => {
+  // Vote: one seat has voted, the other is still pending — stage itself is not
+  // correctable, and a vote can never be reopened.
+  let vote = toVote();
+  const voted = vote.tasks.find(
+    (task) => task.provider === 'chatgpt' && task.status === 'pending',
+  );
+  vote = answerFor(vote, 'chatgpt', 'VOTE_AGREE', { stance: 'agree' });
+  assert.equal(vote.stage, 'vote');
+  assert.ok(vote.tasks.some((task) => task.status === 'pending'));
+  assert.throws(
+    () =>
+      applyAction(vote, 'correct', {
+        taskId: voted.id,
+        text: 'REWRITTEN_VOTE',
+        previousText: 'VOTE_AGREE',
+      }),
+    /cannot be corrected in the vote stage/,
+  );
+
+  // Proposal: the drafter is the only task and the stage is not correctable.
+  let proposal = start();
+  proposal = answerFor(proposal, 'chatgpt', 'P_A');
+  proposal = answerFor(proposal, 'claude', 'P_B');
+  proposal = answerFor(proposal, 'chatgpt', 'P_A_CRITIQUE');
+  proposal = answerFor(proposal, 'claude', 'P_B_CRITIQUE');
+  assert.equal(proposal.stage, 'proposal');
+  const drafter = proposal.tasks.find((task) => task.status === 'pending');
+  assert.throws(
+    () =>
+      applyAction(proposal, 'correct', {
+        taskId: drafter.id,
+        text: 'REWRITTEN_PROPOSAL',
+        previousText: 'nothing yet',
+      }),
+    /cannot be corrected in the proposal stage/,
+  );
+
+  // A skipped seat is an absence, not an answer.
+  let skipped = start();
+  skipped = skipFor(skipped, 'chatgpt');
+  const skippedId = skipped.tasks.find((task) => task.status === 'skipped').id;
+  assert.throws(
+    () =>
+      applyAction(skipped, 'correct', {
+        taskId: skippedId,
+        text: 'LATE_REPLY',
+        previousText: '',
+      }),
+    /was skipped/,
+  );
+
+  // A pending seat has nothing to correct yet.
+  let pending = start();
+  assert.throws(
+    () =>
+      applyAction(pending, 'correct', {
+        taskId: pendingTask(pending, 'chatgpt').id,
+        text: 'INSTEAD_OF_SUBMIT',
+        previousText: '',
+      }),
+    /no saved answer yet/,
+  );
+
+  // Local automation seats are owned by the web driver, not this correction.
+  let auto = createSession(QUESTION, ['local-a', 'claude']);
+  auto = applyAction(auto, 'answer', {
+    taskId: pendingTask(auto, 'local-a').id,
+    text: 'AUTO_ORIGINAL',
+  });
+  assert.throws(
+    () =>
+      applyAction(auto, 'correct', {
+        taskId: liveAnswered(auto, 'local-a').id,
+        text: 'AUTO_EDITED',
+        previousText: 'AUTO_ORIGINAL',
+      }),
+    /automated seat/,
+  );
+});
+
+test('the next round receives the corrected text and history keeps the original', () => {
+  let session = start();
+  session = answerFor(session, 'chatgpt', 'PEER_TEXT_ORIGINAL_9f');
+  session = applyAction(session, 'correct', {
+    taskId: liveAnswered(session, 'chatgpt').id,
+    text: 'PEER_TEXT_CORRECTED_7c',
+    previousText: 'PEER_TEXT_ORIGINAL_9f',
+  });
+
+  // The correction alone must not advance or add a task.
+  assert.equal(session.stage, 'independent');
+  assert.equal(session.tasks.length, 2);
+
+  session = answerFor(session, 'claude', 'OWN_TEXT_B');
+  assert.equal(session.stage, 'critique');
+  const claudeTask = session.tasks.find((task) => task.provider === 'claude');
+  assert.ok(claudeTask);
+  assert.ok(claudeTask.prompt.includes('PEER_TEXT_CORRECTED_7c'));
+  assert.equal(claudeTask.prompt.includes('PEER_TEXT_ORIGINAL_9f'), false);
+
+  // Archived history keeps one answer, its corrected text and its original.
+  const archived = session.history.filter(
+    (entry) => entry.stage === 'independent' && entry.provider === 'chatgpt',
+  );
+  assert.equal(archived.length, 1);
+  assert.equal(archived[0].answer, 'PEER_TEXT_CORRECTED_7c');
+  assert.equal(archived[0].originalAnswer, 'PEER_TEXT_ORIGINAL_9f');
+  assert.equal(archived[0].corrections.length, 1);
+  assert.equal(archived[0].corrections[0].previousText, 'PEER_TEXT_ORIGINAL_9f');
+  assert.ok(archived[0].answeredAt > 0);
+  assert.ok(archived[0].correctedAt >= archived[0].answeredAt);
+});
+
 test('applyAction never mutates the input session', () => {
   const session = start();
   const before = JSON.stringify(session);

@@ -6,6 +6,7 @@
 //   sendMessage({ type: 'create', question, providers: [idA, idB] })
 //   sendMessage({ type: 'act', id, action, payload })
 //      actions: 'answer' {taskId, text, stance?, version?, stage?, round?}
+//               'correct' {taskId, text, previousText, stage?, round?}
 //               'skip' {taskId} | 'guide' {text} | 'pause' | 'resume' | 'finish'
 //   sendMessage({ type: 'delete', id })
 //   sendMessage({ type: 'open', id, provider })
@@ -48,7 +49,7 @@ import {
 const AUTOMATION_SEATS = new Set(AUTOMATION_PROVIDER_IDS);
 const STANCES = new Set(['agree', 'conditional', 'oppose']);
 const COMMAND_TYPES = new Set(['list', 'get', 'create', 'act', 'delete', 'open']);
-const ACTIONS = new Set(['answer', 'skip', 'guide', 'pause', 'resume', 'finish']);
+const ACTIONS = new Set(['answer', 'skip', 'guide', 'pause', 'resume', 'finish', 'correct']);
 
 const MAX_QUESTION = 8000;
 const MAX_ANSWER = 200000;
@@ -155,6 +156,29 @@ function normalizeActPayload(action, raw) {
     if (payload.version !== undefined && payload.version !== null) {
       next.version = payload.version;
     }
+    if (payload.stage !== undefined && payload.stage !== null) {
+      next.stage = payload.stage;
+    }
+    if (payload.round !== undefined && payload.round !== null) {
+      next.round = payload.round;
+    }
+    return next;
+  }
+
+  if (action === 'correct') {
+    const taskId = requireTaskId(payload.taskId);
+    if (typeof payload.text !== 'string') throw new ArenaError('text 必须是文本');
+    if (!payload.text.trim()) throw new ArenaError('text 不能为空');
+    if (payload.text.length > MAX_ANSWER) {
+      throw new ArenaError(`text 超过 ${MAX_ANSWER} 字符上限`);
+    }
+    // The exact text the user was looking at. core.js rejects the correction
+    // when another window already replaced it, so a stale card cannot
+    // silently overwrite a newer correction.
+    if (typeof payload.previousText !== 'string') {
+      throw new ArenaError('previousText 必须是文本');
+    }
+    const next = { taskId, text: payload.text, previousText: payload.previousText };
     if (payload.stage !== undefined && payload.stage !== null) {
       next.stage = payload.stage;
     }

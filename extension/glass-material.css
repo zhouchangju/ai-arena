@@ -1,0 +1,469 @@
+/* ===========================================================================
+ * AI Arena · 光与玻璃（glass material）
+ *
+ * 由 workspace.html / connections.html 在基础样式之后加载，只叠加视觉：
+ * 一层有方向的光场、两条从画外穿过的玻璃带、导航面的真实折射边，以及
+ * 首页右上的小型玻璃徽记。没有脚本、没有外部字体或网络资源。
+ *
+ * 结构：光场 → 导航玻璃 → 品牌印记 → 首页徽记 → 次要玻璃件 → 深色
+ *       → 窄屏 → 减少透明／高对比／减少动态
+ * =========================================================================== */
+
+/* ------------------------------ 光场 ------------------------------ */
+
+/* 画面底部是一张静态的“光学雕塑”场：左侧一条宽玻璃带从导航栏后方穿过，
+ * 右上是一组镜片与车削环。光来自左上，暗面压向右下。 */
+body {
+  background-color: #e9eef9;
+  background-image: url("assets/field-light.svg");
+  background-repeat: no-repeat;
+  background-position: center center;
+  background-size: cover;
+  background-attachment: fixed;
+}
+
+/* 一层很薄的方向光：左上更亮，右下退后；静态，不做漂移。 */
+body::before {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  background:
+    radial-gradient(58% 40% at 14% -8%, rgba(255, 255, 255, 0.82), transparent 68%),
+    linear-gradient(112deg, rgba(255, 255, 255, 0.46) 0%, rgba(255, 255, 255, 0) 34%),
+    linear-gradient(292deg, rgba(24, 46, 104, 0.1) 0%, rgba(24, 46, 104, 0) 46%);
+  content: "";
+  pointer-events: none;
+  animation: none;
+}
+
+/* 极细的胶片颗粒，压住渐变的色带；不是噪点动效。 */
+body::after {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  background-image: url("assets/film-grain.svg");
+  background-size: 180px 180px;
+  content: "";
+  mix-blend-mode: soft-light;
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+/* ------------------------------ 导航玻璃 ------------------------------ */
+
+/* 关键不是多一层白，而是三件事：低不透明度的底色、被模糊的真实背景、
+ * 一圈机加工般的亮边。底色低到能看见后面的玻璃带，正文仍落在足够暗的墨色上。 */
+.sidebar {
+  position: sticky;
+  border: 0;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.24) 0%, rgba(255, 255, 255, 0.05) 46%,
+      rgba(255, 255, 255, 0.14) 100%),
+    radial-gradient(130% 74% at 8% -4%, rgba(255, 255, 255, 0.4), rgba(255, 255, 255, 0) 62%);
+  box-shadow:
+    0 34px 74px -38px rgba(19, 36, 82, 0.58),
+    0 2px 6px rgba(19, 36, 82, 0.06),
+    inset 0 1px 0 rgba(255, 255, 255, 0.96),
+    inset 1px 0 0 rgba(255, 255, 255, 0.6),
+    inset -1px 0 0 rgba(86, 110, 162, 0.22),
+    inset 0 -1px 0 rgba(66, 92, 148, 0.16);
+  backdrop-filter: blur(26px) saturate(1.7) brightness(1.02);
+  -webkit-backdrop-filter: blur(26px) saturate(1.7) brightness(1.02);
+}
+
+/* 1px 的斜向亮边：上缘冷白，右缘偏钴蓝，下缘略暗，像磨过的棱。 */
+.sidebar::before {
+  position: absolute;
+  z-index: 3;
+  inset: 0;
+  padding: 1px;
+  border-radius: inherit;
+  background: linear-gradient(148deg,
+    rgba(255, 255, 255, 0.98) 0%,
+    rgba(255, 255, 255, 0.28) 26%,
+    rgba(255, 255, 255, 0.08) 48%,
+    rgba(96, 126, 186, 0.38) 78%,
+    rgba(255, 255, 255, 0.82) 100%);
+  content: "";
+  pointer-events: none;
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+}
+
+/* 玻璃内部的一次折光：贴着右缘的一条冷色反光，不出边。 */
+.sidebar::after {
+  position: absolute;
+  z-index: 0;
+  inset: 1px;
+  border-radius: inherit;
+  background:
+    linear-gradient(96deg, rgba(255, 255, 255, 0.34) 0%, rgba(255, 255, 255, 0) 22%),
+    radial-gradient(60% 44% at 102% 42%, rgba(150, 186, 246, 0.26), transparent 72%),
+    radial-gradient(70% 40% at 50% 104%, rgba(126, 150, 214, 0.16), transparent 70%);
+  content: "";
+  pointer-events: none;
+}
+
+.sidebar > * {
+  position: relative;
+  z-index: 1;
+}
+
+/* 新讨论键：一枚薄玻璃片，亮边在上，键帽有一点内凹。 */
+.new-session {
+  border: 1px solid rgba(255, 255, 255, 0.66);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.62), rgba(255, 255, 255, 0.24));
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.9) inset,
+    0 -1px 0 rgba(84, 108, 158, 0.12) inset,
+    0 10px 22px -18px rgba(28, 48, 102, 0.7);
+  backdrop-filter: blur(10px) saturate(1.4);
+  -webkit-backdrop-filter: blur(10px) saturate(1.4);
+}
+
+.new-session:hover {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.76), rgba(255, 255, 255, 0.36));
+}
+
+/* 搜索框：沉进玻璃里的凹槽，不是另一块白纸。 */
+.search input {
+  border: 1px solid rgba(255, 255, 255, 0.5);
+  background: rgba(255, 255, 255, 0.26);
+  box-shadow:
+    inset 0 1px 2px rgba(30, 50, 100, 0.1),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.55);
+}
+
+.search input:hover {
+  background: rgba(255, 255, 255, 0.36);
+}
+
+/* 历史条目贴合玻璃；选中时靠钴蓝细线和一枚浅色内衬，而不是整块白。 */
+.history-item {
+  border-color: rgba(255, 255, 255, 0.44);
+  background: rgba(255, 255, 255, 0.2);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.6);
+}
+
+.history-item:hover {
+  background: rgba(255, 255, 255, 0.34);
+}
+
+.history-item.is-active {
+  border-color: rgba(63, 94, 170, 0.24);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.6), rgba(255, 255, 255, 0.34));
+  box-shadow:
+    inset 3px 0 0 var(--accent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.85);
+}
+
+/* ------------------------------ 品牌印记 ------------------------------ */
+
+/* 原来的“判”字换成两枚交叠镜片：两席对话、一个焦点。图形沿用本地 SVG。 */
+.seal {
+  border: 1px solid rgba(255, 255, 255, 0.52);
+  background:
+    url("assets/arena-mark.svg") center / 23px 23px no-repeat,
+    radial-gradient(120% 100% at 24% 10%, rgba(255, 255, 255, 0.42), transparent 54%),
+    linear-gradient(154deg, #6f8fe4 0%, #2c4a94 44%, #453d9b 78%, #6b5fc6 100%);
+  box-shadow:
+    0 10px 22px -12px rgba(22, 42, 104, 0.85),
+    inset 0 1px 0 rgba(255, 255, 255, 0.55),
+    inset 0 -10px 18px rgba(10, 22, 60, 0.42),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+  color: transparent;
+  font-size: 0;
+}
+
+.stamp {
+  border: 1px solid rgba(255, 255, 255, 0.52);
+  background:
+    url("assets/arena-mark.svg") center / 20px 20px no-repeat,
+    radial-gradient(120% 100% at 24% 10%, rgba(255, 255, 255, 0.4), transparent 54%),
+    linear-gradient(154deg, #6f8fe4 0%, #2c4a94 44%, #453d9b 78%, #6b5fc6 100%);
+  box-shadow:
+    0 8px 18px -12px rgba(22, 42, 104, 0.85),
+    inset 0 1px 0 rgba(255, 255, 255, 0.5),
+    inset 0 -8px 16px rgba(10, 22, 60, 0.4),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.1);
+  color: transparent;
+  font-size: 0;
+}
+
+/* ------------------------------ 首页徽记 ------------------------------ */
+
+/* 右上的小型玻璃雕塑：两条带子交叠成一只镜片。只在桌面断点出现，
+ * 落在标题之外，不与文字抢道。
+ * 图形是 Cycles 实拍渲染（.git/glass/sculpt/hero_loops.py），一张透明 webp，
+ * 玻璃本体的折射、色散和长条高光都在像素里，不是渐变占位。 */
+.home-hero {
+  position: relative;
+}
+
+.home-hero::after {
+  position: absolute;
+  top: 50%;
+  right: -6px;
+  width: clamp(140px, 13vw, 185px);
+  aspect-ratio: 640 / 560;
+  background: url("assets/hero-loops.webp") center / contain no-repeat;
+  content: "";
+  filter: drop-shadow(0 18px 30px rgba(26, 50, 108, 0.26));
+  pointer-events: none;
+  transform: translateY(-50%);
+}
+
+@media (max-width: 1180px) {
+  .home-hero::after {
+    right: 0;
+    width: clamp(132px, 15vw, 160px);
+  }
+}
+
+/* ------------------------------ 次要玻璃件 ------------------------------ */
+
+/* 连接页顶栏与表单页共用同一套棱边语言。 */
+.topbar {
+  border: 1px solid rgba(255, 255, 255, 0.62);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.5), rgba(255, 255, 255, 0.2));
+  box-shadow:
+    0 22px 48px -30px rgba(20, 38, 84, 0.5),
+    inset 0 1px 0 rgba(255, 255, 255, 0.92),
+    inset 0 -1px 0 rgba(78, 104, 158, 0.12);
+  backdrop-filter: blur(24px) saturate(1.6);
+  -webkit-backdrop-filter: blur(24px) saturate(1.6);
+}
+
+/* ------------------------------ 深色 ------------------------------ */
+
+@media (prefers-color-scheme: dark) {
+  body {
+    background-color: #05080f;
+    background-image: url("assets/field-dark.svg");
+  }
+
+  body::before {
+    background:
+      radial-gradient(52% 40% at 16% -6%, rgba(96, 130, 230, 0.28), transparent 70%),
+      linear-gradient(112deg, rgba(140, 170, 255, 0.12) 0%, rgba(140, 170, 255, 0) 34%),
+      linear-gradient(292deg, rgba(3, 6, 14, 0.5) 0%, rgba(3, 6, 14, 0) 48%);
+  }
+
+  body::after {
+    mix-blend-mode: overlay;
+    opacity: 0.4;
+  }
+
+  /* 深色下玻璃更薄：黑底本身压得住正文，反而能多露一点底下的光。 */
+  .sidebar {
+    background:
+      linear-gradient(180deg, rgba(24, 34, 60, 0.46) 0%, rgba(10, 16, 32, 0.3) 48%,
+        rgba(22, 30, 54, 0.42) 100%),
+      radial-gradient(130% 74% at 8% -4%, rgba(120, 150, 255, 0.14), transparent 62%);
+    box-shadow:
+      0 34px 80px -34px rgba(0, 0, 0, 0.8),
+      0 2px 8px rgba(0, 0, 0, 0.35),
+      inset 0 1px 0 rgba(255, 255, 255, 0.14),
+      inset 1px 0 0 rgba(255, 255, 255, 0.07),
+      inset -1px 0 0 rgba(0, 0, 0, 0.5),
+      inset 0 -1px 0 rgba(0, 0, 0, 0.45);
+    backdrop-filter: blur(24px) saturate(1.5) brightness(1.04);
+    -webkit-backdrop-filter: blur(24px) saturate(1.5) brightness(1.04);
+  }
+
+  .sidebar::before {
+    background: linear-gradient(148deg,
+      rgba(220, 235, 255, 0.5) 0%,
+      rgba(220, 235, 255, 0.1) 26%,
+      rgba(255, 255, 255, 0.03) 48%,
+      rgba(0, 0, 0, 0.45) 80%,
+      rgba(180, 205, 255, 0.36) 100%);
+  }
+
+  .sidebar::after {
+    background:
+      linear-gradient(96deg, rgba(255, 255, 255, 0.1) 0%, rgba(255, 255, 255, 0) 24%),
+      radial-gradient(60% 44% at 102% 42%, rgba(90, 126, 220, 0.28), transparent 72%),
+      radial-gradient(70% 40% at 50% 104%, rgba(96, 120, 210, 0.14), transparent 70%);
+  }
+
+  .new-session {
+    border-color: rgba(255, 255, 255, 0.16);
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.04));
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.14),
+      inset 0 -1px 0 rgba(0, 0, 0, 0.4),
+      0 12px 26px -20px rgba(0, 0, 0, 0.9);
+  }
+
+  .new-session:hover {
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.16), rgba(255, 255, 255, 0.06));
+  }
+
+  .search input {
+    border-color: rgba(255, 255, 255, 0.12);
+    background: rgba(255, 255, 255, 0.05);
+    box-shadow:
+      inset 0 1px 2px rgba(0, 0, 0, 0.45),
+      inset 0 -1px 0 rgba(255, 255, 255, 0.06);
+  }
+
+  .history-item {
+    border-color: rgba(255, 255, 255, 0.1);
+    background: rgba(255, 255, 255, 0.04);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  }
+
+  .history-item:hover {
+    background: rgba(255, 255, 255, 0.08);
+  }
+
+  .history-item.is-active {
+    border-color: rgba(140, 170, 255, 0.26);
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0.04));
+    box-shadow:
+      inset 3px 0 0 var(--accent),
+      inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  }
+
+  .seal,
+  .stamp {
+    border-color: rgba(190, 214, 255, 0.3);
+    background:
+      url("assets/arena-mark.svg") center / 23px 23px no-repeat,
+      radial-gradient(120% 100% at 24% 10%, rgba(220, 236, 255, 0.26), transparent 56%),
+      linear-gradient(154deg, #546fbe 0%, #1c3068 46%, #352f7c 80%, #4d449c 100%);
+    box-shadow:
+      0 10px 24px -14px rgba(0, 0, 0, 0.9),
+      inset 0 1px 0 rgba(255, 255, 255, 0.28),
+      inset 0 -10px 18px rgba(0, 0, 0, 0.5),
+      inset 0 0 0 1px rgba(190, 214, 255, 0.08);
+  }
+
+  .stamp {
+    background:
+      url("assets/arena-mark.svg") center / 20px 20px no-repeat,
+      radial-gradient(120% 100% at 24% 10%, rgba(220, 236, 255, 0.24), transparent 56%),
+      linear-gradient(154deg, #546fbe 0%, #1c3068 46%, #352f7c 80%, #4d449c 100%);
+  }
+
+  .home-hero::after {
+    filter: drop-shadow(0 20px 32px rgba(0, 0, 0, 0.5));
+  }
+
+  .topbar {
+    border-color: rgba(255, 255, 255, 0.14);
+    background: linear-gradient(180deg, rgba(22, 32, 56, 0.72), rgba(10, 16, 32, 0.5));
+    box-shadow:
+      0 24px 56px -30px rgba(0, 0, 0, 0.8),
+      inset 0 1px 0 rgba(255, 255, 255, 0.12),
+      inset 0 -1px 0 rgba(0, 0, 0, 0.45);
+  }
+}
+
+/* ------------------------------ 窄屏 ------------------------------ */
+
+/* 导航从左侧栏变成顶部卡片后，画面重心回到控件本身；徽记退场，
+ * 光场只留在玻璃后面，不再与主按钮争注意力。 */
+@media (max-width: 980px) {
+  .home-hero::after {
+    display: none;
+  }
+
+  body {
+    background-position: 62% 42%;
+  }
+}
+
+@media (max-width: 700px) {
+  body {
+    background-position: 70% 30%;
+    background-size: cover;
+  }
+
+  body::before {
+    background:
+      radial-gradient(70% 46% at 24% -8%, rgba(255, 255, 255, 0.86), transparent 70%);
+  }
+
+  .sidebar {
+    box-shadow:
+      0 22px 48px -32px rgba(19, 36, 82, 0.5),
+      inset 0 1px 0 rgba(255, 255, 255, 0.95),
+      inset 1px 0 0 rgba(255, 255, 255, 0.55),
+      inset -1px 0 0 rgba(86, 110, 162, 0.2),
+      inset 0 -1px 0 rgba(66, 92, 148, 0.14);
+  }
+}
+
+/* ------------------------------ 减少透明 ------------------------------ */
+
+/* 明示要求降低透明时，导航回到实色面，折射边只留一线。 */
+@media (prefers-reduced-transparency: reduce) {
+  body::after {
+    display: none;
+  }
+
+  .sidebar,
+  .topbar {
+    background: var(--surface-solid);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+
+  .sidebar::after {
+    display: none;
+  }
+
+  .sidebar::before {
+    opacity: 0.4;
+  }
+
+  .new-session,
+  .search input,
+  .history-item {
+    background: var(--surface-soft);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+
+  .home-hero::after {
+    filter: none;
+  }
+}
+
+/* ------------------------------ 高对比 ------------------------------ */
+
+@media (prefers-contrast: more) {
+  .sidebar,
+  .topbar {
+    background: var(--surface-solid);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+
+  .sidebar::before,
+  .sidebar::after {
+    display: none;
+  }
+
+  .home-hero::after {
+    filter: none;
+    opacity: 1;
+  }
+}
+
+/* ------------------------------ 减少动态 ------------------------------ */
+
+/* 本图层没有任何动画；显式关掉基础样式里残留的光晕漂移。 */
+@media (prefers-reduced-motion: reduce) {
+  body::before,
+  body::after {
+    animation: none;
+  }
+}

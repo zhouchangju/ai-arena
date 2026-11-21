@@ -122,7 +122,7 @@ function runtimeAvailable() {
 function callBackground(message) {
   return new Promise((resolve, reject) => {
     if (!runtimeAvailable()) {
-      reject(new Error('未检测到扩展后台。请从 Chrome 的扩展页打开本页。'));
+      reject(new Error('没有检测到扩展后台。请从 Chrome 扩展页打开本页，不要直接打开文件。'));
       return;
     }
 
@@ -186,10 +186,10 @@ function friendlyError(error, prefix = '') {
 function permissionErrorMessage(error) {
   const message = error && error.message ? error.message : String(error || '未知错误');
   if (/Only permissions specified in the manifest/i.test(message)) {
-    return '扩展尚未声明可选的网页权限（optional_host_permissions）。请更新扩展后重试。';
+    return '扩展没有声明可选的网页权限（optional_host_permissions）。更新扩展再试。';
   }
   if (/must be called during a user gesture/i.test(message)) {
-    return '浏览器要求由点击直接触发权限请求，请重新点击「保存本席」。';
+    return '浏览器要求点击时直接请求权限，请再点一次「保存本席」。';
   }
   return friendlyError(error, '无法请求网页权限');
 }
@@ -276,7 +276,7 @@ function parseLocalUrl(raw) {
 
   const host = url.hostname.toLowerCase();
   if (!LOCAL_HOSTS.has(host)) {
-    return { error: '只允许 127.0.0.1 或 localhost：请填写你本人控制的网页。', field: 'url' };
+    return { error: '只允许 127.0.0.1 或 localhost 的地址。填你本人控制的网页。', field: 'url' };
   }
 
   if (url.username || url.password) {
@@ -583,7 +583,7 @@ function updateOrigin(ui) {
   }
 
   delete ui.origin.dataset.state;
-  ui.origin.textContent = `实际来源 ${parsed.origin} · 权限范围 ${parsed.pattern}（不含端口）`;
+  ui.origin.textContent = `实际来源 ${parsed.origin}，权限范围 ${parsed.pattern}（不含端口）`;
 }
 
 function refreshStatus(seat) {
@@ -627,7 +627,7 @@ function showBackendNotice(detail) {
   backendNoticeEl.hidden = false;
   if (backendNoticeTextEl) {
     const note = detail ? `原因：${oneLine(detail, 120)}。` : '';
-    backendNoticeTextEl.textContent = `${note}你仍可以先填写表单，点击「保存本席」时会再次尝试。若持续失败，请重新加载扩展后再打开本页。`;
+    backendNoticeTextEl.textContent = `${note}可以先填表，保存时会再试。一直失败就重新加载扩展。`;
   }
 }
 
@@ -677,7 +677,7 @@ function restoreDrafts() {
     const snapshot = normalizeSnapshot(state.drafts[seat.key]);
     if (!FIELD_KEYS.some((key) => snapshot[key])) continue;
     applySnapshot(ui, snapshot);
-    setFeedback(ui, '已恢复本机草稿，尚未保存。', 'warn');
+    setFeedback(ui, '已恢复草稿，还没保存。', 'warn');
   }
 }
 
@@ -746,7 +746,7 @@ async function saveSeat(seat) {
 
   clearInvalid(ui);
   ui.saving = true;
-  setFeedback(ui, '正在请求该地址的访问权限…');
+  setFeedback(ui, '正在请求访问权限…');
 
   try {
     let granted = false;
@@ -758,7 +758,7 @@ async function saveSeat(seat) {
     }
 
     if (!granted) {
-      setFeedback(ui, `没有获得 ${result.origin} 的访问权限，配置未保存。允许后可以重试。`, 'warn');
+      setFeedback(ui, `没有拿到 ${result.origin} 的访问权限，配置没保存。允许后再试。`, 'warn');
       return;
     }
 
@@ -784,10 +784,10 @@ async function saveSeat(seat) {
       updateOrigin(ui);
       setFeedback(
         ui,
-        `已保存。实际来源 ${result.origin} · 权限 ${result.pattern}（不含端口）。`,
+        '已保存。',
         'ok',
       );
-      toast(`已保存${seat.label}的连接设置`);
+      toast(`已保存${seat.label}`);
       void refreshRuns();
     } catch (error) {
       setFeedback(ui, friendlyError(error, '保存失败'), 'error');
@@ -830,11 +830,11 @@ function fillSample() {
     clearInvalid(ui);
     updateOrigin(ui);
     refreshStatus(seat);
-    setFeedback(ui, '已填入固定样本。确认无误后点击「保存本席」。', 'warn');
+    setFeedback(ui, '已填入测试页。确认后点「保存本席」。', 'warn');
   }
 
   persistDrafts();
-  toast('已填入本机测试页配置（固定样本，不是 AI）');
+  toast('已填入测试页配置（不是 AI）');
   refs.get('a').save.focus();
 }
 
