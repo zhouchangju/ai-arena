@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "AI Arena 多 AI 辩论工作台",
+  "version": "0.1.0",
+  "description": "在本地工作台里，让两个已登录的网页版 AI 独立作答、互相质询、逐席确认，并生成带出处的讨论报告。",
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "打开 AI Arena 工作台"
+  },
+  "permissions": ["storage"],
+  "minimum_chrome_version": "102"
+}

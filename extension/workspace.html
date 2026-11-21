@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>判断台 · AI Arena</title>
+  <link rel="stylesheet" href="workspace.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar" aria-label="历史场次">
+      <div class="brand">
+        <span class="seal" aria-hidden="true">判</span>
+        <span class="brand-copy">
+          <span class="brand-title">判断台</span>
+          <span class="brand-sub">AI ARENA · 本地</span>
+        </span>
+      </div>
+
+      <button class="new-session" id="new-session" type="button">
+        <span class="new-session-mark" aria-hidden="true">＋</span>
+        <span>新的判断</span>
+      </button>
+
+      <div class="history-head">
+        <span>历史场次</span>
+        <span class="history-count" id="history-count">0</span>
+      </div>
+
+      <div class="search">
+        <input id="history-search" type="search" placeholder="查找问题" autocomplete="off" aria-label="查找历史场次">
+      </div>
+
+      <div class="history-list" id="history-list" aria-live="polite"></div>
+
+      <div class="sidebar-foot">
+        <p>记录保存在本机浏览器，导出后可离线阅读。</p>
+        <p>删除场次只影响本机记录，不改变各网站历史。</p>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div class="global-error" id="global-error" role="alert" hidden>
+        <div class="global-error-copy">
+          <strong>无法连接扩展后台</strong>
+          <p id="global-error-text">请重新加载扩展后再试。</p>
+        </div>
+        <button class="btn" id="global-error-retry" type="button">重试</button>
+      </div>
+      <div id="view"></div>
+    </main>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+  <noscript>这个工作台需要启用 JavaScript。</noscript>
+
+  <script type="module" src="workspace.js"></script>
+</body>
+</html>
