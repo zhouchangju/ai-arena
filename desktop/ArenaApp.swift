@@ -11,10 +11,8 @@
 //  以便登录；设置 ARENA_FIXTURE_BASE=http://127.0.0.1[:端口] 时由模型
 //  改用 SitePane.testPane 打开回环 /<provider> 页面。
 //
-//  --smoke-test（仅供夹具/回环环境）：
-//    ARENA_SMOKE_RESULT=<输出 JSON 路径> \
-//    ARENA_FIXTURE_BASE=http://127.0.0.1:<port> \
-//    ./ArenaApp --smoke-test
+//  回环验收由 tests/native_desktop_acceptance.py 创建独立的 QA 应用。
+//  仅 QA 身份接受 --smoke-test；正式应用在创建 WebView 前拒绝该入口。
 //  三窗真正加载完成后，用同一 model.start 发送合成问题；stage 变为
 //  done 时写出 session JSON 并退出（0）。超时或未就绪时写出诊断并退出
 //  （1 超时 / 2 缺结果路径 / 3 非回环夹具 / 4 三窗未就绪）。
@@ -62,6 +60,55 @@ struct SitePaneView: NSViewRepresentable {
 
     func updateNSView(_ nsView: WKWebView, context: Context) {
         // 保持原页滚动、图片与交互状态，不做重绘或重载。
+    }
+}
+
+// MARK: - 系统玻璃背景
+
+/// 原生 vibrancy 玻璃。用户开启“降低透明度”或系统不提供该材质时退回
+/// 不透明窗口底色，避免在辅助功能模式下出现低对比度文字。
+struct ArenaGlassSurface: View {
+    var material: NSVisualEffectView.Material = .underWindowBackground
+    var cornerRadius: CGFloat = 12
+
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    var body: some View {
+        if reduceTransparency {
+            fallback
+        } else if #available(macOS 13.0, *) {
+            ArenaVibrancyView(material: material)
+                .clipShape(shape)
+                .overlay(shape.fill(Color.primary.opacity(0.015)))
+        } else {
+            fallback
+        }
+    }
+
+    private var shape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+    }
+
+    private var fallback: some View {
+        shape.fill(Color(nsColor: .windowBackgroundColor))
+    }
+}
+
+/// 只负责一块视觉材质；不参与布局、不触达网页内容。
+fileprivate struct ArenaVibrancyView: NSViewRepresentable {
+    let material: NSVisualEffectView.Material
+
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = material
+        view.blendingMode = .withinWindow
+        view.state = .active
+        view.isEmphasized = false
+        return view
+    }
+
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
+        nsView.material = material
     }
 }
 
@@ -146,6 +193,10 @@ struct ArenaRootView: View {
     @State private var backfillText = ""
     @State private var backfillStance = ""
 
+    @FocusState private var questionFocused: Bool
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -153,7 +204,12 @@ struct ArenaRootView: View {
                 errorBanner(message)
             }
             if model.isRecovering && isRunning && !model.recoveryNotice.isEmpty {
-                Text(model.recoveryNotice).font(.caption).frame(maxWidth: .infinity, alignment: .leading).padding(6)
+                Text(model.recoveryNotice)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 5)
             }
             Divider()
             seatArea
@@ -163,6 +219,9 @@ struct ArenaRootView: View {
             model.prepareHome()
             if model.isRecovering && model.stageKey == "done" && !SmokeRunner.isEnabled {
                 presentDetails(provider: nil, tab: .report)
+            }
+            if !hasStarted {
+                questionFocused = true
             }
             SmokeRunner.shared.begin(model: model)
         }
@@ -182,163 +241,126 @@ struct ArenaRootView: View {
         }
     }
 
-    // MARK: 顶部工具区（两行，尽量不挤占原页）
+    // MARK: 顶部工作台（系统玻璃质感；开始前大输入框，开始后只读题面）
 
     private var header: some View {
-        VStack(spacing: 5) {
-            HStack(spacing: 8) {
-                Image(systemName: "bubble.left.and.bubble.right.fill")
-                    .font(.system(size: 13))
-                    .foregroundStyle(Color.accentColor)
-
-                TextField("向所有席位提出一个问题…", text: $model.question, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .lineLimit(1...2)
-                    .font(.system(size: 12.5))
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 3)
-                    .background(
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(Color.primary.opacity(0.06))
-                    )
-                    .onSubmit(startDiscussion)
-
-                seatChips
+        VStack(alignment: .leading, spacing: hasStarted ? 9 : 11) {
+            titleRow
+            if hasStarted {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 14) {
+                        lockedQuestionBar.frame(minWidth: 285)
+                        actionBar.fixedSize(horizontal: true, vertical: false)
+                    }
+                    VStack(spacing: 8) { lockedQuestionBar; actionBar }
+                }
+            } else {
+                composerCard
             }
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 12)
+        .padding(.bottom, 11)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            ArenaGlassSurface(material: .headerView, cornerRadius: 0)
+        )
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(Color.primary.opacity(0.08))
+                .frame(height: 1)
+        }
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.22), value: hasStarted)
+    }
 
+    private var titleRow: some View {
+        HStack(alignment: .center, spacing: 11) {
+            Image(nsImage: NSApp.applicationIconImage)
+                .resizable()
+                .frame(width: 34, height: 34)
+                .accessibilityHidden(true)
+            Text("AI Arena")
+                .font(.system(size: 17, weight: .semibold, design: .rounded))
+                .layoutPriority(1)
+
+            Spacer(minLength: 10)
+
+            ViewThatFits(in: .horizontal) {
+                headerActions(compact: false)
+                headerActions(compact: true)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func headerActions(compact: Bool) -> some View {
+        HStack(spacing: 8) {
+            historyMenu(compact: compact)
+            if compact {
+                iconToolButton("查看当前提示、历史原文、报告与原始记录", icon: "sidebar.right") {
+                    presentDetails(provider: nil, tab: .prompts)
+                }
+                .disabled(model.session == nil)
+                iconToolButton("以 Markdown 保存本场记录", icon: "square.and.arrow.up") {
+                    ArenaExporter.export(model: model)
+                }
+                .disabled(model.session == nil)
+            } else {
+                toolButton("详情", icon: "sidebar.right") {
+                    presentDetails(provider: nil, tab: .prompts)
+                }
+                .disabled(model.session == nil)
+                .help("查看当前提示、历史原文、报告与原始记录")
+                toolButton("导出", icon: "square.and.arrow.up") {
+                    ArenaExporter.export(model: model)
+                }
+                .disabled(model.session == nil)
+                .help("以 Markdown 保存本场记录")
+            }
+        }
+    }
+
+    private func toolButton(
+        _ title: String,
+        icon: String? = nil,
+        large: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
             HStack(spacing: 6) {
-                stagePill
-                HStack(spacing: 3) {
-                    Text("轮数")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                    Picker("", selection: $roundLimit) {
-                        ForEach(1...5, id: \.self) { value in
-                            Text("\(value)").tag(value)
-                        }
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
-                    .controlSize(.small)
-                    .fixedSize()
-                    .disabled(model.session != nil)
-                    .help("新场次最多讨论轮数（含首轮独立作答、互评、候选与表态，默认 3）")
+                if let icon {
+                    Image(systemName: icon)
+                        .font(.system(size: large ? 12.5 : 11.5, weight: .semibold))
                 }
-                Spacer(minLength: 6)
-                Button("开始", action: startDiscussion)
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .font(.system(size: 11, weight: .semibold))
-                    .keyboardShortcut(.return, modifiers: .command)
-                    .disabled(!canStart)
-                    .help("向所选席位发送同一个问题")
-                Button(isPaused ? "继续" : "暂停", action: pauseOrResume)
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .font(.system(size: 11))
-                    .disabled(!isRunning)
-                    .help(isPaused ? "继续派发后续轮次" : "暂停后续派发，保留当前进度")
-                Button("结束", action: finishDiscussion)
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .font(.system(size: 11))
-                    .disabled(!isRunning)
-                    .help("结束本轮讨论并保留已保存内容")
-                Button("新建", action: newDiscussion)
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .font(.system(size: 11))
-                    .help("清空当前场次，开始新的问题")
-                historyMenu
-                Button("详情", action: { presentDetails(provider: nil, tab: .prompts) })
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .font(.system(size: 11))
-                    .disabled(model.session == nil)
-                    .help("查看当前提示、历史原文、报告与原始记录")
-                Button("导出", action: { ArenaExporter.export(model: model) })
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .font(.system(size: 11))
-                    .disabled(model.session == nil)
-                    .help("以 Markdown 保存本场记录")
+                Text(title)
+                    .font(.system(size: large ? 14 : 13, weight: .medium))
             }
+            .padding(.horizontal, 2)
+            .frame(minHeight: large ? 32 : 28)
+            .contentShape(Rectangle())
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 7)
-        .background(.regularMaterial)
+        .buttonStyle(.bordered)
+        .controlSize(large ? .large : .regular)
     }
 
-    private var seatChips: some View {
-        HStack(spacing: 4) {
-            ForEach(ArenaSeatCatalog.ordered, id: \.self) { provider in
-                let selected = selectedProviders.contains(provider)
-                Button {
-                    toggleSeat(provider)
-                } label: {
-                    HStack(spacing: 3) {
-                        Image(systemName: selected ? "checkmark.circle.fill" : "circle")
-                            .font(.system(size: 9.5))
-                        Text(ArenaSeatCatalog.name(provider))
-                            .font(.system(size: 10.5, weight: .medium))
-                    }
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 3)
-                    .background(
-                        Capsule().fill(
-                            selected
-                                ? Color.accentColor.opacity(0.16)
-                                : Color.primary.opacity(0.05)
-                        )
-                    )
-                    .foregroundStyle(selected ? Color.accentColor : Color.secondary)
-                }
-                .buttonStyle(.plain)
-                .disabled(isRunning)
-                .help(selected ? "本场参与：\(ArenaSeatCatalog.name(provider))" : "点击加入本场")
-            }
+    private func iconToolButton(
+        _ help: String,
+        icon: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 12.5, weight: .medium))
+                .frame(width: 30, height: 24)
+                .contentShape(Rectangle())
         }
-        .fixedSize()
+        .buttonStyle(.bordered)
+        .controlSize(.regular)
+        .help(help)
+        .accessibilityLabel(help)
     }
 
-    private var stagePill: some View {
-        HStack(spacing: 5) {
-            Circle()
-                .fill(isRunning ? Color.green : Color.secondary.opacity(0.5))
-                .frame(width: 6, height: 6)
-            Text(stageText)
-                .font(.system(size: 10.5))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-        }
-        .fixedSize()
-    }
-
-    private func errorBanner(_ message: String) -> some View {
-        HStack(spacing: 6) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 10))
-                .foregroundStyle(Color.orange)
-            Text(message)
-                .font(.system(size: 11))
-                .foregroundStyle(.primary)
-                .lineLimit(2)
-            Spacer(minLength: 4)
-            Button {
-                model.errorMessage = ""
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.system(size: 9))
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 4)
-        .background(Color.orange.opacity(0.10))
-    }
-
-    private var historyMenu: some View {
+    private func historyMenu(compact: Bool) -> some View {
         Menu {
             if model.historyList.isEmpty {
                 Button("暂无历史") {}.disabled(true)
@@ -350,13 +372,304 @@ struct ArenaRootView: View {
                 }
             }
         } label: {
-            Label("历史", systemImage: "clock.arrow.circlepath")
-                .font(.system(size: 11))
+            Group {
+                if compact {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .font(.system(size: 12.5, weight: .medium))
+                        .frame(width: 30, height: 26)
+                } else {
+                    Label("历史", systemImage: "clock.arrow.circlepath")
+                        .font(.system(size: 12.5, weight: .medium))
+                        .padding(.horizontal, 9)
+                        .frame(minHeight: 26)
+                }
+            }
+            .contentShape(Rectangle())
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(Color.primary.opacity(0.06))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.09))
+            )
         }
         .menuStyle(.borderlessButton)
-        .controlSize(.small)
+        .menuIndicator(.hidden)
         .fixedSize()
         .help("打开已保存的场次")
+        .accessibilityLabel("历史场次")
+    }
+
+    // MARK: 开始前：大号多行问题输入
+
+    private var composerCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 3)
+                    .accessibilityHidden(true)
+
+                TextField(
+                    "你想让它们讨论什么？",
+                    text: $model.question,
+                    axis: .vertical
+                )
+                .textFieldStyle(.plain)
+                .font(.system(size: 15))
+                .lineLimit(3...7)
+                .focused($questionFocused)
+                .accessibilityLabel("讨论问题")
+                .help("⌘↩ 开始讨论")
+
+                if model.question.trimmedNonEmpty != nil {
+                    Button {
+                        model.question = ""
+                        questionFocused = true
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 14))
+                            .foregroundStyle(.tertiary)
+                            .frame(width: 26, height: 26)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("清空问题")
+                    .accessibilityLabel("清空问题")
+                }
+            }
+            .padding(.bottom, 2)
+
+            Divider().opacity(0.45)
+
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 12) {
+                    seatChips
+                    roundPicker
+                    Spacer(minLength: 8)
+                    startButton
+                }
+                VStack(alignment: .leading, spacing: 9) {
+                    HStack(spacing: 12) {
+                        seatChips
+                        roundPicker
+                    }
+                    HStack(spacing: 8) {
+                        Spacer(minLength: 0)
+                        startButton
+                    }
+                }
+            }
+        }
+        .padding(14)
+        .background(ArenaGlassSurface(material: .underWindowBackground, cornerRadius: 16))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(
+                    questionFocused
+                        ? Color.accentColor.opacity(0.55)
+                        : Color.primary.opacity(0.09),
+                    lineWidth: questionFocused ? 1.4 : 1
+                )
+        )
+        .shadow(color: .black.opacity(reduceTransparency ? 0 : 0.05), radius: 8, y: 2)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: questionFocused)
+    }
+
+    private var seatChips: some View {
+        HStack(spacing: 6) {
+            ForEach(ArenaSeatCatalog.ordered, id: \.self) { provider in
+                let selected = selectedProviders.contains(provider)
+                Button {
+                    toggleSeat(provider)
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                            .font(.system(size: 11, weight: .semibold))
+                        Text(ArenaSeatCatalog.name(provider))
+                            .font(.system(size: 13, weight: .medium))
+                    }
+                    .padding(.horizontal, 10)
+                    .frame(minHeight: 32)
+                    .contentShape(Capsule())
+                    .background(
+                        Capsule().fill(
+                            selected
+                                ? Color.accentColor.opacity(0.16)
+                                : Color.primary.opacity(0.06)
+                        )
+                    )
+                    .overlay(
+                        Capsule().strokeBorder(
+                            selected
+                                ? Color.accentColor.opacity(0.28)
+                                : Color.primary.opacity(0.08)
+                        )
+                    )
+                    .foregroundStyle(selected ? Color.accentColor : Color.secondary)
+                }
+                .buttonStyle(.plain)
+                .disabled(isRunning)
+                .help(selected ? "本场参与：\(ArenaSeatCatalog.name(provider))" : "点击加入本场")
+                .accessibilityLabel("\(ArenaSeatCatalog.name(provider))，\(selected ? "已选择" : "未选择")")
+            }
+        }
+        .fixedSize()
+    }
+
+    private var roundPicker: some View {
+        HStack(spacing: 5) {
+            Text("轮数")
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(.secondary)
+            Picker("", selection: $roundLimit) {
+                ForEach(1...5, id: \.self) { value in
+                    Text("\(value)").tag(value)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .controlSize(.regular)
+            .fixedSize()
+            .disabled(model.session != nil)
+            .help("新场次最多讨论轮数（含首轮独立作答、互评、候选与表态，默认 3）")
+        }
+        .fixedSize()
+    }
+
+    private var startButton: some View {
+        Button(action: startDiscussion) {
+            Label("开始讨论", systemImage: "paperplane.fill")
+                .font(.system(size: 15, weight: .semibold))
+                .padding(.horizontal, 8)
+                .frame(minHeight: 32)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderedProminent)
+        .controlSize(.large)
+        .keyboardShortcut(.return, modifiers: .command)
+        .disabled(!canStart)
+        .help("向所选席位发送同一个问题（⌘↩）")
+    }
+
+    // MARK: 开始后：紧凑只读题面与操作条
+
+    private var lockedQuestion: String {
+        (model.session?["question"] as? String)?.trimmedNonEmpty
+            ?? model.question.trimmedNonEmpty
+            ?? "（未记录题面）"
+    }
+
+    private var lockedQuestionBar: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "lock.fill")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .padding(.top, 2)
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("本场问题")
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Text(lockedQuestion)
+                    .font(.system(size: 13.5))
+                    .lineLimit(2)
+                    .textSelection(.enabled)
+                    .help(lockedQuestion)
+                    .accessibilityLabel("本场问题：\(lockedQuestion)")
+            }
+
+            Spacer(minLength: 8)
+
+            Button {
+                arenaCopyToPasteboard(lockedQuestion)
+            } label: {
+                Image(systemName: "doc.on.doc")
+                    .font(.system(size: 12))
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+            .help("复制本场问题")
+            .accessibilityLabel("复制本场问题")
+        }
+        .padding(.horizontal, 13)
+        .padding(.vertical, 9)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(ArenaGlassSurface(material: .underWindowBackground, cornerRadius: 12))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.09))
+        )
+    }
+
+    private var actionBar: some View {
+        HStack(spacing: 8) {
+            stagePill
+            Spacer(minLength: 8)
+            toolButton(
+                isPaused ? "继续" : "暂停",
+                icon: isPaused ? "play.fill" : "pause.fill",
+                large: true,
+                action: pauseOrResume
+            )
+            .disabled(!isRunning)
+            .help(isPaused ? "继续派发后续轮次" : "暂停后续派发，保留当前进度")
+            toolButton("结束", icon: "stop.fill", large: true, action: finishDiscussion)
+                .disabled(!isRunning)
+                .help("结束本轮讨论并保留已保存内容")
+            toolButton("新建", icon: "square.and.pencil", large: true, action: newDiscussion)
+                .help("清空当前场次，开始新的问题")
+        }
+    }
+
+    private var stagePill: some View {
+        HStack(spacing: 7) {
+            Circle()
+                .fill(isRunning ? Color.green : Color.secondary.opacity(0.55))
+                .frame(width: 8, height: 8)
+                .shadow(color: isRunning ? Color.green.opacity(0.6) : .clear, radius: 3)
+            Text(stageText)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 10)
+        .frame(minHeight: 26)
+        .background(Capsule().fill(Color.primary.opacity(0.055)))
+        .fixedSize()
+    }
+
+    private func errorBanner(_ message: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 12))
+                .foregroundStyle(Color.orange)
+            Text(message)
+                .font(.system(size: 12))
+                .foregroundStyle(.primary)
+                .lineLimit(2)
+            Spacer(minLength: 6)
+            Button {
+                model.errorMessage = ""
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 11, weight: .medium))
+                    .frame(width: 24, height: 24)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("关闭提示")
+            .accessibilityLabel("关闭提示")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(Color.orange.opacity(0.10))
     }
 
     // MARK: 席位区
@@ -367,7 +680,10 @@ struct ArenaRootView: View {
             if model.isReadOnly, let saved = model.session {
                 ScrollView {
                     Text((saved["report"] as? String) ?? "该场次尚未生成报告，可在详情中查阅已保存的发言。")
-                        .textSelection(.enabled).padding().frame(maxWidth: .infinity, alignment: .leading)
+                        .font(.system(size: 13))
+                        .textSelection(.enabled)
+                        .padding(16)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
             } else if providers.isEmpty {
                 VStack(spacing: 8) {
@@ -380,9 +696,9 @@ struct ArenaRootView: View {
             } else {
                 let columns = columnCount(for: providers.count, width: geometry.size.width)
                 let rows = rowsOf(providers, columns: columns)
-                VStack(spacing: 6) {
+                VStack(spacing: 8) {
                     ForEach(rows.indices, id: \.self) { rowIndex in
-                        HStack(spacing: 6) {
+                        HStack(spacing: 8) {
                             ForEach(rows[rowIndex], id: \.self) { provider in
                                 seatCard(provider)
                                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -397,7 +713,7 @@ struct ArenaRootView: View {
                 }
             }
         }
-        .padding(8)
+        .padding(10)
     }
 
     @ViewBuilder
@@ -423,14 +739,15 @@ struct ArenaRootView: View {
         } else {
             VStack(spacing: 6) {
                 Image(systemName: "rectangle.on.rectangle.slash")
+                    .font(.system(size: 16))
                     .foregroundStyle(.secondary)
                 Text("尚未挂载 \(ArenaSeatCatalog.name(provider))")
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                     .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color.primary.opacity(0.03))
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
     }
 
@@ -440,49 +757,49 @@ struct ArenaRootView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text("文本补录 · \(ArenaSeatCatalog.name(provider))")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: 15, weight: .semibold))
                 Spacer()
                 Button("取消") { backfillRequest = nil }
                     .keyboardShortcut(.cancelAction)
             }
             Text("仅保存本席这一轮的原文；其他席继续运行。")
-                .font(.system(size: 11))
+                .font(.system(size: 12))
                 .foregroundStyle(.secondary)
 
             if let target = backfillTarget {
                 Text("已固定为 \(ArenaStageNames.label(target.stage)) · 第 \(target.round) 轮\(target.version.map { " · 候选 v\($0)" } ?? "")。保存时若本轮已变化，草稿会保留并报错。")
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                     .foregroundStyle(.secondary)
             } else {
                 Text("本席当前没有待处理任务；草稿不会贴入下一轮。请关闭后等本轮出现待答再录入。")
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                     .foregroundStyle(.orange)
             }
 
             if let message = backfillError.trimmedNonEmpty {
                 Text(message)
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
             TextEditor(text: $backfillText)
-                .font(.system(size: 12))
+                .font(.system(size: 13))
                 .scrollContentBackground(.hidden)
-                .padding(6)
+                .padding(7)
                 .background(
-                    RoundedRectangle(cornerRadius: 6)
+                    RoundedRectangle(cornerRadius: 7)
                         .fill(Color(nsColor: .textBackgroundColor))
                 )
                 .overlay(
-                    RoundedRectangle(cornerRadius: 6)
+                    RoundedRectangle(cornerRadius: 7)
                         .strokeBorder(Color.primary.opacity(0.12))
                 )
                 .frame(minHeight: 220)
 
             HStack(spacing: 8) {
                 Text("表态")
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                 Picker("", selection: $backfillStance) {
                     Text("未指定").tag("")
@@ -498,6 +815,7 @@ struct ArenaRootView: View {
                     submitBackfill(provider)
                 }
                 .buttonStyle(.borderedProminent)
+                .controlSize(.large)
                 .disabled(backfillText.trimmedNonEmpty == nil || backfillTarget == nil)
             }
         }
@@ -538,6 +856,7 @@ struct ArenaRootView: View {
         backfillStance = ""
         model.newDiscussion()
         model.prepareHome()
+        DispatchQueue.main.async { questionFocused = true }
     }
 
     private func takeOver(_ provider: String) {
@@ -723,35 +1042,43 @@ struct ArenaSeatCard: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 5) {
+            HStack(spacing: 8) {
                 Circle()
                     .fill(statusColor)
-                    .frame(width: 6.5, height: 6.5)
+                    .frame(width: 8, height: 8)
+                    .shadow(color: statusColor.opacity(0.45), radius: 3)
                 Text(ArenaSeatCatalog.name(provider))
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.system(size: 13, weight: .semibold))
+                    .lineLimit(1)
                 Text(statusText)
-                    .font(.system(size: 10))
+                    .font(.system(size: 11.5, weight: .medium))
                     .foregroundStyle(statusColor)
                     .lineLimit(1)
                     .truncationMode(.tail)
-                    .frame(maxWidth: 165, alignment: .leading)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(Capsule().fill(statusColor.opacity(0.12)))
+                    .frame(maxWidth: 190, alignment: .leading)
                     .help(statusText)
                 if !isParticipant && hasStarted {
                     Text("未参与")
-                        .font(.system(size: 9))
+                        .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
                 }
-                Spacer(minLength: 2)
+                Spacer(minLength: 4)
                 Button(action: onPrompt) {
                     Image(systemName: "text.bubble")
-                        .font(.system(size: 10.5))
+                        .font(.system(size: 12.5, weight: .medium))
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.borderless)
                 .help("查看本席当前真正提示")
+                .accessibilityLabel("查看本席当前提示")
                 menu
             }
-            .padding(.horizontal, 7)
-            .frame(height: 25)
+            .padding(.horizontal, 9)
+            .frame(height: 36)
             .background(Color.primary.opacity(0.035))
 
             Divider()
@@ -764,11 +1091,14 @@ struct ArenaSeatCard: View {
             }
         }
         .background(Color(nsColor: .textBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.09))
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.10))
         )
+        .shadow(color: .black.opacity(0.07), radius: 5, y: 2)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(ArenaSeatCatalog.name(provider)) 席位")
     }
 
     private var menu: some View {
@@ -786,38 +1116,41 @@ struct ArenaSeatCard: View {
             .disabled(!canManage)
         } label: {
             Image(systemName: "ellipsis.circle")
-                .font(.system(size: 10.5))
+                .font(.system(size: 14, weight: .medium))
+                .frame(width: 28, height: 28)
+                .contentShape(Rectangle())
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
-        .frame(width: 18)
+        .frame(width: 28)
         .help("本席操作：回首页（未开始或已接管时）、接管、补录、跳过")
+        .accessibilityLabel("本席操作")
     }
 
     private var placeholder: some View {
-        VStack(spacing: 7) {
+        VStack(spacing: 9) {
             if let openError {
                 Image(systemName: "wifi.exclamationmark")
-                    .font(.system(size: 16))
+                    .font(.system(size: 18))
                     .foregroundStyle(Color.orange)
                 Text(openError)
-                    .font(.system(size: 10.5))
+                    .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .lineLimit(3)
                     .padding(.horizontal, 18)
                 Button("重试") { pane.openHome() }
-                    .buttonStyle(.link)
-                    .font(.system(size: 11))
+                    .buttonStyle(.bordered)
+                    .controlSize(.regular)
             } else {
                 ProgressView().controlSize(.small)
                 Text("正在打开 \(ArenaSeatCatalog.name(provider)) 原页…")
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                 if hasStarted {
                     // 页面加载期间不遮断模型自动派发，仅提示可交互状态。
                     Text("页面打开后可直接在原站查看与操作")
-                        .font(.system(size: 10))
+                        .font(.system(size: 11))
                         .foregroundStyle(.tertiary)
                 }
             }
@@ -1075,7 +1408,7 @@ struct ArenaDetailsSheet: View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
                 Text("本场详情")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: 15, weight: .semibold))
                 Picker("", selection: $tab) {
                     ForEach(ArenaInspectorTab.allCases) { item in
                         Text(item.label).tag(item)
@@ -1083,16 +1416,16 @@ struct ArenaDetailsSheet: View {
                 }
                 .labelsHidden()
                 .pickerStyle(.segmented)
-                .frame(width: 340)
+                .frame(width: 360)
                 .onChange(of: tab) { newValue in
                     if newValue == .prompts { normalizePromptProvider() }
                 }
                 Spacer()
                 Button("导出 Markdown") { ArenaExporter.export(model: model) }
-                    .controlSize(.small)
+                    .controlSize(.regular)
                     .disabled(model.session == nil)
                 Button("关闭") { dismiss() }
-                    .controlSize(.small)
+                    .controlSize(.regular)
                     .keyboardShortcut(.cancelAction)
             }
             .padding(.horizontal, 12)
@@ -1140,29 +1473,29 @@ struct ArenaDetailsSheet: View {
                         arenaCopyToPasteboard(text)
                     }
                 }
-                .controlSize(.small)
+                .controlSize(.regular)
                 .disabled(currentPromptText == nil)
             }
 
             if let task = ArenaSessionDigest.currentTask(model.session, provider: promptProvider) {
                 Text("本席这一轮 · \(ArenaStageNames.label(task.stage)) · 第 \(task.round) 轮"
                     + (task.sourceId.isEmpty ? "" : " · \(task.sourceId)"))
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                     .foregroundStyle(.secondary)
             } else {
                 Text("本席当前没有进行中的提示；下面显示最近一次记录。")
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                     .foregroundStyle(.secondary)
             }
 
             ScrollView {
                 Text(currentPromptText ?? "暂无提示记录")
-                    .font(.system(size: 12.5))
+                    .font(.system(size: 13))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(10)
+                    .padding(11)
                     .background(
-                        RoundedRectangle(cornerRadius: 7)
+                        RoundedRectangle(cornerRadius: 8)
                             .fill(Color.primary.opacity(0.045))
                     )
             }
@@ -1209,18 +1542,18 @@ struct ArenaDetailsSheet: View {
                     HStack {
                         if let reason = ArenaSessionDigest.stopReason(model.session) {
                             Text("停止原因：\(reason)")
-                                .font(.system(size: 11))
+                                .font(.system(size: 12))
                                 .foregroundStyle(.secondary)
                         }
                         Spacer()
                         Button("复制报告") { arenaCopyToPasteboard(report) }
-                            .controlSize(.small)
+                            .controlSize(.regular)
                     }
                     .padding(.horizontal, 12)
                     .padding(.top, 8)
                     ScrollView {
                         Text(report)
-                            .font(.system(size: 12.5))
+                            .font(.system(size: 13))
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(12)
@@ -1242,13 +1575,13 @@ struct ArenaDetailsSheet: View {
         VStack(spacing: 0) {
             HStack {
                 Text("会话原始数据（只读）")
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button("复制 JSON") {
                     arenaCopyToPasteboard(ArenaJSON.string(model.session))
                 }
-                .controlSize(.small)
+                .controlSize(.regular)
             }
             .padding(.horizontal, 12)
             .padding(.top, 8)
@@ -1268,7 +1601,7 @@ struct ArenaDetailsSheet: View {
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(.secondary)
             Text(text.isEmpty ? "（空）" : text)
-                .font(.system(size: 12))
+                .font(.system(size: 13))
                 .foregroundStyle(dim ? Color.secondary : Color.primary)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -1281,7 +1614,7 @@ struct ArenaDetailsSheet: View {
                 .font(.system(size: 18))
                 .foregroundStyle(.secondary)
             Text(text)
-                .font(.system(size: 12))
+                .font(.system(size: 12.5))
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1301,20 +1634,20 @@ struct ArenaAnswerDisclosure: View {
         } label: {
             HStack(spacing: 6) {
                 Text("第 \(row.round) 轮 · \(ArenaStageNames.label(row.stage))")
-                    .font(.system(size: 11.5, weight: .medium))
+                    .font(.system(size: 12.5, weight: .medium))
                 Text(ArenaSeatCatalog.name(row.provider))
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                 if !row.sourceId.isEmpty {
                     Text(row.sourceId)
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(.tertiary)
                 }
                 Spacer()
                 Button("复制原文") {
                     if let text = row.answer { arenaCopyToPasteboard(text) }
                 }
-                .controlSize(.mini)
+                .controlSize(.small)
                 .buttonStyle(.borderless)
             }
         }
@@ -1326,7 +1659,7 @@ struct ArenaAnswerDisclosure: View {
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(.secondary)
             Text(text.isEmpty ? "（空）" : text)
-                .font(.system(size: 12))
+                .font(.system(size: 13))
                 .foregroundStyle(dim ? Color.secondary : Color.primary)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -1504,8 +1837,17 @@ final class SmokeRunner {
     // MARK: 预检（在创建窗口和网页之前）
 
     static func preflight() {
-        guard isEnabled else { return }
         let environment = ProcessInfo.processInfo.environment
+        if ArenaBuildIsolation.isQABuild {
+            guard isEnabled, environment["ARENA_DATA_DIR"]?.trimmedNonEmpty != nil else {
+                Self.writeStderr("[qa] Start this copy through the native acceptance harness.")
+                exit(2)
+            }
+        } else if isEnabled || environment["ARENA_FIXTURE_BASE"]?.trimmedNonEmpty != nil {
+            Self.writeStderr("[qa] Use tests/native_desktop_acceptance.py to run a separate fixture app.")
+            exit(2)
+        }
+        guard isEnabled else { return }
         guard let resultPath = environment["ARENA_SMOKE_RESULT"]?.trimmedNonEmpty else {
             Self.writeStderr("[smoke] ARENA_SMOKE_RESULT is required")
             exit(2)

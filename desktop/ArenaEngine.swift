@@ -26,6 +26,25 @@ struct ArenaEngineError: LocalizedError {
     var errorDescription: String? { message }
 }
 
+// MARK: - Build isolation
+
+/// The packaged app keeps the personal profile (`local.ai-arena.desktop`).
+///
+/// Local regression tests stage a disposable, re-signed copy under the QA
+/// identifier. That copy must never read the live history or reach a consumer
+/// site: WebKit storage follows the bundle identifier, and the default store
+/// directory is the separate "AI Arena QA" folder. Only explicit loopback
+/// fixtures may load pages in a QA build.
+enum ArenaBuildIsolation {
+    /// Kept in sync with `QA_BUNDLE_ID` in `tests/qa_app.py`.
+    static let qaBundleIdentifier = "local.ai-arena.desktop.qa"
+    static let qaSupportDirectoryName = "AI Arena QA"
+
+    static var isQABuild: Bool {
+        Bundle.main.bundleIdentifier == qaBundleIdentifier
+    }
+}
+
 // MARK: - Site configuration
 
 /// One seat's web adapter, normalised from `sites.json`.
@@ -126,7 +145,10 @@ final class ArenaSessionStore {
                 for: .applicationSupportDirectory,
                 in: .userDomainMask
             ).first ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            directory = base.appendingPathComponent("AI Arena", isDirectory: true)
+            let name = ArenaBuildIsolation.isQABuild
+                ? ArenaBuildIsolation.qaSupportDirectoryName
+                : "AI Arena"
+            directory = base.appendingPathComponent(name, isDirectory: true)
         }
         self.root = directory
         do {
@@ -550,6 +572,13 @@ final class ArenaEngine {
                 sitesFailure = message.message
                 return
             }
+        }
+
+        // 验收副本只用于回环夹具。普通双击打开时既不加载真实站点，也读不到
+        // 本机个人历史（存储目录已在 ArenaSessionStore 中分开）。
+        if ArenaBuildIsolation.isQABuild, fixtureBase == nil {
+            sitesFailure = "这是 AI Arena QA 验收副本：只连接 http://127.0.0.1 回环夹具，不加载真实站点或本机历史。"
+            return
         }
 
         guard let url = ArenaResource.url(

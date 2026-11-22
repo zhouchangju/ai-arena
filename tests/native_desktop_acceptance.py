@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from public_automation_acceptance import PROVIDERS, markup
+from qa_app import QA_BUNDLE_ID, stage_qa_app
 
 
 def main():
@@ -23,7 +24,8 @@ def main():
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=True)
     events = []
-    cookie = "arena_native_" + uuid.uuid4().hex + "=1"
+    cookie_name = "arena_native_" + uuid.uuid4().hex
+    cookie = cookie_name + "=1"
     restoring = threading.Event()
     restored_sites = set()
     lock = threading.Lock()
@@ -87,14 +89,18 @@ def main():
     if result.exists():
         raise FileExistsError(f"Choose a fresh evidence directory: {out}")
     try:
-        with tempfile.TemporaryDirectory() as data_dir:
+        with stage_qa_app(args.app, out / "qa-app") as qa, tempfile.TemporaryDirectory() as data_dir:
+            print(
+                "QA launch: %s (%s, %s); source build left untouched"
+                % (qa.app, qa.version, "ad hoc")
+            )
             env = {
                 **os.environ,
                 "ARENA_FIXTURE_BASE": f"http://127.0.0.1:{server.server_port}",
                 "ARENA_DATA_DIR": data_dir,
                 "ARENA_SMOKE_RESULT": str(result),
             }
-            executable = args.app / "Contents/MacOS/AIArena"
+            executable = qa.executable
             with (out / "app.log").open("w") as log:
                 flags = ["--smoke-test"] + (["--smoke-takeover"] if args.takeover else [])
                 proc = subprocess.Popen([executable, *flags], env=env, stdout=log, stderr=log)
@@ -115,6 +121,10 @@ def main():
                 )
                 assert json.loads(restored.read_text()) == json.loads(result.read_text())
                 assert restored_sites == set(PROVIDERS), restored_sites
+                (out / "qa-isolation.json").write_text(json.dumps({
+                    "bundleIdentifier": QA_BUNDLE_ID,
+                    "cookiesReceivedAfterRestart": sorted(restored_sites),
+                }, indent=2))
     finally:
         server.shutdown()
         server.server_close()
@@ -138,7 +148,7 @@ def main():
     assert len({x["proposalDigest"] for x in history if x["stage"] == "vote"}) == 1
     assert session["report"] in (out / "export.md").read_text()
     assert all(row["prompt"] in (out / "export.md").read_text() for row in history)
-    print(f"PASS: 3 provider views; {len(events)//2} exactly matched automatic sends and replies; same-version votes, restore, session cookie and Markdown; takeover={args.takeover}")
+    print(f"PASS: 3 provider views; {len(events)//2} exactly matched automatic sends and replies; same-version votes, restore, QA-isolated session cookie persisted across both launches and Markdown; takeover={args.takeover}")
 
 
 if __name__ == "__main__":

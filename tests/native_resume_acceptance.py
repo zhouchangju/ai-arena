@@ -31,8 +31,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from public_automation_acceptance import PROVIDERS, markup
-
-ROOT = Path(__file__).resolve().parents[1]
+from qa_app import stage_qa_app
 
 
 def normalize(text):
@@ -121,7 +120,12 @@ def main():
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    executable = args.app / "Contents/MacOS/AIArena"
+    qa = stage_qa_app(args.app, out / "qa-app")
+    print(
+        "QA launch: %s (%s, %s); source build left untouched"
+        % (qa.app, qa.version, "ad hoc")
+    )
+    executable = qa.executable
     base_env = {
         **os.environ,
         "ARENA_FIXTURE_BASE": f"http://127.0.0.1:{server.server_port}",
@@ -356,6 +360,7 @@ def main():
         (out / "observed.json").write_text(
             json.dumps(events, ensure_ascii=False, indent=2)
         )
+        qa.cleanup()
         server.shutdown()
         server.server_close()
 
