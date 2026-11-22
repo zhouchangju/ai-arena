@@ -43,7 +43,7 @@
  * even when every seat clicked agree.
  */
 
-import { AUTOMATION_PROVIDER_IDS } from './providers.js';
+import { LOCAL_AUTOMATION_PROVIDER_IDS, PUBLIC_AUTOMATION_PROVIDER_IDS } from './providers.js';
 
 const STANCES = ['agree', 'conditional', 'oppose'];
 const PROVIDER_ID_RE = /^[a-z0-9]+(?:[-_][a-z0-9]+)*$/;
@@ -66,7 +66,13 @@ export const MAX_SEATS = 3;
 // the round completes, its prompts are frozen and a correction would silently
 // change material another seat already received.
 const CORRECTABLE_STAGES = new Set(['independent', 'critique']);
-const AUTOMATION_SEATS = new Set(AUTOMATION_PROVIDER_IDS);
+const LOCAL_AUTOMATION_SEATS = new Set(LOCAL_AUTOMATION_PROVIDER_IDS);
+export const PUBLIC_WEB_VOTE_FORMAT = [
+  '',
+  '',
+  '【网页表态格式】',
+  '正文说明理由，最后一行只写一个立场标记：STANCE: agree、STANCE: conditional 或 STANCE: oppose。',
+].join('\n');
 
 // Where a paused user may add a condition, and which newly constructed task
 // prompts carry it. Vote prompts are excluded on purpose: a vote must stay on
@@ -357,7 +363,7 @@ function actCorrect(session, payload) {
 
   const task = requireCurrentTask(session, payload.taskId);
 
-  if (AUTOMATION_SEATS.has(task.provider)) {
+  if (LOCAL_AUTOMATION_SEATS.has(task.provider)) {
     throw new Error(
       `task "${task.id}" belongs to an automated seat; its saved answer is only changed by the seat's own reply`,
     );
@@ -1074,7 +1080,8 @@ function votePrompt(session, provider, proposal) {
     );
   }
 
-  return lines.join('\n');
+  const prompt = lines.join('\n');
+  return PUBLIC_AUTOMATION_PROVIDER_IDS.includes(provider) ? prompt + PUBLIC_WEB_VOTE_FORMAT : prompt;
 }
 
 function targetedCritiquePrompt(question, provider, proposal, opposition) {

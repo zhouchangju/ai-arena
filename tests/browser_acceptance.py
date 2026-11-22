@@ -78,6 +78,22 @@ PROVIDER_NAME_FALLBACKS = {
     "grok": ("Grok",),
 }
 
+
+def decline_provider_permissions(page: Page) -> None:
+    """Keep manual browser replays offline by declining the optional public hosts."""
+    page.evaluate(
+        """() => {
+          const request = chrome.permissions.request.bind(chrome.permissions);
+          chrome.permissions.request = (permissions, callback) => {
+            if (permissions.origins?.every((origin) => origin.startsWith('https://'))) {
+              queueMicrotask(() => callback(false));
+              return;
+            }
+            return request(permissions, callback);
+          };
+        }"""
+    )
+
 RUNTIME_CALL_JS = """
 (payload) => new Promise((resolve) => {
   let settled = false;
@@ -515,6 +531,7 @@ class WorkspaceUI:
         )
 
     def create_debate(self, question: str, provider_ids: list[str]) -> tuple[str, dict[str, Any]]:
+        decline_provider_permissions(self.page)
         self.set_question(question)
         for provider_id in provider_ids:
             provider = self.by_id.get(provider_id, Provider(provider_id, provider_id))

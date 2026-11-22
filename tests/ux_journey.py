@@ -418,8 +418,17 @@ def main() -> int:
             ba.wait_until(lambda: page.locator("article.seat-card.is-skipped").count() == 1, "skipped seat")
             skipped = page.locator("article.seat-card.is-skipped").first
             skipped_text = skipped.inner_text()
+            # The prompt excerpt repeats the question verbatim; only card copy
+            # outside the prompt block can promise a recovery action.
+            promise_text = skipped.evaluate(
+                """el => {
+                  const copy = el.cloneNode(true);
+                  copy.querySelectorAll('.prompt-box').forEach(node => node.remove());
+                  return copy.textContent || '';
+                }"""
+            )
             recovery_control = skipped.get_by_role("button", name=re.compile("补录|继续草稿|粘贴回答|修改回答|重新填"))
-            promising = "补录" in skipped_text
+            promising = "补录" in promise_text
             check(
                 "Skipped seat either offers recovery or stops promising it",
                 (not promising) or recovery_control.count() > 0,

@@ -42,11 +42,13 @@ import { createSession, applyAction, MIN_SEATS, MAX_SEATS } from './core.js';
 import { installAutomation } from './automation.js';
 import {
   PROVIDERS,
-  AUTOMATION_PROVIDER_IDS,
+  LOCAL_AUTOMATION_PROVIDER_IDS,
+  PUBLIC_AUTOMATION_PROVIDER_IDS,
   isProviderId,
 } from './providers.js';
 
-const AUTOMATION_SEATS = new Set(AUTOMATION_PROVIDER_IDS);
+const LOCAL_AUTOMATION_SEATS = new Set(LOCAL_AUTOMATION_PROVIDER_IDS);
+const PUBLIC_AUTOMATION_SEATS = new Set(PUBLIC_AUTOMATION_PROVIDER_IDS);
 const STANCES = new Set(['agree', 'conditional', 'oppose']);
 const COMMAND_TYPES = new Set(['list', 'get', 'create', 'act', 'delete', 'open']);
 const ACTIONS = new Set(['answer', 'skip', 'guide', 'pause', 'resume', 'finish', 'correct']);
@@ -817,9 +819,25 @@ async function commandOpen(message, sourceTab) {
     if (!session.providers.includes(provider)) {
       throw new ArenaError('该席位不在本场名单中');
     }
-    const entryUrl = AUTOMATION_SEATS.has(provider)
+    const entryUrl = LOCAL_AUTOMATION_SEATS.has(provider)
       ? await configuredLocalEntryUrl(provider)
       : '';
+    if (PUBLIC_AUTOMATION_SEATS.has(provider) && automationApi) {
+      const { runs } = await automationApi.info();
+      const run = runs[id];
+      const binding = run?.tabs?.[provider];
+      if (Number.isInteger(binding?.tabId)) {
+        const tab = await chrome.tabs.get(binding.tabId).catch(() => null);
+        if (tabMatchesEntry(tab, PROVIDERS[provider].url)) {
+          await focusTab(tab);
+          return { session };
+        }
+      }
+      const seat = run?.seats?.[provider];
+      if (run?.enabled && !seat?.paused && !['detached', 'answered'].includes(seat?.status)) {
+        throw new ArenaError('这一席的原页正在连接，稍后可打开或先手动接管');
+      }
+    }
     await openProviderTab(session.id, provider, entryUrl, { sourceTab });
     return { session };
   });

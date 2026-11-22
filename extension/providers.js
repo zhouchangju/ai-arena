@@ -5,8 +5,8 @@
 // user explicitly asks to open. Nothing here performs network access: opening
 // a site is an ordinary user-initiated tab, and the page keeps its own login.
 //
-// `url` is only the entry page. It is never used as a "send" target, and no
-// automation capability is assumed for any site.
+// `url` is the entry page. Sending and reading are separate capabilities
+// and require the matching optional host permission.
 
 export const PROVIDERS = Object.freeze({
   chatgpt: { name: 'ChatGPT', url: 'https://chatgpt.com/' },
@@ -38,8 +38,12 @@ export const PROVIDERS = Object.freeze({
 /** Canonical, lowercase provider ids in display order. */
 export const PROVIDER_IDS = Object.freeze(Object.keys(PROVIDERS));
 
-/** Seats that the first automation version may drive (local loopback only). */
-export const AUTOMATION_PROVIDER_IDS = Object.freeze(['local-a', 'local-b']);
+export const LOCAL_AUTOMATION_PROVIDER_IDS = Object.freeze(['local-a', 'local-b']);
+export const PUBLIC_AUTOMATION_PROVIDER_IDS = Object.freeze(['chatgpt', 'gemini', 'deepseek']);
+export const AUTOMATION_PROVIDER_IDS = Object.freeze([
+  ...LOCAL_AUTOMATION_PROVIDER_IDS,
+  ...PUBLIC_AUTOMATION_PROVIDER_IDS,
+]);
 
 /**
  * Strict canonical allowlist check: only the exact lowercase ids above pass.

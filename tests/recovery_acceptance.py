@@ -25,7 +25,9 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 from auto_acceptance import EXT, TESTS, Quiet, fixture_pages, grant_loopback, prepare_extension, selectors
-from browser_acceptance import CheckLog, Runtime, WorkspaceUI, find_chromium_executable, wait_until
+from browser_acceptance import (
+    CheckLog, Runtime, WorkspaceUI, decline_provider_permissions, find_chromium_executable, wait_until,
+)
 
 
 AUTO = "local-a"
@@ -60,6 +62,7 @@ def provider_tabs(page):
 
 def begin_discussion(page, question):
     runtime = Runtime(page)
+    decline_provider_permissions(page)
     page.locator("#question-input").fill(question)
     for provider in (AUTO, MANUAL):
         option = page.locator(f"button.provider-option[data-provider-id='{provider}']")
@@ -299,7 +302,7 @@ def recover_closed_provider_tab(context, base, out, evidence, checks):
         "The automatic provider tab disappears after exactly one submission while still generating",
         submitted == [automatic["prompt"]] and fixture.locator(selector_map["stop"]).is_visible()
         and seat_task(runtime.get(sid), AUTO) == automatic
-        and active_run["dispatch"][automatic["id"]]["phase"] in {"dispatching", "submitted"},
+        and active_run["dispatch"][automatic["id"]]["phase"] in {"dispatching", "submitted", "streaming"},
     )
     fixture.close()
     checks.check("The automatic provider's original tab is closed", fixture.is_closed())
@@ -310,27 +313,25 @@ def recover_closed_provider_tab(context, base, out, evidence, checks):
 
     paused = wait_until(paused_run, "only the missing automatic seat to become actionable", timeout=20)
     before_skip = runtime.get(sid)
-    replacement = wait_until(lambda: fixture_pages(context).get("A"), "automatic seat's replacement loopback tab")
-    replacement.locator("#composer").wait_for()
-    after_close = fixture_texts(replacement, selector_map["user"])
+    replacement = fixture_pages(context).get("A")
     evidence["closed_provider"] = {
         "before_close": active_run,
         "paused": paused,
         "before_skip": before_skip,
         "original_submissions": submitted,
-        "replacement_submissions": after_close,
+        "automatic_replacement_opened": replacement is not None,
     }
 
     checks.check(
         "The same automatic task is still pending, the saved B reply survives, and Chrome did not resubmit",
         paused["seats"][AUTO]["taskId"] == automatic["id"] and seat_task(before_skip, AUTO) == automatic
         and seat_task(before_skip, MANUAL)["answer"] == MANUAL_ANSWER
-        and after_close == [] and paused["tabs"][AUTO]["tabId"] != active_run["tabs"][AUTO]["tabId"],
+        and replacement is None and paused["tabs"][AUTO]["tabId"] == active_run["tabs"][AUTO]["tabId"],
     )
     auto_card = card(page, AUTO)
     auto_card.get_by_text("自动待处理", exact=True).wait_for()
     button(auto_card, "粘贴回答").wait_for()
-    automatic_panel = page.get_by_role("region", name="本机自动")
+    automatic_panel = page.get_by_role("region", name="自动发送")
     recovery_hint = automatic_panel.get_by_text("已有完整回答可在工作台粘贴，也可跳过这一席。", exact=False)
     recovery_hint.wait_for()
     checks.check(
@@ -351,7 +352,10 @@ def recover_closed_provider_tab(context, base, out, evidence, checks):
         "Skipping the missing answer marks only that task absent and advances without inventing an answer",
         len(independent) == 2 and skipped["status"] == "skipped" and not skipped.get("answer")
         and next(entry for entry in independent if entry["provider"] == MANUAL)["answer"] == MANUAL_ANSWER
-        and automatic["prompt"] not in fixture_texts(replacement, selector_map["user"]),
+        and (
+            (next_page := fixture_pages(context).get("A")) is None
+            or automatic["prompt"] not in fixture_texts(next_page, selector_map["user"])
+        ),
     )
     button(page, "结束讨论").click()
     button(page.get_by_role("dialog"), "结束讨论").click()

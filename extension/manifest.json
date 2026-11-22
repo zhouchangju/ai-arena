@@ -13,7 +13,10 @@
   "permissions": ["storage", "scripting", "alarms", "tabs"],
   "optional_host_permissions": [
     "http://localhost/*",
-    "http://127.0.0.1/*"
+    "http://127.0.0.1/*",
+    "https://chatgpt.com/*",
+    "https://gemini.google.com/*",
+    "https://chat.deepseek.com/*"
   ],
   "minimum_chrome_version": "102"
 }

@@ -1606,6 +1606,11 @@ textarea {
   color: var(--amber);
 }
 
+.stage-count .count-auto {
+  border-color: rgba(42, 78, 168, 0.22);
+  color: var(--accent-deep);
+}
+
 .seat-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1615,6 +1620,11 @@ textarea {
 
 .seat-grid.is-single {
   grid-template-columns: minmax(0, 760px);
+}
+
+/* 三席在宽屏并排；中等宽度回到两列，窄屏再落成一列。 */
+.seat-grid.is-triple {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 /* 两席共用安静纸面，但各自有一条极细的侧标：A 钴蓝、B 丁香。 */
@@ -1761,15 +1771,79 @@ textarea {
 }
 
 .prompt-box summary {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  justify-content: space-between;
-  gap: 10px;
+  gap: 3px 10px;
   padding: 9px 11px;
   color: var(--ink-soft);
   font-size: 11.5px;
   list-style: none;
   cursor: pointer;
+}
+
+.prompt-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 3px 7px;
+  min-width: 0;
+}
+
+.prompt-title {
+  color: var(--ink-soft);
+}
+
+.prompt-status {
+  padding: 1px 7px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  background: var(--surface-solid);
+  color: var(--faint);
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.prompt-status.is-ready {
+  border-color: rgba(122, 90, 18, 0.22);
+  background: var(--amber-wash);
+  color: var(--amber);
+}
+
+.prompt-status.is-sending {
+  border-color: rgba(42, 78, 168, 0.24);
+  background: var(--accent-wash);
+  color: var(--accent-deep);
+}
+
+.prompt-status.is-sent {
+  border-color: rgba(40, 98, 74, 0.22);
+  background: var(--green-wash);
+  color: var(--green);
+}
+
+.prompt-status.is-skipped,
+.prompt-status.is-manual {
+  color: var(--faint);
+}
+
+.prompt-excerpt {
+  display: -webkit-box;
+  grid-column: 1 / -1;
+  margin: 0;
+  padding-top: 2px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.prompt-box[open] .prompt-excerpt {
+  display: none;
 }
 
 .prompt-box summary::-webkit-details-marker {
@@ -2665,6 +2739,12 @@ noscript {
 
 /* ------------------------------ 窄屏 ------------------------------ */
 
+@media (max-width: 1240px) {
+  .seat-grid.is-triple {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
 @media (max-width: 1180px) {
   .wrap {
     padding: 32px 30px 72px;
@@ -2728,6 +2808,10 @@ noscript {
   }
 
   .seat-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .seat-grid.is-triple {
     grid-template-columns: 1fr;
   }
 
@@ -3419,4 +3503,265 @@ noscript {
   body::before {
     animation: none;
   }
+}
+
+/* ------------------------------ 自动发送 ------------------------------ */
+
+/* 场次顶部的逐席进度：一行一席，发送确认、生成中和失败原因都在这里。 */
+.auto-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid rgba(42, 78, 168, 0.14);
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: 0 1px 2px rgba(24, 38, 84, 0.04);
+}
+
+.auto-panel-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+}
+
+.auto-panel-title {
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.auto-panel-summary {
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+
+.auto-seat-list {
+  display: grid;
+  gap: 3px;
+}
+
+.auto-seat-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+
+.auto-seat-name {
+  color: var(--ink-soft);
+  font-weight: 600;
+}
+
+.auto-seat-state {
+  color: var(--ink-soft);
+}
+
+.auto-seat-detail {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+}
+
+.auto-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--faint);
+}
+
+.auto-dot.is-running {
+  background: var(--accent);
+  animation: auto-pulse 1.4s ease-in-out infinite;
+}
+
+.auto-dot.is-done {
+  background: var(--green);
+}
+
+.auto-dot.is-error {
+  background: var(--danger);
+}
+
+.auto-dot.is-warn {
+  background: var(--amber);
+}
+
+@keyframes auto-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+
+  50% {
+    opacity: 0.45;
+    transform: scale(0.82);
+  }
+}
+
+.auto-seat-state.is-running {
+  color: var(--accent-deep);
+}
+
+.auto-seat-state.is-done {
+  color: var(--green);
+}
+
+.auto-seat-state.is-error {
+  color: var(--danger);
+}
+
+.auto-seat-state.is-warn {
+  color: var(--amber);
+}
+
+.auto-panel-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* 授权被拒、启动失败要一直留在页面上，不只是一条会消失的提示。 */
+.auto-notice {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  background: var(--accent-wash);
+  color: var(--ink-soft);
+  font-size: 11.5px;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+
+.auto-notice.is-warn {
+  border-left-color: var(--amber);
+  background: var(--amber-wash);
+}
+
+.auto-notice.is-error {
+  border-left-color: var(--danger);
+  background: var(--danger-wash);
+}
+
+/* 席卡上的自动进度：发送确认、流式正文与接管入口。 */
+.seat-auto {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--surface-inset);
+}
+
+.seat-auto.is-running {
+  border-color: rgba(42, 78, 168, 0.24);
+  background: var(--accent-wash);
+}
+
+.seat-auto.is-done {
+  border-color: rgba(40, 98, 74, 0.22);
+  background: var(--green-wash);
+}
+
+.seat-auto.is-error {
+  border-color: rgba(156, 53, 56, 0.24);
+  background: var(--danger-wash);
+}
+
+.seat-auto-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  color: var(--ink-soft);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+
+.seat-auto-state {
+  font-weight: 600;
+}
+
+.seat-auto-state.is-running {
+  color: var(--accent-deep);
+}
+
+.seat-auto-state.is-done {
+  color: var(--green);
+}
+
+.seat-auto-state.is-error {
+  color: var(--danger);
+}
+
+.seat-auto-state.is-warn {
+  color: var(--amber);
+}
+
+.seat-auto-detail {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+}
+
+.seat-auto-preview-meta {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 2px 8px;
+}
+
+.seat-auto-preview-label {
+  color: var(--faint);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.seat-auto-preview-hint {
+  color: var(--muted);
+  font-size: 10.5px;
+}
+
+.seat-auto-preview {
+  max-height: 170px;
+  margin: 0;
+  padding: 8px 9px;
+  overflow-y: auto;
+  border-radius: 8px;
+  background: var(--surface-solid);
+  color: var(--ink-soft);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.seat-auto-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.seat-auto-issue {
+  border-style: dashed;
+}
+
+/* 「自动待处理 / 未配置」是提醒而不是可用：与首页的绿色「自动」分开。 */
+.provider-tag.is-issue {
+  background: var(--amber-wash);
+  color: var(--amber);
 }

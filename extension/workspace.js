@@ -1,4 +1,9 @@
-import { PROVIDERS, AUTOMATION_PROVIDER_IDS } from './providers.js';
+import {
+  PROVIDERS,
+  AUTOMATION_PROVIDER_IDS,
+  PUBLIC_AUTOMATION_PROVIDER_IDS,
+  providerOrigin,
+} from './providers.js';
 import { latestAnsweredProposal, proposalDigest } from './core.js';
 
 /* ---------------------------------------------------------------------------
@@ -53,6 +58,9 @@ const STATUS_LABELS = {
 };
 
 const AUTOMATION_SEATS = new Set(AUTOMATION_PROVIDER_IDS);
+/* 公开的三席（ChatGPT / Gemini / DeepSeek）在点「开始」的同一次手势里申请
+ * 各自域名的访问权限；本机 A/B 仍只用连接设置里保存的地址。 */
+const PUBLIC_AUTOMATION_SEATS = new Set(PUBLIC_AUTOMATION_PROVIDER_IDS);
 const AUTOMATION_POLL_MS = 4000;
 const AUTOMATION_NEEDS_ACTION = new Set([
   'paused',
@@ -60,17 +68,47 @@ const AUTOMATION_NEEDS_ACTION = new Set([
   'session-paused',
   'unconfigured',
 ]);
+const AUTOMATION_RUNNING_STATUSES = new Set([
+  'probing',
+  'dispatching',
+  'verifying',
+  'submitted',
+  'streaming',
+  'waiting',
+]);
+/* 会改变场次内容或交互方式的状态：已写入讨论要重读回答；暂停、失败、停止
+ * 要让这一席的卡片换成手动动作。流式正文不在此列。 */
+const AUTOMATION_REFRESH_STATUSES = new Set([
+  'answered',
+  'paused',
+  'stale',
+  'session-paused',
+  'unconfigured',
+  'detached',
+  'idle',
+]);
+/* 后台核对了原页用户消息之后才会进入这些相位。提示入口只凭这份回执
+ * 说「已确认发送」，不看本机复制、按钮点击或自动流程正在跑。 */
+const CONFIRMED_DISPATCH_PHASES = new Set(['submitted', 'streaming', 'answered']);
+const SENDING_DISPATCH_PHASES = new Set([
+  'dispatching',
+  'waiting-send',
+  'verifying',
+]);
 const AUTOMATION_SEAT_LABELS = {
   idle: '待命',
-  probing: '检查页面',
-  dispatching: '提交中',
+  probing: '检查原页',
+  dispatching: '正在发送',
+  verifying: '正在确认发送',
+  submitted: '已确认发送，等回答',
+  streaming: '正在生成',
   waiting: '等待回答',
-  answered: '已写入讨论',
-  stale: '已过期，要人工核对',
+  answered: '已完成，已写入讨论',
+  stale: '需要人工核对',
   'session-paused': '讨论已暂停',
   paused: '需要处理',
   unconfigured: '未配置',
-  detached: '已停止',
+  detached: '已停止自动',
 };
 
 const DRAFTS_KEY = 'aiArena.workspace.drafts.v1';
@@ -110,9 +148,16 @@ const state = {
   automation: { loaded: false, configs: {}, runs: {}, error: '' },
   automationPanel: null,
   automationPollTimer: null,
-  automationSignature: '',
   automationRefreshPending: false,
   automationBusy: false,
+  /* 上次看到的逐席快照：只有「已写入讨论」这类会改变场次的状态才触发重读。 */
+  automationSnapshot: {},
+  automationNotice: null,
+  automationRefreshTimer: null,
+  /* 席卡上的自动进度节点，供 automation.progress 只改文字、不整页重绘。 */
+  autoSeatEls: new Map(),
+  /* 提示入口上的发送状态，同样按进度原地更新；键是任务 ID。 */
+  promptStateEls: new Map(),
 };
 
 let loadToken = 0;
@@ -212,6 +257,15 @@ function isAutomationSeat(id) {
   return AUTOMATION_SEATS.has(String(id || '').toLowerCase());
 }
 
+/* ChatGPT / Gemini / DeepSeek：权限按站点申请，不需要连接设置里的地址。 */
+function isPublicAutomationSeat(id) {
+  return PUBLIC_AUTOMATION_SEATS.has(String(id || '').toLowerCase());
+}
+
+function isLocalAutomationSeat(id) {
+  return isAutomationSeat(id) && !isPublicAutomationSeat(id);
+}
+
 function automationConfig(id) {
   const key = String(id || '').toLowerCase();
   return state.automation.configs && state.automation.configs[key]
@@ -237,8 +291,11 @@ function automationSeatState(run, provider) {
 
 function automationSeatNeedsAction(seat) {
   if (!seat) return false;
-  if (seat.paused) return true;
-  return AUTOMATION_NEEDS_ACTION.has(String(seat.status || '').toLowerCase());
+  if (seat.paused || seat.takenOver) return true;
+  const status = String(seat.status || '').toLowerCase();
+  /* 配置缺失时后台保持 idle 并写清原因；这类席位也要按手动处理。 */
+  if (status === 'idle' && seat.detail) return true;
+  return AUTOMATION_NEEDS_ACTION.has(status);
 }
 
 function automationNeedsAction(run) {
@@ -255,11 +312,14 @@ function automationSeatMode(session, provider) {
   if (!isAutomationSeat(id)) return '手动';
   const run = automationRun(session);
   const seat = automationSeatState(run, id);
+  const local = isLocalAutomationSeat(id);
   if (run && run.enabled) {
-    if (automationSeatNeedsAction(seat)) return '本机待处理';
-    if (seat && seat.status === 'detached') return '本机手动';
-    return '本机自动';
+    if (seat && seat.takenOver) return '手动接管';
+    if (automationSeatNeedsAction(seat)) return local ? '本机待处理' : '自动待处理';
+    if (seat && seat.status === 'detached') return '手动';
+    return '自动';
   }
+  if (!local) return seat ? automationSeatLabel(seat) : '可自动';
   return automationConfig(id) ? '本机手动' : '本机未配置';
 }
 
@@ -270,34 +330,93 @@ function automationSeatLabel(seat) {
   return seat.paused && status !== 'paused' ? `${label}（需处理）` : label;
 }
 
-function automationRunSignature(run) {
-  if (!run) return '';
-  const seats = {};
-  for (const [provider, seat] of Object.entries(run.seats || {})) {
-    seats[provider] = {
-      status: seat.status || '',
-      taskId: seat.taskId || '',
-      detail: seat.detail || '',
-      paused: Boolean(seat.paused),
-    };
-  }
-  return JSON.stringify({
-    enabled: Boolean(run.enabled),
-    completed: Boolean(run.completed),
-    stoppedAt: run.stoppedAt || null,
-    lastError: run.lastError || '',
-    seats,
-  });
+/* 自动运行中，「待命」有两种意思：这一席还有本轮任务要发，或本席已完成、等
+ * 其他席位／下一阶段。只在后一种显示「等待下一步」，不和席卡的「待回答」重复。 */
+function automationSeatContextLabel(seat, run, session, provider) {
+  const base = automationSeatLabel(seat);
+  if (base !== '待命') return base;
+  if (!run || !run.enabled || run.completed || run.stoppedAt) return base;
+  if (!session || session.stage === 'done') return base;
+  if (automationSeatNeedsAction(seat)) return base;
+  const id = String(provider || '').toLowerCase();
+  const pending = (session.tasks || []).some((task) =>
+    String(task.provider || '').toLowerCase() === id && task.status === 'pending');
+  return pending ? base : '等待下一步';
 }
 
-function automationRunSummary(run) {
-  if (!run) return '没有启用自动。可以手动复制、粘贴和提交。';
+/* 状态语气只用于一个色点和一个短标签，不改变任何发送行为。 */
+function automationStatusTone(seat) {
+  if (!seat) return 'is-idle';
+  const status = String(seat.status || '').toLowerCase();
+  if (seat.paused || status === 'paused' || status === 'stale') return 'is-error';
+  if (status === 'answered') return 'is-done';
+  if (status === 'unconfigured' || status === 'session-paused' || status === 'detached') return 'is-warn';
+  if (status === 'idle' && seat.detail) return 'is-warn';
+  if (AUTOMATION_RUNNING_STATUSES.has(status)) return 'is-running';
+  return 'is-idle';
+}
+
+/* 自动还在主动驱动这一席：卡片上给出进度、原页和接管入口。
+ * 暂停、失败、已停止的席位由现有手动动作处理，只补一行原因。 */
+function automationSeatDriving(run, seat) {
+  if (!run || !run.enabled || !seat) return false;
+  if (automationSeatNeedsAction(seat)) return false;
+  const status = String(seat.status || '').toLowerCase();
+  if (status === 'detached') return false;
+  return true;
+}
+
+function automationSeatSnapshot(run) {
+  const seats = {};
+  for (const [provider, seat] of Object.entries((run && run.seats) || {})) {
+    seats[provider] = [
+      seat && seat.taskId ? String(seat.taskId) : '',
+      seat && seat.status ? String(seat.status) : '',
+      seat && seat.paused ? '1' : '0',
+      seat && seat.takenOver ? '1' : '0',
+    ].join('|');
+  }
+  return {
+    seats,
+    enabled: Boolean(run && run.enabled),
+    completed: Boolean(run && run.completed),
+    stopped: Boolean(run && run.stoppedAt),
+  };
+}
+
+/* 记住这次看到的逐席状态；返回这次是否出现「已写入讨论」或流程整体变化。 */
+function automationSnapshotChanged(run) {
+  if (!run) return false;
+  const previous = state.automationSnapshot[run.id];
+  const next = automationSeatSnapshot(run);
+  state.automationSnapshot[run.id] = next;
+  if (!previous) return false;
+  if (previous.enabled !== next.enabled
+    || previous.completed !== next.completed
+    || previous.stopped !== next.stopped) return true;
+  for (const [provider, seat] of Object.entries((run && run.seats) || {})) {
+    const status = String((seat && seat.status) || '').toLowerCase();
+    if (!AUTOMATION_REFRESH_STATUSES.has(status)) continue;
+    if (previous.seats[provider] !== next.seats[provider]) return true;
+  }
+  return false;
+}
+
+function automationRunSummary(run, session) {
+  const seats = session ? automationSeats(session) : [];
+  const hasPublic = seats.some(isPublicAutomationSeat);
+  const hasLocal = seats.some(isLocalAutomationSeat);
+  if (!run) {
+    if (hasPublic && hasLocal) return '自动还没开始。公开席位和本机席位都要点「开始自动化」才会发送；手动一直可用。';
+    if (hasPublic) return '自动还没开始。点「开始自动化」会请求原站权限；手动复制、粘贴也一直可用。';
+    return '没有启用自动。可以手动复制、粘贴和提交。';
+  }
   if (run.enabled) {
     const needs = automationNeedsAction(run);
     if (needs > 0) {
       return `自动运行中，有 ${needs} 席要你处理；没处理的席位不会继续自动发送。`;
     }
-    return '自动运行中，只驱动已配置的本机席位；手动操作一直可用。';
+    return '自动运行中，逐席进度见下；手动操作一直可用。';
   }
   if (run.completed) return '讨论已结束，自动也停了。';
   if (run.stoppedAt) return '自动已停止，原页还在，可以继续手动操作。';
@@ -542,6 +661,162 @@ function automationEditingFocus() {
   return Boolean(active.closest && active.closest('.answer-editor'));
 }
 
+/* ------------------------------ 原站权限 ------------------------------ */
+
+function permissionsAvailable() {
+  try {
+    return typeof chrome !== 'undefined'
+      && !!chrome.permissions
+      && typeof chrome.permissions.request === 'function';
+  } catch {
+    return false;
+  }
+}
+
+/** 权限可能早已授予（例如用户上次同意过）；用 contains 复核一次。 */
+function originsGranted(origins) {
+  return new Promise((resolve) => {
+    try {
+      if (!chrome.permissions || typeof chrome.permissions.contains !== 'function') {
+        resolve(false);
+        return;
+      }
+      chrome.permissions.contains({ origins }, (granted) => {
+        resolve(Boolean(granted));
+      });
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+/** "https://chatgpt.com" → "https://chatgpt.com/*"，只覆盖这一站。 */
+function permissionPatternFor(id) {
+  const origin = providerOrigin(id);
+  if (!origin) return '';
+  const { protocol, hostname } = new URL(origin);
+  return `${protocol}//${hostname}/*`;
+}
+
+/**
+ * 必须在点击处理函数里同步调用：Chrome 只接受用户手势触发的权限请求。
+ * Promise 构造器同步执行 chrome.permissions.request，因此外层可以随后 await
+ * 创建场次，手势仍然有效。拒绝授权不是错误——仍会建场，只是先按手动。
+ */
+function requestPublicSeatPermissions(providers) {
+  const ids = (providers || []).filter(isPublicAutomationSeat);
+  const origins = [...new Set(ids.map(permissionPatternFor).filter(Boolean))];
+  if (!ids.length || !origins.length) {
+    return Promise.resolve({ requested: false, granted: true, ids, origins, error: null });
+  }
+  if (!permissionsAvailable()) {
+    return Promise.resolve({
+      requested: false,
+      granted: false,
+      ids,
+      origins,
+      error: new Error('当前环境不能请求网页权限；请从 Chrome 的扩展页打开工作台。'),
+    });
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer = null;
+    const settle = (granted, error) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve({ requested: true, granted: Boolean(granted), ids, origins, error: error || null });
+    };
+    /* 浏览器拒绝这次请求时，先确认这些来源是不是已经授权过了。 */
+    const settleWithCheck = (granted, error) => {
+      if (granted) {
+        settle(true);
+        return;
+      }
+      originsGranted(origins).then((already) => settle(already, error), () => settle(false, error));
+    };
+    timer = setTimeout(() => {
+      settleWithCheck(false, new Error('浏览器在 20 秒内没有返回授权结果。'));
+    }, 20000);
+    try {
+      chrome.permissions.request({ origins }, (granted) => {
+        const lastError = chrome.runtime && chrome.runtime.lastError;
+        if (lastError) {
+          settleWithCheck(false, new Error(lastError.message || '浏览器没有响应授权请求。'));
+          return;
+        }
+        settleWithCheck(granted);
+      });
+    } catch (error) {
+      settleWithCheck(false, error);
+    }
+  });
+}
+
+function permissionRefusalText(permission) {
+  const ids = permission && permission.ids && permission.ids.length
+    ? permission.ids
+    : [];
+  const names = ids.map(providerName).join('、') || '原站';
+  const reason = permission && permission.error && permission.error.message
+    ? `（${oneLine(permission.error.message, 120)}）`
+    : '';
+  return `没有获得 ${names} 的原站权限${reason}。这些席位先按手动：复制提示、打开原页、粘贴回答；想自动就点「开始自动化」重新授权。`;
+}
+
+/* 用户第一次看到授权框可能要想几秒；创建工作不必一直等它。超过这个时间
+ * 先按「结果未返回」建场，结果回来后只更新提示，不默默启动。 */
+const PERMISSION_DECISION_WAIT_MS = 5000;
+
+function waitForPermissionDecision(promise, ms = PERMISSION_DECISION_WAIT_MS) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve({ requested: true, granted: false, undecided: true, ids: [], origins: [], error: null });
+    }, ms);
+    promise.then((value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    }, () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ requested: true, granted: false, undecided: false, ids: [], origins: [], error: new Error('授权请求失败。') });
+    });
+  });
+}
+
+/* ------------------------------ 状态提示 ------------------------------ */
+
+function setAutomationNotice(sessionId, kind, text) {
+  if (!sessionId || !text) {
+    state.automationNotice = null;
+    updateAutomationPanel();
+    return;
+  }
+  state.automationNotice = { sessionId, kind: kind || 'info', text };
+  updateAutomationPanel();
+}
+
+function clearAutomationNotice(sessionId) {
+  if (!state.automationNotice) return;
+  if (sessionId && state.automationNotice.sessionId !== sessionId) return;
+  state.automationNotice = null;
+  updateAutomationPanel();
+}
+
+function automationNoticeFor(session) {
+  const notice = state.automationNotice;
+  if (!notice || !session || notice.sessionId !== session.id) return null;
+  return notice;
+}
+
+/* ------------------------------ 轮询与事件 ------------------------------ */
+
 function stopAutomationPolling() {
   if (state.automationPollTimer) {
     clearInterval(state.automationPollTimer);
@@ -578,6 +853,50 @@ async function refreshSessionQuietly() {
   }
 }
 
+/* 只在「已写入讨论」或流程整体变化后重读场次；流式正文不进这里。 */
+function scheduleAutomationSessionRefresh() {
+  if (state.automationRefreshTimer) return;
+  const sessionId = state.session?.id;
+  state.automationRefreshTimer = setTimeout(() => {
+    state.automationRefreshTimer = null;
+    if (state.view !== 'session' || state.session?.id !== sessionId) return;
+    if (automationEditingFocus()) {
+      state.automationRefreshPending = true;
+      updateAutomationPanel();
+      return;
+    }
+    state.automationRefreshPending = false;
+    void refreshSessionQuietly();
+  }, 250);
+}
+
+/* 后台每次更新自动状态都会发这一条；只认当前场次，并且只改对应席位的文字。 */
+function handleAutomationProgress(id, run) {
+  if (!id || !run || typeof run !== 'object') return;
+  state.automation.runs = { ...(state.automation.runs || {}), [id]: run };
+  if (!state.session || state.session.id !== id) return;
+  updateAutomationPanel();
+  updateSeatAutoViews(run);
+  const changed = automationSnapshotChanged(run);
+  if (run.enabled) ensureAutomationPolling();
+  else stopAutomationPolling();
+  if (changed) scheduleAutomationSessionRefresh();
+}
+
+function bindAutomationEvents() {
+  try {
+    if (!chrome.runtime || !chrome.runtime.onMessage) return;
+    chrome.runtime.onMessage.addListener((message) => {
+      if (!message || message.type !== 'automation.progress') return;
+      const run = message.run;
+      const id = String(message.id || (run && run.id) || '');
+      handleAutomationProgress(id, run);
+    });
+  } catch {
+    /* 通知只是加速；定时轮询和「刷新自动状态」仍然可用。 */
+  }
+}
+
 async function pollAutomation() {
   if (state.view !== 'session' || !state.session) {
     stopAutomationPolling();
@@ -585,21 +904,22 @@ async function pollAutomation() {
   }
   if (state.automationBusy) return;
 
+  const sessionId = state.session.id;
   const reply = await loadAutomationInfo({ silent: true });
   if (!reply) return;
 
   const session = state.session;
-  if (!session) {
+  if (!session || session.id !== sessionId) {
     stopAutomationPolling();
     return;
   }
   const run = automationRun(session);
-  const signature = automationRunSignature(run);
-  const changed = Boolean(state.automationSignature)
-    && signature !== state.automationSignature;
-  state.automationSignature = signature;
+  updateSeatAutoViews(run);
+  updateAutomationPanel();
 
-  if (changed) {
+  const changed = automationSnapshotChanged(run);
+  const pendingRefresh = state.automationRefreshPending && !automationEditingFocus();
+  if (changed || pendingRefresh) {
     if (automationEditingFocus()) {
       state.automationRefreshPending = true;
       updateAutomationPanel();
@@ -616,24 +936,58 @@ async function pollAutomation() {
   ensureAutomationPolling();
 }
 
+/* ------------------------------ 启动、停止、接管 ------------------------------ */
+
 async function startAutomation(button) {
   const session = state.session;
   if (!session || state.automationBusy) return;
+  const publicSeats = automationSeats(session).filter(isPublicAutomationSeat);
+  const publicNames = publicSeats.map(providerName).join('、');
   state.automationBusy = true;
   const original = button ? button.textContent : '';
   if (button) {
     button.disabled = true;
-    button.textContent = '启动中…';
+    button.textContent = publicSeats.length ? '等待授权…' : '启动中…';
   }
   try {
+    /* 先授权，再启动：权限请求必须在这次点击的手势里同步发起。 */
+    let permission = { requested: false, granted: true, ids: [], origins: [], error: null };
+    if (publicSeats.length) {
+      setAutomationNotice(session.id, 'info', `等待 Chrome 返回 ${publicNames} 的原站权限；同意后马上开始发送。`);
+      permission = await requestPublicSeatPermissions(publicSeats);
+      /* 已授权时不会弹窗，直接进入启动；这句把两边的情况都说清。 */
+      if (permission.granted) {
+        setAutomationNotice(session.id, 'info', `已获得 ${publicNames} 的原站权限，正在打开各席原页并发送本轮提示…`);
+      }
+    }
+    const mixed = automationSeats(session).some(isLocalAutomationSeat);
+    if (!permission.granted && !mixed) {
+      /* 纯公开席没有权限就不启动：保留「开始自动化」按钮让用户重新授权。 */
+      setAutomationNotice(session.id, 'warn', permissionRefusalText(permission));
+      toast('没拿到原站权限，自动没有开始；手动操作一直可用', 'error');
+      return;
+    }
     await callBackground({ type: 'automation.start', id: session.id });
     await loadAutomationInfo({ silent: true });
-    state.automationSignature = automationRunSignature(automationRun(state.session));
+    if (state.session) {
+      state.automationSnapshot[session.id] = automationSeatSnapshot(automationRun(state.session));
+    }
     await refreshSessionQuietly();
     ensureAutomationPolling();
-    toast('已开始自动：只驱动配置好的本机席位，手动操作一直可用');
+    if (!permission.granted) {
+      const mixedNotice = mixed
+        ? `没拿到 ${publicNames} 的原站权限：这些席位先按手动，其他席位照常自动。要重试授权，先点「停止自动化」再点「开始自动化」。`
+        : permissionRefusalText(permission);
+      setAutomationNotice(session.id, 'warn', mixedNotice);
+      toast('公开席位没拿到权限，只有它按手动；其他席位照常自动', 'error');
+      return;
+    }
+    clearAutomationNotice(session.id);
+    toast(publicSeats.length ? '已开始自动：逐席发送和生成进度见各席卡片' : '已开始自动：只驱动配置好的本机席位，手动操作一直可用');
   } catch (error) {
-    toast(friendlyError(error, '无法开始自动化'), 'error');
+    const message = friendlyError(error, '无法开始自动化');
+    setAutomationNotice(session.id, 'error', `没能开始自动：${message}。可以按手动复制、打开原页并粘贴回答。`);
+    toast(message, 'error');
   } finally {
     state.automationBusy = false;
     if (button && button.isConnected) {
@@ -670,11 +1024,63 @@ async function stopAutomation(button) {
   }
 }
 
+/* 单席手动接管：后台停止对这一席的原页驱动，已生成的内容保留；随后用现有
+ * 手动路径粘贴回答。请求带 taskId，接管只对这一席当前任务生效。 */
+async function takeoverSeat(session, task, button) {
+  if (!session || !task) return;
+  if (state.automationBusy) return;
+  state.automationBusy = true;
+  const original = button ? button.textContent : '';
+  if (button) {
+    button.disabled = true;
+    button.textContent = '接管中…';
+  }
+  try {
+    await callBackground({
+      type: 'automation.takeover',
+      id: session.id,
+      provider: task.provider,
+      taskId: task.id,
+    });
+    await loadAutomationInfo({ silent: true });
+    setTaskError(task.id, '');
+    state.showEditor[task.id] = 'new';
+    state.dismissedDraftEditors.delete(task.id);
+    setAutomationNotice(
+      session.id,
+      'info',
+      `${providerName(task.provider)} 已交给手动：自动不会再发送这一席。到原页取回回答，粘贴到这里提交。`,
+    );
+    state.automationSnapshot[session.id] = automationSeatSnapshot(automationRun(session));
+    render();
+    requestAnimationFrame(() => {
+      const card = taskCardElement(task.id);
+      if (!card) return;
+      card.scrollIntoView({ block: 'nearest' });
+      const input = card.querySelector('textarea.answer-input');
+      if (input) input.focus({ preventScroll: true });
+    });
+    toast('已接管这一席：按手动粘贴回答');
+  } catch (error) {
+    const message = friendlyError(error, '无法接管这一席');
+    setTaskError(task.id, message);
+    toast(message, 'error');
+  } finally {
+    state.automationBusy = false;
+    if (button && button.isConnected) {
+      button.disabled = false;
+      button.textContent = original;
+    }
+    updateAutomationPanel();
+  }
+}
+
 async function refreshAutomationNow(button) {
   const session = state.session;
   if (!session) return;
   await withButton(button, '刷新中…', async () => {
     await loadAutomationInfo({ silent: false });
+    state.automationSnapshot[session.id] = automationSeatSnapshot(automationRun(state.session));
     await refreshSessionQuietly();
     ensureAutomationPolling();
   });
@@ -1144,6 +1550,9 @@ function goHome() {
   state.taskErrorEls = new Map();
   state.promptCopied = {};
   state.nextStepPanel = null;
+  state.automationNotice = null;
+  state.autoSeatEls = new Map();
+  state.promptStateEls = new Map();
   setHash('');
   maybeRecallLastPair();
   renderHome();
@@ -1247,12 +1656,14 @@ function registerHomeLink(link) {
 
 function homeSeatTag(id) {
   if (!isAutomationSeat(id)) return '';
+  if (isPublicAutomationSeat(id)) return '自动';
   if (!state.automation.loaded) return '';
   return automationConfig(id) ? '自动' : '';
 }
 
 function homeSeatModeText(id) {
   if (!isAutomationSeat(id)) return '手动';
+  if (isPublicAutomationSeat(id)) return '自动（开始时授权）';
   if (!state.automation.loaded) return '读取设置中';
   return automationConfig(id) ? '自动' : '未连接，手动';
 }
@@ -1303,12 +1714,21 @@ function homeSeatModeSummary() {
     return `${text}。${ready}读完设置前可手动。`;
   }
 
-  const autoReady = selected.filter((id) => isAutomationSeat(id) && automationConfig(id)).length;
-  if (autoReady === 0) {
+  const publicSeats = selected.filter(isPublicAutomationSeat);
+  const localSeats = selected.filter(isLocalAutomationSeat);
+  const localReady = localSeats.filter((id) => automationConfig(id)).length;
+
+  if (publicSeats.length && !localSeats.length) {
+    return `${text}。${ready}点开始会请求 ${publicSeats.map(providerName).join('、')} 的原站权限；同意就直接自动发送（已授权不再弹窗），拒绝也能手动。`;
+  }
+  if (publicSeats.length && localSeats.length) {
+    return `${text}。${ready}到讨论页点「开始自动化」时请求公开席位的权限；本机席位也在那一下开始。`;
+  }
+  if (localReady === 0) {
     return `${text}。${ready}本机席位未连接，按手动操作。`;
   }
-  if (autoReady < selected.length) {
-    return `${text}。${ready}${autoReady} 席可自动，其余手动；创建后点「开始自动化」，不点就手动。`;
+  if (localReady < selected.length) {
+    return `${text}。${ready}${localReady} 席可自动，其余手动；创建后点「开始自动化」，不点就手动。`;
   }
   return `${text}。${ready}每席都可自动；创建后点「开始自动化」，不点就手动。`;
 }
@@ -1343,6 +1763,8 @@ function renderHome() {
   state.view = 'home';
   state.homeRefs = null;
   state.automationPanel = null;
+  state.autoSeatEls = new Map();
+  state.promptStateEls = new Map();
   stopAutomationPolling();
 
   const refs = {
@@ -1531,6 +1953,7 @@ function renderHome() {
 
 function providerTagLabel(id) {
   if (!isAutomationSeat(id)) return '手动';
+  if (isPublicAutomationSeat(id)) return '自动，开始时授权';
   if (!state.automation.loaded) return '本机，检查配置中';
   return automationConfig(id) ? '本机自动' : '本机未配置';
 }
@@ -1544,12 +1967,29 @@ function providerChipTitle(provider) {
 
 function homeAutomationSummary() {
   const selected = state.compose.providers;
-  const localSeats = selected.filter(isAutomationSeat);
-  if (!localSeats.length) {
+  const automation = selected.filter(isAutomationSeat);
+  const publicSeats = automation.filter(isPublicAutomationSeat);
+  const localSeats = automation.filter(isLocalAutomationSeat);
+  if (!automation.length) {
     return {
       tag: '手动',
       strong: '全程手动',
       span: '不自动登录、不自动发送，也不读网页回答。',
+    };
+  }
+  if (publicSeats.length) {
+    const names = publicSeats.map(providerName).join('、');
+    if (localSeats.length) {
+      return {
+        tag: '公开席位可自动',
+        strong: '到讨论页再开始自动',
+        span: `点「开始自动化」时请求 ${names} 的原站权限，本机席位也在那一下开始；拒绝也能手动。`,
+      };
+    }
+    return {
+      tag: '开始时授权',
+      strong: '开始后自动发送',
+      span: `点开始会请求 ${names} 的原站权限；同意就直接自动发送，已授权时不再弹窗，拒绝也能建场并手动粘贴。`,
     };
   }
   if (!state.automation.loaded) {
@@ -1676,11 +2116,11 @@ function clearHomeError() {
   if (state.homeRefs?.error) state.homeRefs.error.hidden = true;
 }
 
-function setStartBusy(busy) {
+function setStartBusy(busy, label) {
   const button = state.homeRefs?.start;
   if (!button || !button.isConnected) return;
   button.disabled = busy;
-  button.textContent = busy ? '正在创建…' : '开始讨论';
+  button.textContent = busy ? (label || '正在创建…') : '开始讨论';
 }
 
 async function startSession() {
@@ -1716,13 +2156,77 @@ async function startSession() {
 
   state.pendingCreate = true;
   clearHomeError();
-  setStartBusy(true);
 
+  /* 权限请求必须先于任何 await 发起：这是「开始」这一次点击的手势。
+   * 只有本次点击确实会启动自动（公开席、且没有本机席）时才请求；混用本机
+   * 席位时，自动仍由讨论页的「开始自动化」显式启动，那一下再授权。 */
+  const publicSeats = providers.filter(isPublicAutomationSeat);
+  const hasLocalSeat = providers.some(isLocalAutomationSeat);
+  const willAutoStart = publicSeats.length > 0 && !hasLocalSeat;
+  const publicNames = publicSeats.map(providerName).join('、');
+  setStartBusy(true, willAutoStart ? '等待 Chrome 授权…' : '正在创建…');
+  let permission = { requested: false, granted: true, undecided: false, ids: [], origins: [], error: null };
+  let pendingPermission = null;
+  let autoStarted = false;
+  if (willAutoStart) {
+    const ask = requestPublicSeatPermissions(providers);
+    permission = await waitForPermissionDecision(ask);
+    if (permission.undecided) pendingPermission = ask;
+    /* 已授权时 Chrome 不会再弹窗：这里直接进入自动启动，不再要求第二次点击。 */
+    setStartBusy(true, permission.granted ? '正在自动启动…' : '正在创建…');
+  }
+
+  let startNotice = null;
   try {
     const reply = await callBackground({ type: 'create', question, providers });
     if (!reply.session) throw new Error('后台没有返回新讨论。');
     const session = normalizeSession(reply.session);
     if (!session) throw new Error('后台返回的讨论数据不完整。');
+
+    /* 授权通过就在同一次开始动作里启动；拒绝或没有返回结果时不启动，保留
+     * 「开始自动化」按钮供重新授权。本机 A/B 保持显式启动。 */
+    if (willAutoStart && permission.granted) {
+      try {
+        await callBackground({ type: 'automation.start', id: session.id });
+        await loadAutomationInfo({ silent: true });
+        state.automationSnapshot[session.id] = automationSeatSnapshot(automationRun(session));
+        autoStarted = true;
+        startNotice = {
+          kind: 'info',
+          text: `已获得 ${publicNames} 的原站权限，已开始自动发送本轮提示。逐席进度和接管入口见各席卡片。`,
+        };
+      } catch (error) {
+        startNotice = {
+          kind: 'error',
+          text: `${friendlyError(error, '已建场，但没能开始自动发送')}。每席都可以手动复制、打开原页并粘贴回答。`,
+        };
+      }
+    } else if (willAutoStart && permission.undecided) {
+      startNotice = {
+        kind: 'info',
+        text: '浏览器还没有返回原站授权结果。自动先不启动；授权完成后点「开始自动化」即可，手动一直可用。',
+      };
+    } else if (willAutoStart) {
+      startNotice = { kind: 'warn', text: permissionRefusalText(permission) };
+    } else if (publicSeats.length && hasLocalSeat) {
+      startNotice = {
+        kind: 'info',
+        text: '公开席位和本机席位混用：自动要你在下面点「开始自动化」才会开始，那一下会请求原站权限；手动一直可用。',
+      };
+    }
+
+    /* 授权框晚于建场才返回：只更新提示，不在这里偷偷启动。 */
+    if (pendingPermission) {
+      const sessionId = session.id;
+      pendingPermission.then((final) => {
+        if (!state.session || state.session.id !== sessionId) return;
+        if (final.granted) {
+          setAutomationNotice(sessionId, 'info', `已获得 ${publicNames} 的原站权限；点「开始自动化」就能自动发送。`);
+        } else {
+          setAutomationNotice(sessionId, 'warn', permissionRefusalText(final));
+        }
+      });
+    }
 
     rememberLastPair(providers);
     state.compose = { question: '', providers: [] };
@@ -1730,6 +2234,9 @@ async function startSession() {
 
     state.session = session;
     state.view = 'session';
+    state.automationNotice = startNotice
+      ? { sessionId: session.id, kind: startNotice.kind, text: startNotice.text }
+      : null;
     state.showEditor = {};
     state.dismissedDraftEditors = new Set();
     state.stanceChoice = {};
@@ -1741,7 +2248,7 @@ async function startSession() {
     render();
     renderHistoryList();
     window.scrollTo(0, 0);
-    toast('讨论已创建');
+    toast(autoStarted ? '讨论已创建，已开始自动发送' : '讨论已创建');
     void reloadList({ silent: true });
   } catch (error) {
     showHomeError(friendlyError(error, '创建失败'));
@@ -1791,7 +2298,11 @@ async function openSession(id) {
 
     state.session = session;
     state.view = 'session';
-    state.automationSignature = automationRunSignature(automationRun(session));
+    /* 旧场次只读取现有状态，不在这里启动任何自动。 */
+    state.automationSnapshot[session.id] = automationSeatSnapshot(automationRun(session));
+    state.automationNotice = state.automationNotice && state.automationNotice.sessionId === session.id
+      ? state.automationNotice
+      : null;
     state.showEditor = {};
     state.dismissedDraftEditors = new Set();
     state.stanceChoice = {};
@@ -1931,7 +2442,9 @@ async function deleteCurrentSession(button) {
       state.sessions = state.sessions.filter((item) => item.id !== current.id);
       state.session = null;
       state.automationPanel = null;
-      state.automationSignature = '';
+      state.automationNotice = null;
+      state.autoSeatEls = new Map();
+  state.promptStateEls = new Map();
       state.view = 'home';
       state.showEditor = {};
       state.dismissedDraftEditors = new Set();
@@ -1964,6 +2477,8 @@ function renderSession() {
   state.taskErrorEls = new Map();
   state.automationPanel = null;
   state.nextStepPanel = null;
+  state.autoSeatEls = new Map();
+  state.promptStateEls = new Map();
 
   const wrap = h('div', { class: 'wrap session' });
   wrap.append(renderSessionHeader(session), renderStepper(session));
@@ -1994,8 +2509,25 @@ function renderSession() {
 
 function renderAutomationPanel(session) {
   const seats = automationSeats(session);
-  const statusEl = h('span');
-  const seatListEl = h('div');
+  const hasPublic = seats.some(isPublicAutomationSeat);
+  const hasLocal = seats.some(isLocalAutomationSeat);
+
+  const summaryEl = h('span', { class: 'auto-panel-summary' });
+  const noticeEl = h('p', { class: 'auto-notice', role: 'status', hidden: true });
+  const seatListEl = h('div', { class: 'auto-seat-list' });
+  const rows = new Map();
+
+  for (const provider of seats) {
+    const dot = h('span', { class: 'auto-dot', attrs: { 'aria-hidden': 'true' } });
+    const name = h('span', { class: 'auto-seat-name', text: providerName(provider) });
+    const stateEl = h('span', { class: 'auto-seat-state', text: '待命' });
+    const detailEl = h('span', { class: 'auto-seat-detail', text: '' });
+    seatListEl.append(h('div', {
+      class: 'auto-seat-row',
+      dataset: { provider },
+    }, dot, name, stateEl, detailEl));
+    rows.set(provider, { dot, stateEl, detailEl });
+  }
 
   const startButton = h('button', {
     class: 'btn btn-small btn-strong',
@@ -2018,30 +2550,34 @@ function renderAutomationPanel(session) {
   });
   refreshButton.addEventListener('click', () => { void refreshAutomationNow(refreshButton); });
 
-  const settingsLink = h('a', {
+  const settingsLink = hasLocal ? h('a', {
     class: 'link-quiet',
     href: 'connections.html',
     target: '_blank',
     rel: 'noopener noreferrer',
     text: '连接设置',
     title: '配置本机席位的网页地址和选择器',
-  });
+  }) : null;
 
   const panel = h('section', {
-    class: 'manual-note',
-    attrs: { 'aria-label': '本机自动' },
+    class: 'auto-panel',
+    attrs: { 'aria-label': hasPublic ? '自动发送' : '本机自动' },
   },
-    h('div', {},
-      h('strong', { text: '本机自动' }),
-      statusEl,
-      seatListEl),
-    h('div', {}, startButton, stopButton, refreshButton, settingsLink));
+    h('div', { class: 'auto-panel-head' },
+      h('strong', { class: 'auto-panel-title', text: hasPublic ? '自动发送' : '本机自动' }),
+      summaryEl),
+    noticeEl,
+    seatListEl,
+    h('div', { class: 'auto-panel-actions' }, startButton, stopButton, refreshButton, settingsLink));
 
   state.automationPanel = {
     sessionId: session.id,
     seats,
-    statusEl,
-    seatListEl,
+    hasPublic,
+    hasLocal,
+    summaryEl,
+    noticeEl,
+    rows,
     startButton,
     stopButton,
     refreshButton,
@@ -2050,40 +2586,64 @@ function renderAutomationPanel(session) {
   return panel;
 }
 
+function canStartAutomationSeat(provider) {
+  if (isPublicAutomationSeat(provider)) return true;
+  return Boolean(automationConfig(provider));
+}
+
 function updateAutomationPanel() {
   const panel = state.automationPanel;
-  if (!panel || !panel.statusEl || !panel.statusEl.isConnected) return;
+  if (!panel || !panel.summaryEl) return;
   const session = state.session;
   if (!session || session.id !== panel.sessionId) return;
 
   const run = automationRun(session);
-  let summary = automationRunSummary(run);
+  let summary = automationRunSummary(run, session);
   if (state.automation.error) {
     summary = `${summary} 读取自动状态失败：${oneLine(state.automation.error, 120)}`;
   }
   if (state.automationRefreshPending) {
     summary = `${summary} 有新的自动进展；结束当前编辑后会自动刷新。`;
   }
-  panel.statusEl.textContent = summary;
+  panel.summaryEl.textContent = summary;
 
-  panel.seatListEl.replaceChildren();
-  for (const provider of panel.seats) {
-    const seat = automationSeatState(run, provider);
-    const configured = automationConfig(provider) ? '' : ' · 未配置';
-    const detail = seat && seat.detail ? ` · ${oneLine(seat.detail, 120)}` : '';
-    panel.seatListEl.append(h('div', {
-      title: seat && seat.detail ? seat.detail : '',
-      text: `${providerName(provider)}（${provider}）：${automationSeatLabel(seat)}${configured}${detail}`,
-    }));
+  /* 授权被拒、启动失败这类配置问题要一直留在页面上，不只是弹一条提示。 */
+  const notice = automationNoticeFor(session);
+  const errorText = !notice && state.automation.error
+    ? `读取自动状态失败：${oneLine(state.automation.error, 160)}`
+    : '';
+  const shown = notice ? notice.text : errorText;
+  panel.noticeEl.hidden = !shown;
+  if (shown) {
+    panel.noticeEl.className = `auto-notice is-${notice ? notice.kind : 'error'}`;
+    panel.noticeEl.textContent = shown;
   }
 
-  const configuredCount = panel.seats.filter((provider) => automationConfig(provider)).length;
+  for (const [provider, refs] of panel.rows) {
+    const seat = automationSeatState(run, provider);
+    const tone = automationStatusTone(seat);
+    refs.dot.className = `auto-dot ${tone}`;
+    refs.stateEl.className = `auto-seat-state ${tone}`;
+    refs.stateEl.textContent = automationSeatContextLabel(seat, run, session, provider);
+    const detailParts = [];
+    if (seat && seat.detail) detailParts.push(String(seat.detail));
+    if (isLocalAutomationSeat(provider) && !automationConfig(provider)) {
+      detailParts.push('未连接设置，按手动');
+    }
+    refs.detailEl.textContent = detailParts.join(' · ');
+  }
+
+  const startable = panel.seats.filter(canStartAutomationSeat);
   const active = Boolean(run && run.enabled);
-  panel.startButton.hidden = active;
-  panel.startButton.disabled = state.automationBusy || configuredCount === 0;
-  panel.startButton.title = configuredCount === 0
-    ? '先在连接设置保存网页地址和选择器'
-    : '手动开始自动发送；复制、粘贴和提交一直可用';
+  panel.startButton.hidden = active || session.stage === 'done';
+  panel.startButton.disabled = state.automationBusy || startable.length === 0;
+  if (!startable.length) {
+    panel.startButton.title = '先在连接设置保存本机席位的网页地址和选择器';
+  } else if (panel.hasPublic) {
+    panel.startButton.title = '会先请求原站权限再开始发送；复制、粘贴和提交一直可用';
+  } else {
+    panel.startButton.title = '手动开始自动发送；复制、粘贴和提交一直可用';
+  }
   panel.stopButton.hidden = !active;
   panel.stopButton.disabled = state.automationBusy;
   panel.refreshButton.hidden = !active;
@@ -2093,16 +2653,24 @@ function updateAutomationPanel() {
 function renderSessionHeader(session) {
   const seats = session.providers.map((provider, index) => {
     const seat = seatLetter(index).toLowerCase();
+    let seatTitle = '原站席位：手动复制提示、粘贴回答';
+    if (isPublicAutomationSeat(provider)) {
+      seatTitle = '公开席位：开始讨论时按站申请权限，授权后自动发送；也能手动粘贴';
+    } else if (isAutomationSeat(provider)) {
+      seatTitle = automationConfig(provider)
+        ? '本机席位：可以手动，也可以在连接设置后自动'
+        : '本机席位：还没保存地址，只能手动';
+    }
+    const mode = automationSeatMode(session, provider);
+    const modeClass = /待处理|未配置/.test(mode)
+      ? 'provider-tag is-issue'
+      : (mode === '自动' ? 'provider-tag is-auto' : 'provider-tag');
     return h('span', {
       class: `seat-meta seat-meta-${seat}`,
-      title: isAutomationSeat(provider)
-        ? automationConfig(provider)
-          ? '本机席位：可以手动，也可以在连接设置后自动'
-          : '本机席位：还没保存地址，只能手动'
-        : '原站席位：手动复制提示、粘贴回答',
+      title: seatTitle,
     }, h('span', { class: 'seat-dot', attrs: { 'aria-hidden': 'true' } }),
       `席 ${seatLetter(index)} · ${providerName(provider)}`,
-      h('span', { class: 'provider-tag', text: automationSeatMode(session, provider) }));
+      h('span', { class: modeClass, text: mode }));
   });
 
   const statusText = session.stage === 'done'
@@ -2335,12 +2903,24 @@ function renderStage(session) {
     answered: tasks.filter((task) => task.status === 'answered').length,
     skipped: tasks.filter((task) => task.status === 'skipped').length,
   };
-  counts.pending = tasks.length - counts.answered - counts.skipped;
+  const remaining = tasks.length - counts.answered - counts.skipped;
+  /* 自动正在驱动、且已有具体状态的席位，卡上已写「正在发送 / 正在生成」；
+   * 不再并列算进「待回答」，只保留还没拿到具体状态的席位。 */
+  const run = automationRun(session);
+  counts.auto = tasks.filter((task) => {
+    if (task.status !== 'pending') return false;
+    const provider = String(task.provider || '').toLowerCase();
+    const seat = run ? automationSeatState(run, provider) : null;
+    if (!seat || !automationSeatDriving(run, seat)) return false;
+    return AUTOMATION_RUNNING_STATUSES.has(String(seat.status || '').toLowerCase());
+  }).length;
+  counts.pending = remaining - counts.auto;
 
   const section = h('section', { class: 'stage', attrs: { 'aria-labelledby': 'stage-title' } });
   const countLine = h('div', { class: 'stage-count' },
     h('span', { text: `本阶段 ${tasks.length} 席 · 已收到 ${counts.answered} / ${tasks.length}` }),
     counts.skipped ? h('span', { class: 'count-skip', text: `跳过 ${counts.skipped}` }) : null,
+    counts.auto ? h('span', { class: 'count-auto', text: `自动中 ${counts.auto}` }) : null,
     counts.pending ? h('span', { class: 'count-pending', text: `待回答 ${counts.pending}` }) : null);
 
   section.append(
@@ -2367,13 +2947,15 @@ function renderStage(session) {
   const nextStep = renderNextStep(session, nextTask);
   if (nextStep) section.append(nextStep);
 
-  const grid = h('div', { class: `seat-grid${tasks.length === 1 ? ' is-single' : ''}` });
+  /* 有空间时三席并排；两席、单席各有自己的列宽。窄屏由 CSS 收回成两列或一列。 */
+  const layoutClass = tasks.length === 1 ? ' is-single' : tasks.length === 3 ? ' is-triple' : '';
+  const grid = h('div', { class: `seat-grid${layoutClass}` });
   tasks.forEach((task, index) => {
     grid.append(renderTaskCard(session, task, index, nextTask ? nextTask.id : ''));
   });
   section.append(grid);
 
-  if (counts.pending === 0) {
+  if (remaining === 0) {
     const refresh = h('button', { class: 'btn btn-small', type: 'button', text: '刷新状态' });
     refresh.addEventListener('click', () => { void refreshSession(refresh); });
     section.append(
@@ -2528,7 +3110,10 @@ function canCorrectTask(session, task) {
   if (!CORRECTABLE_STAGES.has(session.stage)) return false;
   if (task.status !== 'answered') return false;
   if (!String(task.answer || '').trim()) return false;
-  if (isAutomationSeat(task.provider)) return false;
+  /* 本机席位由驱动写入，后台一律拒绝改正；公开席位只有没在自动驱动时才
+   * 允许人工改正，避免和原页答案分叉。 */
+  if (isLocalAutomationSeat(task.provider)) return false;
+  if (!seatOperatesManually(session, String(task.provider || '').toLowerCase())) return false;
   if (!session.tasks.some((item) => item.id === task.id)) return false;
   return session.tasks.some((item) => item.id !== task.id && item.status === 'pending');
 }
@@ -2578,6 +3163,150 @@ function renderRevisionDetails(task) {
   return details;
 }
 
+/* ------------------------------ 席卡上的自动进度 ------------------------------ */
+
+/* 停掉这一席的自动发送，保留已读到的预览；进度区和故障区共用同一个按钮。 */
+function seatTakeoverButton(session, task) {
+  const button = h('button', {
+    class: 'btn btn-small',
+    type: 'button',
+    text: '手动接管',
+    title: '停止这一席的自动发送；已生成的内容保留，之后按手动粘贴回答',
+  });
+  button.addEventListener('click', () => { void takeoverSeat(session, task, button); });
+  return button;
+}
+
+/* 只在自动仍在驱动这一席时渲染：发送确认、生成中、已完成和失败原因都写在
+ * 这张卡上，不动其他席位的内容。preview 一律按纯文本写入。 */
+function renderSeatAuto(session, task, providerId, seat) {
+  const entry = {
+    provider: providerId,
+    taskId: String((seat && seat.taskId) || ''),
+    root: null,
+    dot: h('span', { class: 'auto-dot', attrs: { 'aria-hidden': 'true' } }),
+    stateEl: h('span', { class: 'seat-auto-state' }),
+    detailEl: h('span', { class: 'seat-auto-detail' }),
+    previewHead: h('div', { class: 'seat-auto-preview-meta', hidden: true },
+      h('span', { class: 'seat-auto-preview-label', text: '原页正文' }),
+      h('span', { class: 'seat-auto-preview-hint', text: `来自 ${providerName(providerId)} 原页 · 生成中` })),
+    previewEl: h('pre', { class: 'seat-auto-preview', hidden: true }),
+  };
+
+  const openButton = h('button', {
+    class: 'btn btn-small btn-ghost',
+    type: 'button',
+    text: '打开原页',
+    title: '打开这一席的对话页；自动标签会被复用',
+  });
+  openButton.addEventListener('click', () => { void openProviderSite(session, task, openButton); });
+
+  entry.root = h('section', {
+    class: 'seat-auto',
+    dataset: { provider: providerId, taskId: entry.taskId },
+    attrs: { 'aria-label': `${providerName(providerId)} 的自动进度` },
+  },
+    h('div', { class: 'seat-auto-head' },
+      entry.dot,
+      entry.stateEl,
+      entry.detailEl),
+    entry.previewHead,
+    entry.previewEl,
+    h('div', { class: 'seat-auto-actions' }, openButton, seatTakeoverButton(session, task)));
+
+  state.autoSeatEls.set(providerId, entry);
+  applySeatAutoView(entry, seat, automationRun(session), session);
+  return entry.root;
+}
+
+/* 需要处理的席位：先给原页和接管两个入口，再由现有手动动作负责粘贴或跳过。
+ * 讨论整体暂停时不提供接管，避免把暂停误当成这一席故障。 */
+function renderSeatAutoIssue(session, task, providerId, seat) {
+  const preview = seatPreviewText(seat, task.id);
+  const status = String((seat && seat.status) || '').toLowerCase();
+  const canTakeover = Boolean(seat) && !seat.takenOver && status !== 'session-paused';
+  const openButton = h('button', {
+    class: 'btn btn-small btn-ghost',
+    type: 'button',
+    text: '打开原页',
+  });
+  openButton.addEventListener('click', () => { void openProviderSite(session, task, openButton); });
+  return h('div', {
+    class: 'seat-auto seat-auto-issue',
+    dataset: { provider: providerId },
+  },
+    h('div', { class: 'seat-auto-head' },
+      h('span', { class: 'auto-dot is-error', attrs: { 'aria-hidden': 'true' } }),
+      h('span', { class: 'seat-auto-state is-error', text: automationSeatLabel(seat) }),
+      h('span', {
+        class: 'seat-auto-detail',
+        text: seat && seat.detail ? String(seat.detail) : '这一席不会自动重发；核对原页后手动粘贴或跳过。',
+      })),
+    preview && h('div', { class: 'seat-auto-preview-meta' },
+      h('span', { class: 'seat-auto-preview-label', text: '原页正文' }),
+      h('span', { class: 'seat-auto-preview-hint', text: `来自 ${providerName(providerId)} 原页 · 尚未保存` })),
+    preview && h('pre', {
+      class: 'seat-auto-preview',
+      text: preview,
+      attrs: { 'aria-label': '来自原页、尚未保存的网页正文' },
+    }),
+    h('div', { class: 'seat-auto-actions' },
+      openButton,
+      canTakeover ? seatTakeoverButton(session, task) : null));
+}
+
+/* 后台把正在生成的正文放在 seat.preview = { taskId, text, … }。只有同一任务的
+ * 片段才会显示；它永远不会被当作回答。 */
+function seatPreviewText(seat, taskId) {
+  const preview = seat && seat.preview;
+  if (!preview || typeof preview !== 'object') return '';
+  if (typeof preview.text !== 'string' || !preview.text) return '';
+  if (taskId && preview.taskId && preview.taskId !== taskId) return '';
+  if (taskId && seat.taskId && seat.taskId !== taskId) return '';
+  return preview.truncated ? `…\n${preview.text}` : preview.text;
+}
+
+function applySeatAutoView(entry, seat, run, session) {
+  if (!entry || !entry.root) return;
+  const tone = automationStatusTone(seat);
+  entry.dot.className = `auto-dot ${tone}`;
+  entry.stateEl.className = `seat-auto-state ${tone}`;
+  entry.stateEl.textContent = automationSeatContextLabel(seat, run, session, entry.provider);
+  entry.detailEl.textContent = seat && seat.detail ? String(seat.detail) : '';
+
+  const status = String((seat && seat.status) || '').toLowerCase();
+  const preview = seatPreviewText(seat, entry.taskId);
+  const showPreview = Boolean(preview) && status !== 'answered';
+  const el = entry.previewEl;
+  const nearBottom = el.hidden
+    || (el.scrollHeight - el.scrollTop - el.clientHeight) < 24;
+  if (el.textContent !== preview) el.textContent = preview;
+  el.hidden = !showPreview;
+  if (entry.previewHead) entry.previewHead.hidden = !showPreview;
+  if (showPreview) {
+    /* 流式时跟随到底部，但用户往上翻看时不动滚动位置。 */
+    if (nearBottom) el.scrollTop = el.scrollHeight;
+  }
+  entry.root.dataset.status = status;
+  entry.root.classList.toggle('is-running', tone === 'is-running');
+  entry.root.classList.toggle('is-done', tone === 'is-done');
+  entry.root.classList.toggle('is-error', tone === 'is-error');
+}
+
+/* 从 automation.progress 只增量更新仍显示同一任务的席卡；不重绘整页。 */
+function updateSeatAutoViews(run) {
+  updatePromptStatusViews();
+  if (!run || !state.autoSeatEls) return;
+  for (const [provider, entry] of state.autoSeatEls) {
+    if (!entry || !entry.root || !entry.root.isConnected) continue;
+    const seat = automationSeatState(run, provider);
+    if (!seat) continue;
+    const taskId = String(seat.taskId || '');
+    if (entry.taskId && taskId && entry.taskId !== taskId) continue;
+    applySeatAutoView(entry, seat, run, state.session);
+  }
+}
+
 function renderTaskCard(session, task, fallbackIndex, nextTaskId) {
   const providerId = String(task.provider || '').toLowerCase();
   const seatIndex = session.providers.indexOf(providerId);
@@ -2611,9 +3340,12 @@ function renderTaskCard(session, task, fallbackIndex, nextTaskId) {
     text: statusLabel(task.status),
   });
 
-  const autoSeat = isAutomationSeat(providerId)
-    ? automationSeatState(automationRun(session), providerId)
-    : null;
+  const autoRun = isAutomationSeat(providerId) ? automationRun(session) : null;
+  const autoSeat = autoRun ? automationSeatState(autoRun, providerId) : null;
+  const autoDriving = automationSeatDriving(autoRun, autoSeat);
+  /* 需要人工处理的自动席已有「自动待处理」和具体原因，不再并排一个「待回答」。 */
+  const autoIssue = Boolean(
+    autoRun && autoRun.enabled && autoSeat && automationSeatNeedsAction(autoSeat));
   const header = h('div', { class: 'seat-top' },
     h('div', { class: 'seat-identity' },
       h('span', { class: `seat-badge seat-badge-${seat.toLowerCase()}`, text: seat }),
@@ -2625,12 +3357,20 @@ function renderTaskCard(session, task, fallbackIndex, nextTaskId) {
     h('div', { class: 'seat-status' },
       isNext ? h('span', { class: 'draft-chip', text: '下一步' }) : null,
       hasDraft && !editorOpen && !terminal ? h('span', { class: 'draft-chip', text: '有草稿' }) : null,
-      autoSeat && automationSeatNeedsAction(autoSeat)
+      autoSeat && !terminal && automationSeatNeedsAction(autoSeat) && !autoSeat.takenOver
         ? h('span', { class: 'draft-chip', text: '自动待处理', title: autoSeat.detail || '' })
         : null,
       isCorrectedAnswer(task) ? revisionChip() : null,
-      statusChip));
-  card.append(header, renderPromptBox(task));
+      terminal || (!autoDriving && !autoIssue) ? statusChip : null));
+  card.append(header, renderPromptBox(session, task));
+
+  /* 自动仍在驱动这一席：把发送确认、生成正文和接管入口放在这张卡上。 */
+  if (!terminal && autoDriving) {
+    const autoRow = renderSeatAuto(session, task, providerId, autoSeat);
+    if (autoRow) card.append(autoRow);
+  } else if (!terminal && autoSeat && automationSeatNeedsAction(autoSeat)) {
+    card.append(renderSeatAutoIssue(session, task, providerId, autoSeat));
+  }
 
   const actions = h('div', { class: 'task-actions' });
 
@@ -2735,21 +3475,16 @@ function renderTaskCard(session, task, fallbackIndex, nextTaskId) {
       moreActions(),
     ]);
   } else {
-    /* 自动席位已在跑：不摆手动主按钮，说明状态，把接管入口放进「更多操作」。 */
-    const autoLabel = autoSeat ? automationSeatLabel(autoSeat) : '待命';
-    actions.append(
-      h('p', {
-        class: 'task-auto-note',
-        text: `本机自动：${autoLabel}。需要自己接手时展开「更多操作」。`,
-        title: autoSeat?.detail || '',
-      }),
-      moreActions(editorOpen ? null : editorButton(hasDraft ? '继续草稿' : '手动填写', '')));
+    /* 自动席位已在跑：不摆手动主按钮，状态和接管入口都在上面的进度区。 */
+    actions.append(moreActions(editorOpen ? null : editorButton(hasDraft ? '继续草稿' : '手动填写', '')));
   }
 
-  card.append(actions, renderAnswerBlock(session, task, isNext));
+  /* 原页正文 / 生成预览之后紧接保存后的回答，动作按钮放最后，避免打断阅读。 */
+  card.append(renderAnswerBlock(session, task, isNext));
   if (!terminal && session.stage === 'critique') {
     appendChildren(card, [renderCritiqueContext(session, task, session.round)]);
   }
+  card.append(actions);
 
   const errorEl = h('div', {
     class: 'task-error',
@@ -2770,12 +3505,97 @@ function renderTaskCard(session, task, fallbackIndex, nextTaskId) {
   return card;
 }
 
-function renderPromptBox(task) {
+/* 后台回执只认当前任务的 dispatch 记录：同一席、相位已经过原页用户消息核对。
+ * 复制提示、点按钮或自动流程刚开始都不会产生这里说的「已确认发送」。 */
+function taskDispatchReceipt(session, task) {
+  if (!session || !task) return null;
+  if (!isAutomationSeat(task.provider)) return null;
+  const run = automationRun(session);
+  if (!run || !run.dispatch || typeof run.dispatch !== 'object') return null;
+  const taskId = String(task.id || '');
+  if (!taskId) return null;
+  const item = run.dispatch[taskId];
+  if (!item || typeof item !== 'object') return null;
+  const provider = String(task.provider || '').toLowerCase();
+  if (String(item.provider || '').toLowerCase() !== provider) return null;
+  const phase = String(item.phase || '').toLowerCase();
+  if (!CONFIRMED_DISPATCH_PHASES.has(phase)) return null;
+  const seat = automationSeatState(run, provider);
+  if (seat && seat.taskId && String(seat.taskId) !== taskId) return null;
+  return item;
+}
+
+/* 提示入口只描述这一轮提示的发送状态，不参与任何判断。 */
+function taskPromptStatus(session, task) {
+  if (task.status === 'skipped') {
+    return { tone: 'skipped', label: '已跳过', title: '这一席本轮没有发送提示' };
+  }
+  const receipt = taskDispatchReceipt(session, task);
+  if (receipt) {
+    const at = Number(receipt.at);
+    return {
+      tone: 'sent',
+      label: '已确认发送',
+      title: Number.isFinite(at) && at > 0
+        ? `后台核对了这一轮的用户消息 · ${formatTime(at)}`
+        : '后台核对了这一轮的用户消息',
+    };
+  }
+  if (task.status === 'answered') {
+    return { tone: 'manual', label: '手动录入', title: '这一席的回答是粘贴进来的，没有自动发送回执' };
+  }
+  const provider = String(task.provider || '').toLowerCase();
+  const run = automationRun(session);
+  const seat = run ? automationSeatState(run, provider) : null;
+  const status = String((seat && seat.status) || '').toLowerCase();
+  if (seat && String(seat.taskId || '') === String(task.id || '')
+    && SENDING_DISPATCH_PHASES.has(status)) {
+    return {
+      tone: 'sending',
+      label: '发送中 · 待核对',
+      title: '正在原页发送；后台核对到用户消息后才会标记已确认发送',
+    };
+  }
+  return { tone: 'ready', label: '准备发送', title: '提示已保存在本机；还没有后台发送回执' };
+}
+
+function applyPromptStatus(entry, session) {
+  if (!entry || !entry.el || !entry.el.isConnected) return;
+  const task = (session.tasks || []).find((item) => item.id === entry.taskId);
+  if (!task) return;
+  const status = taskPromptStatus(session, task);
+  const className = `prompt-status is-${status.tone}`;
+  if (entry.el.className !== className) entry.el.className = className;
+  if (entry.el.textContent !== status.label) entry.el.textContent = status.label;
+  const title = status.title || '';
+  if (entry.el.title !== title) entry.el.title = title;
+}
+
+function updatePromptStatusViews() {
+  if (!state.session || !state.promptStateEls) return;
+  for (const entry of state.promptStateEls.values()) applyPromptStatus(entry, state.session);
+}
+
+/* 提示默认只露出一行摘要，点开才读精确全文；摘要不会把三席的回答挤出首屏。 */
+function renderPromptBox(session, task) {
   const prompt = typeof task.prompt === 'string' ? task.prompt : '';
+  const status = taskPromptStatus(session, task);
+  const statusEl = h('span', {
+    class: `prompt-status is-${status.tone}`,
+    text: status.label,
+    title: status.title || '',
+  });
+  state.promptStateEls.set(task.id, { el: statusEl, taskId: task.id });
   const details = h('details', { class: 'prompt-box' },
     h('summary', {},
-      h('span', { text: '本轮提示原文' }),
-      h('span', { class: 'prompt-hint', text: prompt ? '展开' : '未保存' })));
+      h('span', { class: 'prompt-head' },
+        h('span', { class: 'prompt-title', text: '本轮提示原文' }),
+        statusEl),
+      h('span', { class: 'prompt-hint', text: prompt ? '读全文' : '未保存' }),
+      h('span', {
+        class: 'prompt-excerpt',
+        text: prompt ? oneLine(prompt, 120) : '这一轮没有保存提示原文。',
+      })));
   if (prompt) {
     details.append(
       h('pre', { class: 'prompt-text', text: prompt }),
@@ -2785,8 +3605,7 @@ function renderPromptBox(task) {
           type: 'button',
           text: '复制这一份',
           onClick: () => copyPrompt(task),
-        })),
-    );
+        })));
   }
   return details;
 }
@@ -2795,7 +3614,12 @@ function renderAnswerBlock(session, task, isNext) {
   if (task.status === 'answered') {
     const block = h('div', { class: 'answer-block' });
     const head = h('div', { class: 'answer-head' },
-      h('span', { class: 'answer-label', text: session.stage === 'vote' ? '本轮表态' : '已收到的原文' }));
+      h('span', { class: 'answer-label', text: session.stage === 'vote' ? '本轮表态' : '已收到的原文' }),
+      task.answeredAt > 0 ? h('span', {
+        class: 'answer-label',
+        text: formatAbsolute(task.answeredAt),
+        title: '工作台收到完整回答的时间',
+      }) : null);
     if (task.stance) head.append(stanceChip(task.stance));
     if (isCorrectedAnswer(task)) head.append(revisionChip());
     const answer = task.answer && task.answer.trim()
@@ -3293,8 +4117,9 @@ function seatOperatesManually(session, providerId) {
   const run = automationRun(session);
   if (!run || !run.enabled) return true;
   const seat = automationSeatState(run, providerId);
+  if (!seat) return false;
   if (automationSeatNeedsAction(seat)) return true;
-  return Boolean(seat && seat.status === 'detached');
+  return seat.status === 'detached';
 }
 
 /* 一次点击完成复制和打开原页。复制失败时绝不声称已复制；两边分开报告，
@@ -4170,6 +4995,7 @@ function downloadText(text, filename) {
 /* ------------------------------ 启动 ------------------------------ */
 
 function bindGlobalEvents() {
+  bindAutomationEvents();
   document.getElementById('new-session')?.addEventListener('click', goHome);
 
   searchEl?.addEventListener('input', (event) => {
