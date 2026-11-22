@@ -2328,18 +2328,6 @@ textarea {
   font-weight: 650;
 }
 
-.report-conditions-list {
-  margin: 0;
-  padding-left: 17px;
-  color: var(--ink-soft);
-  font-size: 12.5px;
-  line-height: 1.7;
-}
-
-.report-conditions-list li {
-  margin: 3px 0;
-}
-
 .report-details {
   margin-top: 16px;
   padding-top: 12px;

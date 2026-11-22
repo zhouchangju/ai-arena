@@ -741,7 +741,7 @@ async function callDriver(id, provider, config, command) {
 async function pauseSeat(id, provider, task, reason, detail) {
   if (!(await runEnabled(id))) return;
   const actionHint =
-    '已停止对该席的自动重发。请打开该席原页核对；修正配置或页面状态后，再次点击“开始自动化”。';
+    '该席不会自动重发。若仍可查看原对话，请先核对。已有完整回答可在工作台粘贴，也可跳过这一席。';
   return updateSeat(id, provider, {
     status: 'paused',
     taskId: task ? task.id : '',
@@ -1350,7 +1350,6 @@ async function pumpSeat(id, session, provider, config) {
       provider,
       task,
       '上次提交未确认',
-      '请打开原页核对后，再次点击“开始自动化”',
     );
     return;
   }

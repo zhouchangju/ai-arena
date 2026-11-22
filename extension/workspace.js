@@ -1,4 +1,5 @@
 import { PROVIDERS, AUTOMATION_PROVIDER_IDS } from './providers.js';
+import { latestAnsweredProposal, proposalDigest } from './core.js';
 
 /* ---------------------------------------------------------------------------
  * 判断台工作台
@@ -886,6 +887,8 @@ function normalizeHistoryEntry(raw, fallbackIndex = 0) {
     ...task,
     stage: STAGE_BY_KEY.has(raw.stage) ? raw.stage : String(raw.stage || ''),
     round: Number.isFinite(Number(raw.round)) ? Number(raw.round) : 1,
+    version: raw.version,
+    proposalDigest: raw.proposalDigest,
   };
 }
 
@@ -963,7 +966,13 @@ function sessionProviderList(session) {
 
 function deriveStances(session) {
   const providers = sessionProviderList(session);
-  const entries = session.history.filter((entry) => entry.stage === 'vote');
+  const proposal = session.stage === 'done' ? latestAnsweredProposal(session.history) : null;
+  const digest = proposal ? proposalDigest(proposal) : null;
+  const entries = session.history.filter((entry) => entry.stage === 'vote' && (
+    session.stage !== 'done' || (proposal
+      && entry.version === proposal.version
+      && entry.proposalDigest === digest)
+  ));
   if (session.stage === 'vote') {
     entries.push(...session.tasks.map((task) => ({ ...task, stage: 'vote', round: session.round })));
   }
@@ -979,6 +988,7 @@ function deriveStances(session) {
         status: entry.status || 'pending',
         stance: entry.stance,
         answer: entry.answer || '',
+        sourceId: entry.sourceId,
       });
     }
   }
@@ -3595,18 +3605,10 @@ function reportReasonOf(session, sections) {
   return '';
 }
 
-function reportConditions(sections) {
-  const section = sections.get('未解决分歧与附加条件');
-  if (!section) return [];
-  return section.lines
-    .map((line) => line.trim())
-    .filter((line) => /^[-*]\s+/.test(line))
-    .map((line) => line.replace(/^[-*]\s+/, ''))
-    .filter((text) => text && !/^当前版本没有记录到明确反对或附加条件。?$/.test(text));
-}
-
 function renderReport(session) {
   const reportText = session.report && session.report.trim() ? session.report.trim() : '';
+  const stanceSummary = renderStanceSummary(session);
+  const openConditions = stanceSummary.querySelector('#report-open-conditions');
   const actions = h('div', { class: 'report-actions' });
 
   actions.append(h('button', {
@@ -3652,8 +3654,6 @@ function renderReport(session) {
     const bodyText = hasProposal
       ? answerLines.slice(1).join('\n').trim()
       : reportSectionText(sections.get('建议回答'));
-    const conditions = reportConditions(sections);
-
     const answer = h('div', { class: 'report-answer' },
       h('div', { class: 'report-answer-head' },
         h('p', {
@@ -3667,6 +3667,19 @@ function renderReport(session) {
       const meta = h('p', { class: 'report-answer-meta' });
       appendReportInline(meta, metaText, sources);
       answer.append(meta);
+    }
+
+    if (openConditions) {
+      answer.append(h('p', { class: 'report-status-note' }, h('a', {
+        class: 'link-quiet',
+        href: '#report-open-conditions',
+        text: '查看各席附加条件与反对',
+        onClick: (event) => {
+          event.preventDefault();
+          openConditions.scrollIntoView({ block: 'start' });
+          openConditions.focus({ preventScroll: true });
+        },
+      })));
     }
 
     if (hasProposal && bodyText) {
@@ -3689,26 +3702,13 @@ function renderReport(session) {
       }));
     }
 
-    section.append(answer);
-
-    if (conditions.length) {
-      const list = h('ul', { class: 'report-conditions-list' });
-      for (const text of conditions) {
-        const item = h('li', {});
-        appendReportInline(item, text, sources);
-        list.append(item);
-      }
-      section.append(h('div', { class: 'report-conditions' },
-        h('h3', { class: 'report-conditions-title', text: '尚未解决的条件与反对' }),
-        list));
-    }
+    section.append(answer, stanceSummary);
 
     const visibleText = [
       hasProposal ? metaText : '',
       hasProposal ? bodyText : (bodyText || ''),
-      conditions.join(' '),
     ].join(' ');
-    if (/\[S\d+\]/.test(visibleText)) {
+    if (/\[S\d+\]/.test(visibleText) || openConditions?.querySelector('.report-cite')) {
       section.append(h('p', {
         class: 'report-source-note',
         text: '编号可跳到下面「历次发言」的对应原文。',
@@ -3728,9 +3728,9 @@ function renderReport(session) {
       class: 'report-empty',
       text: '这场讨论已结束，但没有结论文本。逐席表态和发言仍在下面，可以导出。',
     }));
+    section.append(stanceSummary);
   }
 
-  section.append(renderStanceSummary(session));
   return section;
 }
 
@@ -3743,6 +3743,17 @@ function renderStanceSummary(session) {
       text: '缺席、沉默和无法解析的表态都不计为同意。每位都明确同意，且关键条件已写入，才算全体一致。',
     }));
 
+  const conditions = h('div', {
+    class: 'report-conditions',
+    id: 'report-open-conditions',
+    tabIndex: -1,
+    attrs: { role: 'group', 'aria-labelledby': 'report-open-conditions-title' },
+  }, h('h4', {
+    class: 'report-conditions-title',
+    id: 'report-open-conditions-title',
+    text: '尚未解决的条件与反对',
+  }));
+  const otherRows = [];
   for (const row of rows) {
     const reason = row.status === 'none'
       ? '没有确认记录。'
@@ -3751,12 +3762,20 @@ function renderStanceSummary(session) {
         : row.status === 'pending'
           ? '尚未回答。'
           : row.answer && row.answer.trim() ? row.answer : '未保存理由文本。';
-    wrap.append(h('div', { class: 'stance-row' },
+    const outstanding = row.status === 'answered'
+      && (row.stance === 'conditional' || row.stance === 'oppose');
+    const entry = h('div', { class: 'stance-row' },
       h('span', { class: 'stance-name', text: providerName(row.provider) }),
       h('span', {}, stanceChip(row.stance, stanceRowLabel(row))),
-      h('span', { class: 'stance-reason', text: reason })));
+      h('div', {},
+        h('span', { class: 'stance-reason', text: reason }),
+        outstanding && row.sourceId ? [' ', reportCitation(row.sourceId)] : null));
+    if (outstanding) conditions.append(entry);
+    else otherRows.push(entry);
   }
 
+  if (conditions.childElementCount > 1) wrap.append(conditions);
+  wrap.append(...otherRows);
   return wrap;
 }
 

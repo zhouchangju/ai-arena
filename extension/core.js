@@ -546,7 +546,7 @@ function advanceStage(session) {
       advanceFromProposal(session);
       return;
     case 'vote':
-      advanceFromVote(session, completed);
+      advanceFromVote(session);
       return;
     default:
       throw new Error(`cannot advance unknown stage "${completedStage}"`);
@@ -666,7 +666,7 @@ function advanceFromProposal(session) {
   finalize(session, 'proposal-skipped');
 }
 
-function advanceFromVote(session, completedVotes) {
+function advanceFromVote(session) {
   const proposal = latestAnsweredProposal(session.history);
   if (!proposal) {
     finalize(session, 'proposal-skipped');
@@ -674,9 +674,9 @@ function advanceFromVote(session, completedVotes) {
   }
 
   const digest = proposalDigest(proposal);
-  const votes = completedVotes.filter(
+  const votes = answeredHistory(session, 'vote').filter(
     (task) =>
-      task.status === 'answered' &&
+      task.round === session.round &&
       STANCES.includes(task.stance) &&
       task.version === proposal.version &&
       task.proposalDigest === digest,
@@ -913,7 +913,7 @@ function latestByProvider(tasks, provider) {
   return null;
 }
 
-function latestAnsweredProposal(history) {
+export function latestAnsweredProposal(history) {
   const proposals = history.filter(
     (task) =>
       task.stage === 'proposal' &&
@@ -941,7 +941,7 @@ function nextProposalVersion(session) {
  * substituted for the full candidate, or a history entry that changed while
  * keeping the same version.
  */
-function proposalDigest(proposal) {
+export function proposalDigest(proposal) {
   const text = String(proposal?.answer ?? '');
   let hash = 0x811c9dc5;
   for (let index = 0; index < text.length; index += 1) {

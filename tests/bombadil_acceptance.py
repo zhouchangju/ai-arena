@@ -6,7 +6,9 @@ import asyncio
 import hashlib
 import json
 import mimetypes
+import os
 import signal
+import stat
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -16,8 +18,11 @@ from browser_acceptance import REPO_ROOT, extension_id_from_path, find_chromium_
 
 ORIGIN = "http://127.0.0.1:8765"
 WORKSPACE = f"{ORIGIN}/workspace.html"
-BRIDGE = """(origin) => {
+BRIDGE = """(origin, workspace, question) => {
   if (location.origin !== origin) return;
+  if (question !== null && window.top === window && location.href.split('#', 1)[0] === workspace) {
+    Object.defineProperty(window, 'arenaLiveQuestion', { value: question });
+  }
   Object.defineProperty(window.chrome, 'runtime', { value: {
     id: 'arena-bombadil',
     sendMessage(message, callback) {
@@ -25,6 +30,21 @@ BRIDGE = """(origin) => {
     },
   } });
 }"""
+
+
+def check_private_output_directory(directory, label):
+    if directory.is_relative_to(REPO_ROOT):
+        raise ValueError(f"{label} must be outside the repository")
+    while True:
+        try:
+            details = directory.stat()
+            break
+        except FileNotFoundError:
+            directory = directory.parent
+    if not stat.S_ISDIR(details.st_mode):
+        raise ValueError(f"{label} requires an output directory: {directory}")
+    if details.st_uid != os.getuid() or details.st_mode & 0o077:
+        raise ValueError(f"{label} requires an owner-private directory (mode 0700): {directory}")
 
 
 def check_live_session(session, live_dir):
@@ -67,11 +87,39 @@ async def main():
     parser.add_argument("--reproduce", type=Path)
     parser.add_argument("--ext", type=Path, default=REPO_ROOT / "extension")
     parser.add_argument("--live-dir", type=Path, help="Private handoff directory for real model replies")
+    parser.add_argument(
+        "--question-file", type=Path,
+        help="UTF-8 question for a new live run with private outputs outside the repository",
+    )
     args = parser.parse_args()
+    question = None
+    if args.question_file:
+        if not args.live_dir or args.reproduce:
+            parser.error("--question-file requires --live-dir and a new run without --reproduce")
+        try:
+            question = args.question_file.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError) as error:
+            parser.error(f"could not read --question-file as UTF-8: {error}")
+        if not question:
+            parser.error("--question-file must contain a question")
+        try:
+            trace = args.trace.resolve()
+            live = args.live_dir.resolve()
+            check_private_output_directory(trace.parent, "trace")
+            check_private_output_directory(live, "--live-dir")
+            if trace.exists():
+                raise ValueError("trace must be a new output file")
+            if live.exists() and any(live.iterdir()):
+                raise ValueError("--live-dir must be new or empty")
+        except (OSError, RuntimeError, ValueError) as error:
+            parser.error(str(error))
+    else:
+        trace = args.trace.resolve()
+        live = args.live_dir.resolve() if args.live_dir else None
+
     extension = args.ext.resolve()
     executable = find_chromium_executable()
     extension_url = f"chrome-extension://{extension_id_from_path(extension)}/workspace.html"
-    live = args.live_dir.resolve() if args.live_dir else None
     spec = Path(__file__).with_name("bombadil_live.js" if live else "bombadil_workbench.js")
     finished = asyncio.Event()
 
@@ -163,7 +211,8 @@ async def main():
                     )
 
                 await context.expose_binding("arenaTestMessage", relay)
-                await context.add_init_script(f"({BRIDGE})({json.dumps(ORIGIN)})")
+                bridge_args = ", ".join(json.dumps(value) for value in (ORIGIN, WORKSPACE, question))
+                await context.add_init_script(f"({BRIDGE})({bridge_args})")
                 await context.route("http*://**/*", serve)
                 port = (Path(profile) / "DevToolsActivePort").read_text().splitlines()[0]
                 command = [
@@ -171,7 +220,7 @@ async def main():
                     "--remote-debugger", f"http://127.0.0.1:{port}",
                     "--chrome-grant-permissions=", "--instrument-javascript=",
                     "--width", str(args.width), "--height", "800",
-                    "--output-path", str(args.trace.resolve()),
+                    "--output-path", str(trace),
                 ]
                 if args.reproduce:
                     command.extend(("--reproduce", str(args.reproduce.resolve())))
@@ -227,6 +276,8 @@ async def main():
                     await report_page.get_by_role("button", name="导出 Markdown", exact=True).first.click()
                     exported = await report_page.evaluate("() => window.arenaExport")
                     check_live_session(session, live)
+                    if question is not None and session["question"] != question:
+                        raise ValueError("Saved session did not use --question-file")
                     if not exported or session["question"] not in exported or any(
                         entry["sourceId"] not in exported for entry in session["history"] if entry.get("sourceId")
                     ):

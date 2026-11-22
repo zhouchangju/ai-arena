@@ -6,24 +6,28 @@ export {
 } from "@antithesishq/bombadil/browser/defaults/properties";
 
 const providers = ["chatgpt", "gemini", "deepseek"];
-const question = "合成决策题：一个两人团队只剩两个周末。其个人笔记应用的桌面搜索常漏结果，手机采集常被抱怨麻烦，但两边都没有行为数据。应该先做什么？给出一个最小试验、明确的反转条件和容易忽视的反例。请用中文，避免虚构数据，尽量控制在 450 字内。";
+const defaultQuestion = "合成决策题：一个两人团队只剩两个周末。其个人笔记应用的桌面搜索常漏结果，手机采集常被抱怨麻烦，但两边都没有行为数据。应该先做什么？给出一个最小试验、明确的反转条件和容易忽视的反例。请用中文，避免虚构数据，尽量控制在 450 字内。";
 
-const state = extract(({ document }) => ({
-  question: document.querySelector("#question-input")?.value ?? null,
-  selected: [...document.querySelectorAll(".provider-option[aria-pressed=true]")]
-    .map((button) => button.dataset.providerId),
-  ready: Boolean(document.querySelector(".start-row button:not(:disabled)")),
-  report: document.querySelector(".report-status")?.textContent.trim() ?? "",
-  finalSeats: [...new Set([...document.querySelectorAll(".timeline-seat")].map((seat) => seat.textContent))],
-  startupError: Boolean(document.querySelector("#global-error:not([hidden])")),
-  error: document.querySelector(".seat-card .task-error:not([hidden])")?.textContent.trim() ?? "",
-  stage: document.querySelector(".step.is-current .step-label")?.textContent.trim() ?? "",
-  pending: document.querySelectorAll(".seat-card.is-pending").length,
-}));
-
-const setQuestion = registerCustomAction("fill-arena-question", (document, window, text) => {
+const state = extract(({ document }) => {
   const input = document.querySelector("#question-input");
-  input.value = text;
+  const question = document.defaultView.arenaLiveQuestion ?? defaultQuestion;
+  return {
+    questionMatches: input ? input.value === question : null,
+    selected: [...document.querySelectorAll(".provider-option[aria-pressed=true]")]
+      .map((button) => button.dataset.providerId),
+    ready: Boolean(document.querySelector(".start-row button:not(:disabled)")),
+    report: document.querySelector(".report-status")?.textContent.trim() ?? "",
+    finalSeats: [...new Set([...document.querySelectorAll(".timeline-seat")].map((seat) => seat.textContent))],
+    startupError: Boolean(document.querySelector("#global-error:not([hidden])")),
+    error: document.querySelector(".seat-card .task-error:not([hidden])")?.textContent.trim() ?? "",
+    stage: document.querySelector(".step.is-current .step-label")?.textContent.trim() ?? "",
+    pending: document.querySelectorAll(".seat-card.is-pending").length,
+  };
+});
+
+const setQuestion = registerCustomAction("fill-arena-question", (document, window) => {
+  const input = document.querySelector("#question-input");
+  input.value = window.arenaLiveQuestion ?? defaultQuestion;
   input.dispatchEvent(new window.Event("input", { bubbles: true }));
 });
 
@@ -99,8 +103,8 @@ const finish = registerCustomAction("record-final-arena-state", async (document,
 export const liveDiscussion = actions(() => {
   const view = state.current;
   if (view.report) return [finish(), idle()];
-  if (view.question !== null) {
-    if (view.question !== question) return [setQuestion(question)];
+  if (view.questionMatches !== null) {
+    if (!view.questionMatches) return [setQuestion()];
     const next = providers.find((provider) => !view.selected.includes(provider));
     if (next) return [selectSeat(next)];
     if (view.ready) return [start()];
