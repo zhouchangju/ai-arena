@@ -2,7 +2,7 @@
 
 这是一个使用系统 WebKit 的原生 macOS 应用。一个窗口里有 ChatGPT、Gemini 和 DeepSeek 各自的真实网页。流式正文、图片、表格、引用和交互控件由各站渲染。工具栏负责组织轮次，讨论记录保存在本机。
 
-本机已打好的 0.3.0（构建 4，折纸三人组图标）位于 `desktop/build/releases/0.3.0/AI Arena.app`，压缩包在同一目录。这个目录属于本机构建产物；新检出的仓库可按下方命令构建。 [开场界面](../docs/evidence/native-0.3/composer.png) · [讨论界面](../docs/evidence/native-0.3/discussion.png)
+本机已打好的 0.4.0（构建 5）位于 `desktop/build/releases/0.4.0/AI Arena.app`，压缩包在同一目录。这个目录属于本机构建产物；新检出的仓库可按下方命令构建。 [开场界面](../docs/evidence/native-0.3/composer.png) · [讨论界面](../docs/evidence/native-0.3/discussion.png)
 
 ## 第一次使用
 
@@ -12,6 +12,12 @@
 4. 讨论结束会打开报告。也可从「详情」查看发言、出处和报告，用「导出」保存 Markdown。「历史」打开已有记录。应用重启会恢复上次讨论；未完成席先进入人工核对，避免重复发送。记录默认存放在 `~/Library/Application Support/AI Arena/`。
 
 首次登录需要站点本人验证。Google 可能限制嵌入式 WebView 登录。已在本机登录态核对三站的原页收发；具体轮次与验收覆盖见迭代记录。Chrome 扩展的历史、权限和账号属于它自己的浏览器环境。 [Google 授权说明](https://developers.google.com/identity/protocols/oauth2/native-app#disallowed_useragent)
+
+## 最终报告怎么来
+
+起草席收到带有来源编号的讨论原文，用它写出建议回答、成立条件、反例和分歧。每一席都对同一版本的完整候选表态。工作台核对参与记录、候选版本、正文摘要值及明确票态，再把结论、逐席意见与来源编入报告。页面上的“全体一致”表示各席在这次讨论中达成一致，外部事实仍需按引用核实。
+
+详情在独立的 macOS 窗口中打开。先读建议和最终态度，需要核对时再展开发言、质询和出处。复制报告和导出 Markdown 都可取得完整材料，包括往轮中提出的反例。窗口可以拖动边缘调整大小，右上角“最大化”可放大和还原，绿色按钮可进入全屏。标题栏双击遵循 macOS 的系统设置。点击正文中的来源编号（如 [S1]）可以查看对应发言。 [报告窗口示例](../docs/evidence/native-0.4/report.png)
 
 ## 一席停住时怎么看
 

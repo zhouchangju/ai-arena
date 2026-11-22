@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createSession, applyAction } from '../extension/core.js';
+import { createSession, applyAction, proposalDigest, reportBallot } from '../extension/core.js';
 
 const QUESTION = '我的笔记工具值不值得先做移动端？我只有两个周末。';
 const PROVIDERS = ['chatgpt', 'claude'];
@@ -1710,4 +1710,19 @@ test('frozen peer and candidate text is embedded in full, including the middle',
   assert.ok(session.report.includes(candidateMiddle));
   assert.ok(session.report.includes(middleObjection));
   assert.doesNotMatch(session.report, /中间省略/);
+});
+
+test('the reader and report accept only ballots for the exact latest candidate text', () => {
+  const candidate = { id: 'p2', stage: 'proposal', status: 'answered', version: 2, round: 2, answer: '正文 📖 [S1]' };
+  const previous = { ...candidate, id: 'p1', version: 1, round: 1, answer: '旧稿' };
+  const vote = { id: 'v2', stage: 'vote', status: 'answered', provider: 'chatgpt', version: 2,
+    stance: 'conditional', proposalDigest: proposalDigest(candidate) };
+  const history = [previous, candidate, vote,
+    { ...vote, id: 'v1', version: 1, proposalDigest: proposalDigest(previous) },
+    { ...vote, id: 'wrong-digest', proposalDigest: proposalDigest(previous) },
+    { ...vote, id: 'legacy-no-digest', proposalDigest: undefined },
+    { ...vote, id: 'skipped', status: 'skipped' }];
+  const ballot = reportBallot(history);
+  assert.equal(ballot.proposal.id, 'p2');
+  assert.deepEqual(ballot.votes.map(x => [x.id, x.stance]), [['v2', 'conditional']]);
 });

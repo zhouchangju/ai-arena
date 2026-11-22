@@ -168,12 +168,36 @@ final class ArenaAppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            NSApp.windows.first?.makeKeyAndOrderFront(nil)
+            if NSApp.keyWindow == nil { NSApp.windows.first?.makeKeyAndOrderFront(nil) }
         }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    /// Dock 点击或重新激活时，优先把主工作台带回前台。详情窗口是独立
+    /// 辅助窗口，不能代替主窗口成为“重新打开”的落点。
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        guard !flag else { return true }
+        if let main = Self.mainArenaWindow() {
+            if main.isMiniaturized { main.deminiaturize(nil) }
+            main.makeKeyAndOrderFront(nil)
+        } else if !ArenaDetailsWindowController.shared.focusIfVisible() {
+            NSApp.windows.first?.makeKeyAndOrderFront(nil)
+        }
+        return true
+    }
+
+    @MainActor
+    private static func mainArenaWindow() -> NSWindow? {
+        let details = ArenaDetailsWindowController.shared.window
+        return NSApp.windows.first {
+            $0 !== details
+                && $0.styleMask.contains(.titled)
+                && !$0.isSheet
+                && $0.canBecomeMain
+        }
     }
 }
 
@@ -186,7 +210,6 @@ struct ArenaRootView: View {
     @State private var roundLimit = 3
     private var hasStarted: Bool { model.session != nil }
     @State private var takenOver: Set<String> = []
-    @State private var detailsRequest: ArenaDetailRequest?
     @State private var backfillRequest: ArenaSeatTarget?
     @State private var backfillTarget: ArenaManualTarget?
     @State private var backfillError = ""
@@ -229,9 +252,6 @@ struct ArenaRootView: View {
             if stage == "done", !model.isReadOnly, backfillRequest == nil {
                 presentDetails(provider: nil, tab: .report)
             }
-        }
-        .sheet(item: $detailsRequest) { request in
-            ArenaDetailsSheet(model: model, request: request)
         }
         .sheet(item: $backfillRequest, onDismiss: {
             backfillTarget = nil
@@ -678,12 +698,12 @@ struct ArenaRootView: View {
         GeometryReader { geometry in
             let providers = gridProviders
             if model.isReadOnly, let saved = model.session {
-                ScrollView {
-                    Text((saved["report"] as? String) ?? "该场次尚未生成报告，可在详情中查阅已保存的发言。")
-                        .font(.system(size: 13))
-                        .textSelection(.enabled)
-                        .padding(16)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                if ArenaSessionDigest.report(saved) != nil {
+                    ArenaReportReader(session: saved, ballot: model.reportBallot())
+                        .id(ArenaSessionDigest.id(saved))
+                } else {
+                    Text("该场次尚未生成报告，可在详情中查阅已保存的发言。")
+                        .padding()
                 }
             } else if providers.isEmpty {
                 VStack(spacing: 8) {
@@ -833,6 +853,8 @@ struct ArenaRootView: View {
             return
         }
         takenOver = []
+        // 新场次会替换阅读内容；旧详情窗口不再代表当前讨论。
+        ArenaDetailsWindowController.shared.close()
         model.start(providers, maxRounds: roundLimit)
     }
 
@@ -848,7 +870,7 @@ struct ArenaRootView: View {
         takenOver = []
         selectedProviders = Set(ArenaSeatCatalog.ordered)
         roundLimit = 3
-        detailsRequest = nil
+        ArenaDetailsWindowController.shared.close()
         backfillRequest = nil
         backfillTarget = nil
         backfillError = ""
@@ -905,7 +927,10 @@ struct ArenaRootView: View {
     }
 
     private func presentDetails(provider: String?, tab: ArenaInspectorTab) {
-        detailsRequest = ArenaDetailRequest(provider: provider, tab: tab)
+        ArenaDetailsWindowController.shared.present(
+            model: model,
+            request: ArenaDetailRequest(provider: provider, tab: tab)
+        )
     }
 
     private func toggleSeat(_ provider: String) {
@@ -1295,6 +1320,16 @@ enum ArenaSessionDigest {
         (session?["providers"] as? [String]) ?? []
     }
 
+    /// 详情窗口的席位列：参与席优先，再补上已有记录的席位；没有场次时
+    /// 退回本机已挂载的默认顺序，保证窄窗口里也总有一个可选目标。
+    static func providerChoices(_ session: [String: Any]?) -> [String] {
+        var choices = participants(session)
+        for row in rows(session) where !choices.contains(row.provider) {
+            choices.append(row.provider)
+        }
+        return choices.isEmpty ? ArenaSeatCatalog.ordered : choices
+    }
+
     static func currentTask(_ session: [String: Any]?, provider: String) -> ArenaTaskRow? {
         guard let session else { return nil }
         let stage = (session["stage"] as? String) ?? ""
@@ -1372,6 +1407,15 @@ enum ArenaInspectorTab: String, CaseIterable, Identifiable {
         case .json: return "原始记录"
         }
     }
+
+    var symbol: String {
+        switch self {
+        case .prompts: return "text.bubble"
+        case .answers: return "clock.arrow.circlepath"
+        case .report: return "doc.text"
+        case .json: return "curlybraces"
+        }
+    }
 }
 
 struct ArenaSeatTarget: Identifiable {
@@ -1384,188 +1428,590 @@ struct ArenaDetailRequest: Identifiable {
     let tab: ArenaInspectorTab
 }
 
-struct ArenaDetailsSheet: View {
+// MARK: - 详情窗口（独立、非模态）
+
+/// 详情窗口只保存阅读状态；会话仍由 ArenaModel 持有。窗口被关闭后保留，
+/// 下一次「详情」「查看当前提示」或历史回看只更新所选标签、席位和内容。
+@MainActor
+final class ArenaDetailsWindowState: ObservableObject {
+    @Published var tab: ArenaInspectorTab = .report
+    @Published var provider: String = ArenaSeatCatalog.ordered.first ?? "chatgpt"
+
+    func apply(request: ArenaDetailRequest, session: [String: Any]?) {
+        tab = request.tab
+        let choices = ArenaSessionDigest.providerChoices(session)
+        if let requested = request.provider, choices.contains(requested) {
+            provider = requested
+        } else if !choices.contains(provider) {
+            provider = choices.first ?? provider
+        }
+    }
+
+    func normalize(session: [String: Any]?) {
+        let choices = ArenaSessionDigest.providerChoices(session)
+        guard !choices.contains(provider), let first = choices.first else { return }
+        provider = first
+    }
+}
+
+/// 独立的标准 NSWindow：有标题栏、可缩放、可最小化、可关闭，绿色按钮和
+/// ⌃⌘F 使用系统全屏，标题栏双击遵循“系统设置 → 桌面与程序坞”的用户偏好。
+/// 工具栏另给一个明确的最大化/还原按钮。
+@MainActor
+final class ArenaDetailsWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate, NSToolbarItemValidation {
+
+    static let shared = ArenaDetailsWindowController()
+
+    private(set) var window: NSWindow?
+    private var hostingController: NSHostingController<ArenaDetailsWindowView>?
+    private var hostedModel: ArenaModel?
+    private let state = ArenaDetailsWindowState()
+    private var restoreFrame: NSRect?
+    private var copyReportItem: NSToolbarItem?
+    private var zoomItem: NSToolbarItem?
+
+    private enum Item {
+        static let copyReport = NSToolbarItem.Identifier("arena.details.copy-report")
+        static let export = NSToolbarItem.Identifier("arena.details.export")
+        static let zoom = NSToolbarItem.Identifier("arena.details.zoom")
+    }
+
+    private override init() {
+        super.init()
+    }
+
+    // MARK: 打开与复用
+
+    func present(model: ArenaModel, request: ArenaDetailRequest) {
+        state.apply(request: request, session: model.session)
+        let window = ensureWindow(model: model)
+        window.title = "本场详情"
+        window.subtitle = Self.subtitle(for: model.session)
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        refreshToolbar()
+    }
+
+    /// 显式关闭（红点、⌘W、标题栏菜单或界面按钮）后窗口仍被保留，
+    /// 下次打开继续使用同一个窗口和阅读状态。
+    func close() {
+        window?.close()
+    }
+
+    @discardableResult
+    func focusIfVisible() -> Bool {
+        guard let window, window.isVisible else { return false }
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        window.makeKeyAndOrderFront(nil)
+        return true
+    }
+
+    private func ensureWindow(model: ArenaModel) -> NSWindow {
+        if let window, hostedModel === model {
+            return window
+        }
+        if let existing = window {
+            existing.delegate = nil
+            existing.close()
+        }
+
+        let root = ArenaDetailsWindowView(model: model, state: state)
+        let hosting = NSHostingController(rootView: root)
+        let visible = NSScreen.main?.visibleFrame.size ?? NSSize(width: 1100, height: 800)
+        let initial = NSRect(x: 0, y: 0, width: min(1060, visible.width - 32),
+                             height: min(720, visible.height - 100))
+        hosting.view.frame = initial
+
+        let window = NSWindow(
+            contentRect: initial,
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentViewController = hosting
+        window.title = "本场详情"
+        window.minSize = NSSize(width: 520, height: 420)
+        window.isReleasedWhenClosed = false
+        window.tabbingMode = .disallowed
+        window.collectionBehavior = [.fullScreenPrimary, .managed]
+        window.animationBehavior = .documentWindow
+        window.delegate = self
+
+        let toolbar = NSToolbar(identifier: "ArenaDetailsToolbar")
+        toolbar.delegate = self
+        toolbar.displayMode = .iconAndLabel
+        toolbar.allowsUserCustomization = false
+        toolbar.autosavesConfiguration = false
+        window.toolbar = toolbar
+        window.toolbarStyle = .unified
+
+        if !window.setFrameUsingName("ArenaDetailsWindow") {
+            window.center()
+        }
+        window.setFrameAutosaveName("ArenaDetailsWindow")
+
+        hostingController = hosting
+        hostedModel = model
+        self.window = window
+        return window
+    }
+
+    private static func subtitle(for session: [String: Any]?) -> String {
+        guard let session else { return "尚未建立场次" }
+        let stage = (session["stage"] as? String) ?? ""
+        let round = ArenaValue.int(session["round"]) ?? 1
+        return "\(ArenaStageNames.label(stage)) · 第 \(round) 轮"
+    }
+
+    // MARK: 工具栏
+
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [Item.copyReport, Item.export, .flexibleSpace, Item.zoom]
+    }
+
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [Item.copyReport, Item.export, .flexibleSpace, .space, Item.zoom]
+    }
+
+    func toolbar(
+        _ toolbar: NSToolbar,
+        itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
+        willBeInsertedIntoToolbar flag: Bool
+    ) -> NSToolbarItem? {
+        switch itemIdentifier {
+        case Item.copyReport:
+            let item = makeItem(
+                itemIdentifier,
+                label: "复制报告",
+                toolTip: "复制本场报告全文",
+                symbol: "doc.on.doc",
+                action: #selector(copyReport(_:))
+            )
+            item.isEnabled = ArenaSessionDigest.report(hostedModel?.session) != nil
+            copyReportItem = item
+            return item
+        case Item.export:
+            return makeItem(
+                itemIdentifier,
+                label: "导出 Markdown",
+                toolTip: "以 Markdown 保存本场完整记录",
+                symbol: "square.and.arrow.up",
+                action: #selector(exportMarkdown(_:))
+            )
+        case Item.zoom:
+            let item = makeItem(
+                itemIdentifier,
+                label: "最大化",
+                toolTip: "最大化到屏幕可用区域",
+                symbol: "arrow.up.left.and.arrow.down.right",
+                action: #selector(toggleMaximize(_:))
+            )
+            zoomItem = item
+            updateZoomItem()
+            return item
+        default:
+            return nil
+        }
+    }
+
+    private func makeItem(
+        _ identifier: NSToolbarItem.Identifier,
+        label: String,
+        toolTip: String,
+        symbol: String,
+        action: Selector
+    ) -> NSToolbarItem {
+        let item = NSToolbarItem(itemIdentifier: identifier)
+        item.label = label
+        item.paletteLabel = label
+        item.toolTip = toolTip
+        item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)
+        item.target = self
+        item.action = action
+        item.isBordered = true
+        return item
+    }
+
+    func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
+        switch item.itemIdentifier {
+        case Item.copyReport:
+            return ArenaSessionDigest.report(hostedModel?.session) != nil
+        case Item.export:
+            return hostedModel?.session != nil
+        default:
+            return true
+        }
+    }
+
+    private func refreshToolbar() {
+        copyReportItem?.isEnabled = ArenaSessionDigest.report(hostedModel?.session) != nil
+        updateZoomItem()
+        window?.toolbar?.validateVisibleItems()
+    }
+
+    @objc private func copyReport(_ sender: Any?) {
+        guard let report = ArenaSessionDigest.report(hostedModel?.session) else { return }
+        arenaCopyToPasteboard(report)
+    }
+
+    @objc private func exportMarkdown(_ sender: Any?) {
+        guard let model = hostedModel else { return }
+        ArenaExporter.export(model: model)
+    }
+
+    // MARK: 最大化 / 还原 / 全屏
+
+    @objc private func toggleMaximize(_ sender: Any?) {
+        guard let window else { return }
+        if window.styleMask.contains(.fullScreen) {
+            window.toggleFullScreen(nil)
+            return
+        }
+        if isMaximized(window), let restoreFrame {
+            window.setFrame(restoreFrame, display: true, animate: true)
+            self.restoreFrame = nil
+        } else if isMaximized(window) {
+            // 用户可能用绿色按钮放大过；交给系统还原到它记住的标准尺寸。
+            window.zoom(nil)
+        } else if let screen = window.screen ?? NSScreen.main {
+            restoreFrame = window.frame
+            window.setFrame(screen.visibleFrame, display: true, animate: true)
+        }
+        updateZoomItem()
+    }
+
+    private func isMaximized(_ window: NSWindow) -> Bool {
+        if window.styleMask.contains(.fullScreen) { return true }
+        guard let screen = window.screen ?? NSScreen.main else { return false }
+        let target = screen.visibleFrame
+        return abs(window.frame.minX - target.minX) <= 1
+            && abs(window.frame.minY - target.minY) <= 1
+            && abs(window.frame.width - target.width) <= 1
+            && abs(window.frame.height - target.height) <= 1
+    }
+
+    private func updateZoomItem() {
+        guard let item = zoomItem, let window else { return }
+        let fullScreen = window.styleMask.contains(.fullScreen)
+        let maximized = isMaximized(window)
+        let symbol: String
+        let label: String
+        let toolTip: String
+        if maximized {
+            symbol = "arrow.down.right.and.arrow.up.left"
+            label = fullScreen ? "退出全屏" : "还原"
+            toolTip = fullScreen ? "退出全屏" : "还原窗口大小"
+        } else {
+            symbol = "arrow.up.left.and.arrow.down.right"
+            label = "最大化"
+            toolTip = "最大化到屏幕可用区域（⌃⌘F 进入全屏）"
+        }
+        item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)
+        item.label = label
+        item.paletteLabel = label
+        item.toolTip = toolTip
+    }
+
+    // MARK: NSWindowDelegate
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        refreshToolbar()
+    }
+
+    func windowDidResize(_ notification: Notification) {
+        updateZoomItem()
+    }
+
+    func windowDidEnterFullScreen(_ notification: Notification) {
+        updateZoomItem()
+        refreshToolbar()
+    }
+
+    func windowDidExitFullScreen(_ notification: Notification) {
+        updateZoomItem()
+        refreshToolbar()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard (notification.object as? NSWindow) === window else { return }
+        restoreFrame = nil
+    }
+}
+
+// MARK: 详情窗口内容
+
+struct ArenaDetailsWindowView: View {
     @ObservedObject var model: ArenaModel
-    let request: ArenaDetailRequest
+    @ObservedObject var state: ArenaDetailsWindowState
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
-    @Environment(\.dismiss) private var dismiss
-    @State private var tab: ArenaInspectorTab
-    @State private var promptProvider: String
+    private var session: [String: Any]? { model.session }
+    private var report: String? { ArenaSessionDigest.report(session) }
+    private var sessionIdentity: String { ArenaSessionDigest.id(session) ?? "" }
 
-    init(model: ArenaModel, request: ArenaDetailRequest) {
-        self.model = model
-        self.request = request
-        let participants = ArenaSessionDigest.participants(model.session)
-        let fallback = request.provider
-            ?? participants.first
-            ?? ArenaSeatCatalog.ordered.first
-            ?? "chatgpt"
-        _tab = State(initialValue: request.tab)
-        _promptProvider = State(initialValue: fallback)
+    private var questionText: String {
+        (session?["question"] as? String)?.trimmedNonEmpty
+            ?? model.question.trimmedNonEmpty
+            ?? ""
+    }
+
+    private var providerChoices: [String] {
+        ArenaSessionDigest.providerChoices(session)
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                Text("本场详情")
-                    .font(.system(size: 15, weight: .semibold))
-                Picker("", selection: $tab) {
-                    ForEach(ArenaInspectorTab.allCases) { item in
-                        Text(item.label).tag(item)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.segmented)
-                .frame(width: 360)
-                .onChange(of: tab) { newValue in
-                    if newValue == .prompts { normalizePromptProvider() }
-                }
-                Spacer()
-                Button("导出 Markdown") { ArenaExporter.export(model: model) }
-                    .controlSize(.regular)
-                    .disabled(model.session == nil)
-                Button("关闭") { dismiss() }
-                    .controlSize(.regular)
-                    .keyboardShortcut(.cancelAction)
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 9)
-
+            header
             Divider()
-
-            Group {
-                switch tab {
-                case .prompts: promptsView
-                case .answers: answersView
-                case .report: reportView
-                case .json: jsonView
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .overlay(Color.primary.opacity(0.08))
+            content
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(minWidth: 760, minHeight: 560)
+        .frame(minWidth: 520, minHeight: 420)
+        .background(ArenaGlassSurface(material: .underWindowBackground, cornerRadius: 0))
+        .onAppear { state.normalize(session: session) }
+        .onChange(of: sessionIdentity) { _ in state.normalize(session: session) }
+    }
+
+    // MARK: 顶部
+
+    private var header: some View {
+        tabBar
+            .frame(maxWidth: 640)
+            .frame(maxWidth: .infinity, alignment: .center)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .background(ArenaGlassSurface(material: .headerView, cornerRadius: 0))
+    }
+
+    private var tabBar: some View {
+        HStack(spacing: 6) {
+            ForEach(ArenaInspectorTab.allCases) { item in
+                let selected = state.tab == item
+                Button {
+                    state.tab = item
+                } label: {
+                    HStack(spacing: 7) {
+                        Image(systemName: item.symbol)
+                            .font(.system(size: 13, weight: .semibold))
+                        Text(item.label)
+                            .font(.system(size: 13.5, weight: .medium))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.8)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .frame(minHeight: 38)
+                    .padding(.horizontal, 8)
+                    .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .background(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(selected
+                                  ? Color.accentColor.opacity(0.18)
+                                  : Color.primary.opacity(0.05))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .strokeBorder(
+                                selected
+                                    ? Color.accentColor.opacity(0.30)
+                                    : Color.primary.opacity(0.08)
+                            )
+                    )
+                    .foregroundStyle(selected ? Color.accentColor : Color.primary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityAddTraits(selected ? .isSelected : [])
+            }
+        }
+    }
+
+    // MARK: 内容
+
+    @ViewBuilder
+    private var content: some View {
+        switch state.tab {
+        case .prompts: promptsView
+        case .answers: answersView
+        case .report: reportView
+        case .json: jsonView
+        }
     }
 
     // MARK: 当前提示
 
-    private var providerChoices: [String] {
-        let participants = ArenaSessionDigest.participants(model.session)
-        if !participants.isEmpty { return participants }
-        return ArenaSeatCatalog.ordered.filter { model.panes[$0] != nil }
+    private var promptsView: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                readingCard(
+                    title: "本场问题",
+                    subtitle: participantSummary,
+                    text: questionText,
+                    copyLabel: "复制问题"
+                )
+
+                VStack(alignment: .leading, spacing: 10) {
+                    providerPickerRow
+                    taskCaption
+                    readingCard(
+                        title: "本席当前提示",
+                        subtitle: nil,
+                        text: currentPromptText,
+                        copyLabel: "复制提示"
+                    )
+                }
+            }
+            .padding(18)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 
-    private var promptsView: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                if providerChoices.count > 1 {
-                    Picker("", selection: $promptProvider) {
-                        ForEach(providerChoices, id: \.self) { provider in
-                            Text(ArenaSeatCatalog.name(provider)).tag(provider)
-                        }
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.segmented)
-                    .frame(maxWidth: 320)
-                }
-                Spacer()
-                Button("复制提示") {
-                    if let text = currentPromptText {
-                        arenaCopyToPasteboard(text)
-                    }
-                }
-                .controlSize(.regular)
-                .disabled(currentPromptText == nil)
-            }
+    private var participantSummary: String {
+        let participants = ArenaSessionDigest.participants(session)
+        guard !participants.isEmpty else { return "发送给参与本场的席位" }
+        return "发送给 " + participants.map(ArenaSeatCatalog.name).joined(separator: "、")
+    }
 
-            if let task = ArenaSessionDigest.currentTask(model.session, provider: promptProvider) {
-                Text("本席这一轮 · \(ArenaStageNames.label(task.stage)) · 第 \(task.round) 轮"
-                    + (task.sourceId.isEmpty ? "" : " · \(task.sourceId)"))
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-            } else {
-                Text("本席当前没有进行中的提示；下面显示最近一次记录。")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-            }
-
-            ScrollView {
-                Text(currentPromptText ?? "暂无提示记录")
-                    .font(.system(size: 13))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(11)
-                    .background(
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(Color.primary.opacity(0.045))
-                    )
+    @ViewBuilder
+    private var providerPickerRow: some View {
+        if providerChoices.count > 1 {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) {
+                    pickerLabel
+                    providerPicker
+                    Spacer(minLength: 0)
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    pickerLabel
+                    providerPicker
+                }
             }
         }
-        .padding(12)
-        .onAppear(perform: normalizePromptProvider)
+    }
+
+    private var pickerLabel: some View {
+        Text("查看席位")
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(.secondary)
+    }
+
+    private var providerPicker: some View {
+        Picker("", selection: $state.provider) {
+            ForEach(providerChoices, id: \.self) { provider in
+                Text(ArenaSeatCatalog.name(provider)).tag(provider)
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.segmented)
+        .controlSize(.large)
+        .frame(maxWidth: 430)
+    }
+
+    @ViewBuilder
+    private var taskCaption: some View {
+        if let task = ArenaSessionDigest.currentTask(session, provider: state.provider) {
+            Text("本席这一轮 · \(ArenaStageNames.label(task.stage)) · 第 \(task.round) 轮"
+                + (task.sourceId.isEmpty ? "" : " · \(task.sourceId)"))
+                .font(.system(size: 12.5))
+                .foregroundStyle(.secondary)
+        } else {
+            Text("本席当前没有进行中的提示；下面显示最近一次记录。")
+                .font(.system(size: 12.5))
+                .foregroundStyle(.secondary)
+        }
     }
 
     private var currentPromptText: String? {
-        ArenaSessionDigest.promptText(model.session, provider: promptProvider)
+        ArenaSessionDigest.promptText(session, provider: state.provider)
     }
 
-    private func normalizePromptProvider() {
-        guard !providerChoices.contains(promptProvider) else { return }
-        if let first = providerChoices.first { promptProvider = first }
+    private func readingCard(
+        title: String,
+        subtitle: String?,
+        text: String?,
+        copyLabel: String
+    ) -> some View {
+        let value = text?.trimmedNonEmpty
+        return VStack(alignment: .leading, spacing: 9) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(title)
+                    .font(.system(size: 13, weight: .semibold))
+                if let subtitle {
+                    Text(subtitle)
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                Spacer(minLength: 8)
+                Button(copyLabel) {
+                    if let value { arenaCopyToPasteboard(value) }
+                }
+                .controlSize(.large)
+                .disabled(value == nil)
+            }
+
+            Text(value ?? "（暂无记录）")
+                .font(.system(size: 14))
+                .foregroundStyle(value == nil ? Color.secondary : Color.primary)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color.primary.opacity(0.035))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.09))
+        )
+        .shadow(color: .black.opacity(reduceTransparency ? 0 : 0.04), radius: 6, y: 2)
     }
 
     // MARK: 历史原文
 
     @ViewBuilder
     private var answersView: some View {
-        let rows = ArenaSessionDigest.answerRows(model.session)
+        let rows = ArenaSessionDigest.answerRows(session)
         if rows.isEmpty {
             emptyState("还没有已保存的原文。")
         } else {
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 8) {
+                LazyVStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 8) {
+                        Text("已保存 \(rows.count) 条原文")
+                            .font(.system(size: 12.5, weight: .medium))
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 8)
+                        Text("提示与原文均按轮次保留")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .padding(.bottom, 2)
+
                     ForEach(rows) { row in
                         ArenaAnswerDisclosure(row: row)
                     }
                 }
-                .padding(12)
+                .padding(18)
             }
         }
     }
 
     // MARK: 报告
 
+    @ViewBuilder
     private var reportView: some View {
-        let report = ArenaSessionDigest.report(model.session)
-        return Group {
-            if let report {
-                VStack(spacing: 0) {
-                    HStack {
-                        if let reason = ArenaSessionDigest.stopReason(model.session) {
-                            Text("停止原因：\(reason)")
-                                .font(.system(size: 12))
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        Button("复制报告") { arenaCopyToPasteboard(report) }
-                            .controlSize(.regular)
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.top, 8)
-                    ScrollView {
-                        Text(report)
-                            .font(.system(size: 13))
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(12)
-                    }
-                }
-            } else {
-                emptyState(
-                    ArenaSessionDigest.stopReason(model.session)
-                        .map { "尚未生成报告。停止原因：\($0)" }
-                        ?? "尚未生成报告。"
-                )
-            }
+        if report != nil {
+            ArenaReportReader(session: model.session, ballot: model.reportBallot())
+                .id(sessionIdentity)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if let reason = ArenaSessionDigest.stopReason(session) {
+            emptyState("尚未生成报告。停止原因：\(reason)")
+        } else {
+            emptyState("讨论结束后可在这里查看报告。")
         }
     }
 
@@ -1573,50 +2019,44 @@ struct ArenaDetailsSheet: View {
 
     private var jsonView: some View {
         VStack(spacing: 0) {
-            HStack {
+            HStack(spacing: 8) {
                 Text("会话原始数据（只读）")
-                    .font(.system(size: 12))
+                    .font(.system(size: 12.5))
                     .foregroundStyle(.secondary)
-                Spacer()
+                Spacer(minLength: 8)
                 Button("复制 JSON") {
-                    arenaCopyToPasteboard(ArenaJSON.string(model.session))
+                    arenaCopyToPasteboard(ArenaJSON.string(session))
                 }
-                .controlSize(.regular)
+                .controlSize(.large)
+                .disabled(session == nil)
             }
-            .padding(.horizontal, 12)
-            .padding(.top, 8)
+            .padding(.horizontal, 18)
+            .padding(.vertical, 10)
+
+            Divider()
+
             ScrollView([.horizontal, .vertical]) {
-                Text(ArenaJSON.string(model.session))
-                    .font(.system(size: 11, design: .monospaced))
+                Text(ArenaJSON.string(session))
+                    .font(.system(size: 12, design: .monospaced))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(12)
+                    .padding(18)
             }
-        }
-    }
-
-    private func labeled(_ title: String, text: String, dim: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(title)
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.secondary)
-            Text(text.isEmpty ? "（空）" : text)
-                .font(.system(size: 13))
-                .foregroundStyle(dim ? Color.secondary : Color.primary)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
     private func emptyState(_ text: String) -> some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 10) {
             Image(systemName: "tray")
-                .font(.system(size: 18))
+                .font(.system(size: 22, weight: .light))
                 .foregroundStyle(.secondary)
             Text(text)
-                .font(.system(size: 12.5))
+                .font(.system(size: 13))
                 .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 420)
         }
+        .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
@@ -1626,42 +2066,53 @@ struct ArenaAnswerDisclosure: View {
 
     var body: some View {
         DisclosureGroup {
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 10) {
                 labeled("提示", text: row.prompt, dim: true)
                 labeled("原文", text: row.answer ?? "", dim: false)
             }
-            .padding(.top, 6)
+            .padding(.top, 8)
         } label: {
-            HStack(spacing: 6) {
+            HStack(spacing: 7) {
                 Text("第 \(row.round) 轮 · \(ArenaStageNames.label(row.stage))")
-                    .font(.system(size: 12.5, weight: .medium))
+                    .font(.system(size: 13.5, weight: .semibold))
                 Text(ArenaSeatCatalog.name(row.provider))
-                    .font(.system(size: 12))
+                    .font(.system(size: 12.5))
                     .foregroundStyle(.secondary)
                 if !row.sourceId.isEmpty {
                     Text(row.sourceId)
-                        .font(.system(size: 11, design: .monospaced))
+                        .font(.system(size: 11.5, design: .monospaced))
                         .foregroundStyle(.tertiary)
+                        .lineLimit(1)
                 }
-                Spacer()
+                Spacer(minLength: 8)
                 Button("复制原文") {
                     if let text = row.answer { arenaCopyToPasteboard(text) }
                 }
-                .controlSize(.small)
+                .controlSize(.large)
                 .buttonStyle(.borderless)
             }
         }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.primary.opacity(0.035))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.09))
+        )
     }
 
     private func labeled(_ title: String, text: String, dim: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
+        VStack(alignment: .leading, spacing: 4) {
             Text(title)
-                .font(.system(size: 10, weight: .semibold))
+                .font(.system(size: 10.5, weight: .semibold))
                 .foregroundStyle(.secondary)
             Text(text.isEmpty ? "（空）" : text)
-                .font(.system(size: 13))
+                .font(.system(size: 13.5))
                 .foregroundStyle(dim ? Color.secondary : Color.primary)
                 .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
     }

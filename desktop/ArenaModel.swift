@@ -2257,6 +2257,19 @@ final class ArenaModel: ObservableObject {
         return true
     }
 
+    func reportBallot() -> [String: Any]? {
+        guard let history = session?["history"] as? [[String: Any]] else { return nil }
+        // The per-turn prompts can contain the entire debate. Only ballot
+        // metadata and candidate text are needed by the shared core filter.
+        let keys: Set<String> = ["id", "provider", "stage", "status", "version", "round", "proposalDigest", "stance"]
+        let materials = history.compactMap { row -> [String: Any]? in
+            let stage = row["stage"] as? String
+            guard stage == "proposal" || stage == "vote" else { return nil }
+            return row.filter { keys.contains($0.key) || (stage == "proposal" && $0.key == "answer") }
+        }
+        return try? engine.reportBallot(history: materials)
+    }
+
     private func restoreLastSession() {
         guard let id = engine.store.currentID(),
               let file = engine.store.load(id: id),

@@ -304,6 +304,13 @@ final class ArenaCore {
                     createSession(question, JSON.parse(providersJSON), { maxRounds })
                   );
                 };
+                globalThis.__arenaReportBallot = function (historyJSON) {
+                  const { proposal, version, votes } = reportBallot(JSON.parse(historyJSON));
+                  return JSON.stringify({
+                    candidateID: proposal?.id, version,
+                    votes: proposal ? votes.map(({ id, provider, stance }) => ({ id, provider, stance })) : []
+                  });
+                };
                 globalThis.__arenaApply = function (sessionJSON, action, payloadJSON) {
                   return JSON.stringify(
                     applyAction(JSON.parse(sessionJSON), action, JSON.parse(payloadJSON))
@@ -341,6 +348,10 @@ final class ArenaCore {
             arguments: [sessionJSON, action, payloadJSON],
             label: "applyAction"
         )
+    }
+
+    func reportBallot(history: [[String: Any]]) throws -> [String: Any] {
+        try callBridge("__arenaReportBallot", arguments: [Self.jsonString(history)], label: "reportBallot")
     }
 
     // MARK: Private
@@ -483,6 +494,10 @@ final class ArenaEngine {
             providers: providers,
             maxRounds: maxRounds
         )
+    }
+
+    func reportBallot(history: [[String: Any]]) throws -> [String: Any] {
+        try loadedCore().reportBallot(history: history)
     }
 
     func apply(

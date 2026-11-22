@@ -1298,14 +1298,8 @@ function extractSourceRefs(text) {
 // Markdown report
 // ---------------------------------------------------------------------------
 
-function buildReport(session, reason) {
-  const history = session.history;
-  const answered = history.filter(
-    (task) =>
-      task.status === 'answered' &&
-      typeof task.answer === 'string' &&
-      task.answer.trim().length > 0,
-  );
+/** The reader and Markdown export use the same candidate and ballot filters. */
+export function reportBallot(history) {
   const proposal = latestAnsweredProposal(history);
   const version = proposal ? proposal.version : 0;
   const digest = proposal ? proposalDigest(proposal) : null;
@@ -1318,6 +1312,18 @@ function buildReport(session, reason) {
       STANCES.includes(task.stance) &&
       (digest === null || task.proposalDigest === digest),
   );
+  return { proposal, version, votes };
+}
+
+function buildReport(session, reason) {
+  const history = session.history;
+  const answered = history.filter(
+    (task) =>
+      task.status === 'answered' &&
+      typeof task.answer === 'string' &&
+      task.answer.trim().length > 0,
+  );
+  const { proposal, version, votes } = reportBallot(history);
   const skipped = history.filter((task) => task.status === 'skipped');
   // Pending entries only survive an early user finish: the stage was archived
   // before it completed. They are outstanding work, not absences and not
