@@ -32,6 +32,12 @@
  * scope.allowNavigation=true 时，允许同源 SPA 换地址（新建页 → 对话页），
  * 前提是本轮用户消息已经被核对；跨源或未核对时仍返回 unknown/page-changed。
  *
+ * scope.href（可选、向后兼容）：本席已核验过的对话地址（origin+path，已规范化，
+ * 不含账号/查询串/片段）。给了就要求当前页规范化后完全一致：probe/read 在
+ * 授权阶段核对，submit 还会在真正填入前和最后一次点击前各核对一次。不一致
+ * 立即返回 conversation-changed（pre-click，不填、不点、不重发）。没给时行为
+ * 与旧版完全相同；同源首页 → 首个已核对会话的 SPA 进展不受影响。
+ *
  * 回应：{ ok, status, text?, error?, detail? }
  *   status: 'ready' | 'submitted' | 'pending' | 'done' | 'unknown' | 'error'
  *   ok     : 仅 ready / submitted / pending / done 为 true
@@ -81,8 +87,8 @@
  * 错误码（status:error 时 error 字段）：
  *   bad-message, foreign-sender, not-authorized-page, document-not-ready,
  *   selector-invalid, selector-missing, selector-hidden, selector-ambiguous,
- *   selector-overlap, out-of-scope, prompt-empty, prompt-too-long,
- *   prompt-already-sent, task-id-conflict, selector-changed,
+ *   selector-overlap, out-of-scope, conversation-changed, prompt-empty,
+ *   prompt-too-long, prompt-already-sent, task-id-conflict, selector-changed,
  *   input-uneditable, input-disabled, input-readonly, draft-conflict, busy,
  *   fill-failed, fill-mismatch, send-pending, send-unavailable,
  *   submit-unconfirmed, user-turn-mismatch, internal
@@ -243,14 +249,44 @@
     }
   }
 
+  /**
+   * 允许用来固定会话的地址（与 desktop/SitePane.swift 的白名单同规则）：
+   * http(s)、无账号密码、丢弃查询串与片段，只留 origin + 规范化 path。
+   * 路径像登录/授权/回调页时返回 null：这类地址既不比对也不保存。
+   * 仅供 scope.href 使用，旧调用方不传就完全不受影响。
+   */
+  function normalizePathname(pathname) {
+    const value = (pathname || '/').replace(/\/+$/g, '');
+    return value || '/';
+  }
+
+  function canonicalHref(value) {
+    if (typeof value !== 'string' || !value) return null;
+    try {
+      const url = new URL(value);
+      if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+      if (url.username || url.password) return null;
+      const path = normalizePathname(url.pathname);
+      if (path.length > 1000 || path.indexOf('//') !== -1) return null;
+      const segments = path.split('/').filter(Boolean).map((part) => part.toLowerCase());
+      const authentication = [
+        'auth', 'authorize', 'callback', 'login', 'logout', 'oauth',
+        'signin', 'sign-in', 'signout', 'sign-out', 'sso',
+      ];
+      if (segments.some((part) => authentication.indexOf(part) !== -1)) return null;
+      return url.origin + path;
+    } catch (e) {
+      return null;
+    }
+  }
+
   function newConversationHome(scope) {
     if (!scope || typeof scope.homeHref !== 'string' || !scope.homeHref) return false;
     try {
       const home = new URL(scope.homeHref);
       const here = new URL(location.href);
       if (home.origin !== here.origin) return false;
-      const normalizePath = (path) => (path.replace(/\/+$/g, '') || '/');
-      return normalizePath(home.pathname) === normalizePath(here.pathname);
+      return normalizePathname(home.pathname) === normalizePathname(here.pathname);
     } catch (e) {
       return false;
     }
@@ -432,6 +468,14 @@
       if (typeof raw.homeHref !== 'string' || raw.homeHref.length > 2000) return { error: 'homeHref' };
       scope.homeHref = raw.homeHref;
     }
+    // 可选会话约束：已核验的对话地址。规范化后仍不合格就整条拒绝，
+    // 绝不解成“只比 origin”。
+    if (raw.href !== undefined && raw.href !== null && raw.href !== '') {
+      if (typeof raw.href !== 'string' || raw.href.length > 2000) return { error: 'href' };
+      const canonical = canonicalHref(raw.href);
+      if (!canonical) return { error: 'href' };
+      scope.href = canonical;
+    }
     if (raw.allowNavigation === true) scope.allowNavigation = true;
     return { value: scope };
   }
@@ -555,8 +599,35 @@
       if (scope.hrefPrefix && location.href.indexOf(scope.hrefPrefix) !== 0) {
         return fail('out-of-scope', { expectedHrefPrefix: scope.hrefPrefix, actualHref: location.href });
       }
+      if (scope.href) {
+        const here = canonicalHref(location.href);
+        if (here !== scope.href) {
+          return fail('conversation-changed', {
+            expectedHref: scope.href,
+            actualHref: here || location.href,
+            phase: 'authorize',
+            clickAttempted: false,
+          });
+        }
+      }
     }
     return null;
+  }
+
+  /**
+   * 最后一次真正填入/点击前的地址核对。同源不同对话也算换窗口：
+   * 只认规范化后与 scope.href 完全一致，绝不退化成“同 origin 就行”。
+   */
+  function conversationGate(scope, phase) {
+    if (!scope || !scope.href) return null;
+    const here = canonicalHref(location.href);
+    if (here === scope.href) return null;
+    return fail('conversation-changed', {
+      expectedHref: scope.href,
+      actualHref: here || location.href,
+      phase: phase,
+      clickAttempted: false,
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -1025,6 +1096,7 @@
       requireDoneMarker: Boolean(record.requireDoneMarker),
       elapsedMs: Date.now() - record.startedAt,
       url: location.href,
+      href: canonicalHref(location.href),
       contextHref: record.contextHref || record.baseline.href,
     };
     if (record.navigation) {
@@ -1116,6 +1188,7 @@
         version: VERSION,
         taskId: req.taskId,
         url: location.href,
+        href: canonicalHref(location.href),
         frame: window.top === window ? 'top' : 'sub',
         composer: {
           kind: kind,
@@ -1289,6 +1362,9 @@
     if (busy) return busy;
 
     // 只有空输入或内容已完全一致才写；绝不覆盖不同草稿。
+    // 真正填入前再核对一次会话地址：上面算摘要/等控件期间用户可能已经换窗口。
+    const beforeFill = conversationGate(req.scope, 'pre-fill');
+    if (beforeFill) return beforeFill;
     let filled = false;
     if (draftCollapsed !== promptCollapsed) {
       const write = setComposerValue(input, req.prompt);
@@ -1323,6 +1399,11 @@
         reason: 'composer-changed',
       });
     }
+
+    // 最后一次点击前的地址核对。等发送控件期间页面仍可能被换到同站别的
+    // 对话；只要不是本席核验过的地址就停在这里（不点、不建基线、不重发）。
+    const beforeClick = conversationGate(req.scope, 'pre-click');
+    if (beforeClick) return beforeClick;
 
     // 点击前记录基线：此后只认新节点。
     const baseline = snapshotHistory(req.selectors, container);
@@ -1365,7 +1446,11 @@
     }
 
     const located = await waitForUserTurn(record, req.selectors, container, req.options);
-    if (located.error) return located.error;
+    if (located.error) {
+      return fail('submit-unconfirmed', {
+        cause: located.error.error, possiblySubmitted: true, clickAttempted: true,
+      });
+    }
     if (located.timeout) {
       const stop = optionalSignal(req.selectors, 'stop', null);
       const stopActive = !stop.error && stop.active;
@@ -1405,6 +1490,8 @@
         sawGenerating: Boolean(record.sawGenerating),
         elapsedMs: Date.now() - record.startedAt,
         url: location.href,
+        href: canonicalHref(location.href),
+        userTurnVerified: true,
         preview: preview,
       },
     });
@@ -1532,6 +1619,7 @@
           completedAt: record.completedAt,
           userTurnVerified: true,
           url: location.href,
+          href: canonicalHref(location.href),
         },
       });
     }

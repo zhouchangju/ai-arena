@@ -257,6 +257,37 @@ def main() -> int:
             results["post_click_not_retried"] = True
             page.close()
 
+            # Native panes can navigate within one host. A route change between
+            # filling the composer and clicking send must leave both chats untouched.
+            page = new_page(ctx, base, {"hiddenMs": 900})
+            page.evaluate("""() => document.querySelector('#editor').addEventListener(
+                'input', () => history.replaceState(null, '', '/different-chat'), {once: true})""")
+            reply = handle(page, {
+                "type": "arena.web.submit", "taskId": "t-switched-chat", "prompt": new,
+                "selectors": selectors(), "scope": {"origin": base, "href": base + "/"},
+            })
+            assert reply["status"] == "error", reply
+            assert reply["detail"]["clickAttempted"] is False, reply
+            assert page.evaluate("window.clicks") == 0
+            results["same_origin_switch_stopped_before_click"] = True
+            page.close()
+
+            page = new_page(ctx, base, {"ignoreClicks": True})
+            page.evaluate("""() => document.querySelector('#send').addEventListener('click', () => {
+                for (let i=0; i<2; i++) {
+                    const stop=document.createElement('button');
+                    stop.className='stop'; stop.textContent='Stop'; document.body.append(stop);
+                }
+            })""")
+            reply = handle(page, {
+                "type": "arena.web.submit", "taskId": "t-after-click", "prompt": new,
+                "selectors": {**selectors(), "stop": ".stop"}, "scope": {"origin": base},
+            })
+            assert reply["error"] == "submit-unconfirmed" and reply["detail"]["clickAttempted"] is True, reply
+            assert page.evaluate("window.clicks") == 1
+            results["ambiguous_post_click_is_read_only"] = True
+            page.close()
+
             browser.close()
             print(json.dumps(results, ensure_ascii=False, indent=2))
     finally:
