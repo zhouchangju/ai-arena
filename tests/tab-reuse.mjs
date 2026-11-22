@@ -10,6 +10,9 @@
 // - two loopback seats that differ only by port;
 // - two seats sharing one fixture origin, separated by ?seat;
 // - tab whose metadata is unreadable or already redirecting elsewhere;
+// - fresh tabs inherit the requesting window, opener and Chrome tab group;
+// - valid off-window bindings move in place; failed moves preserve the binding;
+// - failed creation can retry; a lost group does not create a duplicate;
 // - worker restart (fresh module instance, persisted binding only).
 
 import test from 'node:test';
@@ -61,11 +64,14 @@ const FIXTURE = 'http://127.0.0.1:8765/web-driver-fixture.html';
 const ENTRY_A = `${FIXTURE}?seat=A`;
 const ENTRY_B = `${FIXTURE}?seat=B`;
 const ENTRY_A_OTHER_PORT = 'http://127.0.0.1:8766/web-driver-fixture.html?seat=A';
+const WORKSPACE = chrome.runtime.getURL('workspace.html');
 
 function createTabsApi() {
   const tabs = new Map();
   const updates = [];
   const creates = [];
+  const groups = [];
+  const moves = [];
   let nextId = 1;
 
   const snapshot = (tab) => ({ ...tab });
@@ -74,23 +80,38 @@ function createTabsApi() {
     tabs,
     updates,
     creates,
+    groups,
+    moves,
     api: {
       async get(id) {
         if (!tabs.has(id)) throw new Error(`No tab with id ${id}`);
         return snapshot(tabs.get(id));
       },
-      async create({ url, active }) {
+      async create({ url, active, windowId, openerTabId }) {
         const id = nextId++;
         const tab = {
           id,
-          windowId: 1,
+          windowId: windowId ?? 1,
+          openerTabId,
+          groupId: -1,
           url: '',
           pendingUrl: url,
           status: 'loading',
           active: Boolean(active),
         };
         tabs.set(id, tab);
-        creates.push({ id, url });
+        creates.push({ id, url, windowId, openerTabId });
+        return snapshot(tab);
+      },
+      async group({ tabIds, groupId }) {
+        groups.push({ tabIds, groupId });
+        tabs.get(tabIds).groupId = groupId;
+        return groupId;
+      },
+      async move(id, { windowId, index }) {
+        const tab = tabs.get(id);
+        moves.push({ id, windowId, index });
+        Object.assign(tab, { windowId, openerTabId: undefined, groupId: -1 });
         return snapshot(tab);
       },
       async update(id, changes) {
@@ -192,6 +213,155 @@ test('two clicks before the tab finished loading create one tab', async () => {
   // The tab is still loading (url empty, pendingUrl set): a third click reuses.
   const c = await h.open('local-a', ENTRY_A);
   assert.equal(c, a);
+  assert.equal(h.creates.length, 1);
+});
+
+test('a fresh tab opens from the requesting workbench and same-window bindings stay in place', async () => {
+  const h = harness();
+  h.deps.sourceTab = { id: 27, windowId: 42, groupId: 5 };
+  const first = await h.open('local-a', ENTRY_A);
+  assert.deepEqual(h.creates, [{ id: first, url: ENTRY_A, windowId: 42, openerTabId: 27 }]);
+  assert.deepEqual(h.groups, [{ tabIds: first, groupId: 5 }]);
+
+  assert.equal(await h.open('local-a', ENTRY_A), first);
+  assert.equal(h.creates.length, 1);
+  assert.deepEqual(h.groups, [{ tabIds: first, groupId: 5 }]);
+  assert.deepEqual(h.moves, []);
+  assert.deepEqual(h.windows.updates, [{ id: 42, info: { focused: true } }]);
+
+  h.deps.sourceTab = { id: 28, windowId: 43, groupId: 6 };
+  h.navigate(first, 'https://example.com/');
+  const fresh = await h.open('local-a', ENTRY_A);
+  assert.deepEqual(h.creates[1], { id: fresh, url: ENTRY_A, windowId: 43, openerTabId: 28 });
+  assert.deepEqual(h.groups[1], { tabIds: fresh, groupId: 6 });
+});
+
+test('a valid off-window binding returns with the same tab, conversation, and workbench relationship', async () => {
+  const h = harness();
+  const first = await h.open('local-a', ENTRY_A);
+  const conversation = `${ENTRY_A}&conversation=42`;
+  h.navigate(first, conversation);
+  const source = { id: 27, windowId: 42, groupId: 5, url: `${WORKSPACE}#s=session-1` };
+  h.deps.sourceTab = source;
+  h.tabs.set(source.id, source);
+
+  assert.equal(await h.open('local-a', ENTRY_A), first);
+  assert.deepEqual(h.moves, [{ id: first, windowId: source.windowId, index: -1 }]);
+  assert.deepEqual(h.updates, [
+    { id: first, changes: { openerTabId: source.id } },
+    { id: first, changes: { active: true } },
+  ]);
+  assert.deepEqual(h.groups, [{ tabIds: first, groupId: source.groupId }]);
+  assert.deepEqual(h.windows.updates, [{ id: source.windowId, info: { focused: true } }]);
+  assert.equal(h.tabs.get(first).url, conversation);
+  assert.equal(bindingTabId(h.bindings, 'local-a'), first);
+  assert.equal(h.creates.length, 1);
+});
+
+test('a stale workbench or rejected move leaves the old binding without activating its window', async () => {
+  const h = harness();
+  const first = await h.open('local-a', ENTRY_A);
+  const source = { id: 27, windowId: 42, groupId: 5, url: WORKSPACE };
+  h.deps.sourceTab = source;
+  h.tabs.set(source.id, { ...source, windowId: 43 });
+  await assert.rejects(h.open('local-a', ENTRY_A), /工作台窗口已变更/);
+  assert.deepEqual(h.moves, []);
+
+  h.tabs.set(source.id, source);
+  h.api.move = async () => { throw new Error('Tabs cannot be edited right now'); };
+  await assert.rejects(h.open('local-a', ENTRY_A), /无法把已打开的原页移回/);
+  assert.deepEqual(h.updates, []);
+  assert.deepEqual(h.groups, []);
+  assert.deepEqual(h.windows.updates, []);
+  assert.equal(bindingTabId(h.bindings, 'local-a'), first);
+  assert.equal(h.creates.length, 1);
+  assert.equal(h.tabs.get(first).windowId, 1);
+});
+
+test('an opener failure after a successful move retries in place', async () => {
+  const h = harness();
+  const first = await h.open('local-a', ENTRY_A);
+  const source = { id: 27, windowId: 42, groupId: -1, url: WORKSPACE };
+  h.deps.sourceTab = source;
+  h.tabs.set(source.id, source);
+  const update = h.api.update;
+  h.api.update = async () => { throw new Error('Browser rejected the opener'); };
+
+  await assert.rejects(h.open('local-a', ENTRY_A), /浏览器未能将原页关联/);
+  assert.equal(h.tabs.get(first).windowId, source.windowId);
+  assert.equal(bindingTabId(h.bindings, 'local-a'), first);
+  assert.deepEqual(h.windows.updates, []);
+
+  h.api.update = update;
+  assert.equal(await h.open('local-a', ENTRY_A), first);
+  assert.equal(h.tabs.get(first).openerTabId, source.id);
+  assert.equal(h.moves.length, 1);
+  assert.equal(h.creates.length, 1);
+});
+
+test('a same-window binding recovers its opener and group without moving or duplicating', async () => {
+  const h = harness();
+  const first = await h.open('local-a', ENTRY_A);
+  h.tabs.get(first).groupId = 9;
+  const source = { id: 27, windowId: 1, groupId: 5, url: WORKSPACE };
+  h.deps.sourceTab = source;
+  h.tabs.set(source.id, source);
+
+  assert.equal(await h.open('local-a', ENTRY_A), first);
+  assert.deepEqual(h.moves, []);
+  assert.deepEqual(h.groups, [{ tabIds: first, groupId: source.groupId }]);
+  assert.equal(h.tabs.get(first).openerTabId, source.id);
+  assert.equal(h.creates.length, 1);
+});
+
+test('a bound tab repurposed while the workbench is checked is not moved or activated', async () => {
+  const h = harness();
+  const first = await h.open('local-a', ENTRY_A);
+  const source = { id: 27, windowId: 42, groupId: 5, url: WORKSPACE };
+  h.deps.sourceTab = source;
+  h.tabs.set(source.id, source);
+  const get = h.api.get;
+  h.api.get = async (id) => {
+    if (id === source.id) h.navigate(first, 'https://example.com/');
+    return get(id);
+  };
+
+  await assert.rejects(h.open('local-a', ENTRY_A), /原页已变更/);
+  assert.deepEqual(h.moves, []);
+  assert.deepEqual(h.updates, []);
+  assert.deepEqual(h.windows.updates, []);
+  assert.equal(h.creates.length, 1);
+});
+
+test('creation failure makes no binding or off-window retry and allows a later open', async () => {
+  const h = harness();
+  h.deps.sourceTab = { id: 27, windowId: 42, groupId: -1 };
+  const create = h.api.create;
+  const attempts = [];
+  h.api.create = async (properties) => {
+    attempts.push(properties);
+    throw new Error('No window with id 42');
+  };
+  await assert.rejects(h.open('local-a', ENTRY_A), /No window/);
+  assert.deepEqual(attempts, [{ url: ENTRY_A, active: true, windowId: 42, openerTabId: 27 }]);
+  assert.equal(bindingTabId(h.bindings, 'local-a'), null);
+
+  h.api.create = create;
+  h.deps.sourceTab = { id: 27, windowId: 43, groupId: -1 };
+  const fresh = await h.open('local-a', ENTRY_A);
+  assert.equal(bindingTabId(h.bindings, 'local-a'), fresh);
+  assert.deepEqual(h.groups, []);
+});
+
+test('a disappearing group leaves the created tab bound and reusable', async () => {
+  const h = harness();
+  h.deps.sourceTab = { id: 27, windowId: 42, groupId: 5 };
+  h.api.group = async () => { throw new Error('No group with id 5'); };
+  const first = await h.open('local-a', ENTRY_A);
+  assert.equal(h.tabs.get(first).groupId, -1);
+  assert.equal(bindingTabId(h.bindings, 'local-a'), first);
+  h.tabs.set(27, { id: 27, windowId: 42, groupId: -1, url: WORKSPACE });
+  assert.equal(await h.open('local-a', ENTRY_A), first);
   assert.equal(h.creates.length, 1);
 });
 

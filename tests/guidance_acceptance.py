@@ -49,12 +49,13 @@ def check(name: str, ok: bool, detail: str = "") -> None:
         raise AcceptanceError(f"{name}: {detail}" if detail else name)
 
 
-def provider_tab_ids(page):
+def provider_tabs(page):
     """Backend-created tabs are invisible to context.pages; ask the extension's tabs API."""
     return page.evaluate(
         "async () => (await chrome.tabs.query({}))"
         ".filter(t => (t.pendingUrl || t.url || '').startsWith('https://chatgpt.com/'))"
-        ".map(t => t.id)"
+        ".map(({ id, windowId, openerTabId, groupId, active, url, pendingUrl }) => "
+        "({ id, windowId, openerTabId, groupId, active, address: pendingUrl || url }))"
     )
 
 
@@ -187,19 +188,49 @@ def main() -> int:
         card = page.locator("article.seat-card").filter(has_text="chatgpt").first
         compound = card.get_by_role("button", name=COMPOUND)
         check("Pending manual seat exposes one compound copy/open button", compound.count() == 1, f"matches={compound.count()}")
+        source = page.evaluate("""async () => {
+            const { id, windowId } = await chrome.tabs.getCurrent();
+            const groupId = await chrome.tabs.group({ tabIds: id });
+            return { id, windowId, groupId };
+        }""")
         page.bring_to_front()
         page.evaluate("text => navigator.clipboard.writeText(text)", marker)
         marker_written = page.evaluate("() => navigator.clipboard.readText()") == marker
         check("Clipboard marker round-trips before the compound click", marker_written, "marker readable")
         compound.first.click()
-        page.wait_for_timeout(120)
-        first_ids = provider_tab_ids(page)
-        check("Compound click opens the mock provider tab", len(first_ids) == 1, f"tab_ids={first_ids}")
+        opened = wait_until(lambda: provider_tabs(page), "compound click to open mock provider")
+        check("Compound click opens the mock provider tab", len(opened) == 1, f"tabs={opened}")
+        child = wait_until(
+            lambda: next((tab for tab in provider_tabs(page) if tab["groupId"] == source["groupId"]), None),
+            "provider tab to join the workbench Chrome tab group",
+        )
+        check("New provider keeps the workbench as opener in its Chrome window and group",
+              child["windowId"] == source["windowId"] and child.get("openerTabId") == source["id"],
+              f"source={source}, child={child}")
         page.bring_to_front()
         compound.first.click()
-        page.wait_for_timeout(120)
-        ids = provider_tab_ids(page)
-        check("Two compound clicks open exactly one mock provider tab", len(ids) == 1, f"tab_ids={ids}")
+        reopened = wait_until(
+            lambda: next((tab for tab in provider_tabs(page) if tab["active"]), None),
+            "second compound click to activate the provider",
+        )
+        ids = [tab["id"] for tab in provider_tabs(page)]
+        check("Two compound clicks reuse the first mock provider tab",
+              ids == [child["id"]] and reopened["id"] == child["id"], f"tab_ids={ids}")
+        other_window = page.evaluate("id => chrome.windows.create({ tabId: id })", child["id"])
+        check("The existing provider tab is now bound from a different window",
+              provider_tabs(page)[0]["windowId"] == other_window["id"] != source["windowId"],
+              f"other_window={other_window['id']}")
+        page.bring_to_front()
+        compound.first.click()
+        returned = wait_until(
+            lambda: next((tab for tab in provider_tabs(page) if tab["windowId"] == source["windowId"]
+                         and tab["groupId"] == source["groupId"] and tab["active"]), None),
+            "off-window provider tab to return to the workbench",
+        )
+        check("Off-window binding returns the same page to its workbench and group",
+              [tab["id"] for tab in provider_tabs(page)] == [child["id"]]
+              and returned.get("openerTabId") == source["id"] and returned["address"] == reopened["address"],
+              f"provider_tab={returned}")
         page.bring_to_front()
         copied = page.evaluate("() => navigator.clipboard.readText()")
         check("Compound click actually copied the stored prompt, not the CLI marker",

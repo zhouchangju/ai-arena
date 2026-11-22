@@ -29,9 +29,9 @@
 //   provider ids from providers.js; `open` only opens a registry URL for a seat
 //   that is actually part of the session.
 // - `open` reuses the seat's bound tab when the `tabs` metadata permission shows
-//   its URL still belongs to the intended page (see `tabMatchesEntry`). It never
-//   reads page content, never queries unrelated tabs, and never navigates a tab
-//   that was repurposed elsewhere.
+//   its URL still belongs to the intended page (see `tabMatchesEntry`). It brings
+//   the bound tab to the requesting workbench window without navigating it.
+//   It does not read page content or query unrelated tabs.
 //
 // Persistence: one IndexedDB database. Every read-modify-write command runs
 // through a promise queue *and* inside a single readwrite transaction, so two
@@ -536,6 +536,59 @@ async function focusTab(tab, tabsApi = chrome.tabs, windowsApi = chrome.windows)
   }
 }
 
+async function joinWorkbenchTabGroup(tab, sourceTab, tabsApi) {
+  if (tab.windowId !== sourceTab.windowId || !hasWorkbenchTabGroup(sourceTab)
+    || tab.groupId === sourceTab.groupId || !tabsApi.group) return;
+  try {
+    await tabsApi.group({ tabIds: tab.id, groupId: sourceTab.groupId });
+  } catch {
+    // A group can disappear while the tab opens or moves.
+  }
+}
+
+function hasWorkbenchTabGroup(tab) {
+  return Number.isInteger(tab.groupId) && tab.groupId >= 0;
+}
+
+async function placeBoundTab(tab, sourceTab, targetUrl, tabsApi) {
+  const source = await tabsApi.get(sourceTab.id).catch(() => null);
+  if (source?.windowId !== sourceTab.windowId
+    || !isWorkspaceTabUrl(tabEntryUrl(source), chrome.runtime.getURL(WORKSPACE_PAGE))) {
+    throw new ArenaError('工作台窗口已变更，请重新点击打开原页');
+  }
+
+  let bound = await tabsApi.get(tab.id).catch(() => null);
+  if (bound?.id !== tab.id || !tabMatchesEntry(bound, targetUrl)) {
+    throw new ArenaError('原页已变更，请重新点击打开原页');
+  }
+  if (bound.windowId !== source.windowId) {
+    try {
+      bound = await tabsApi.move(tab.id, { windowId: source.windowId, index: -1 });
+    } catch {
+      throw new ArenaError('无法把已打开的原页移回当前工作台窗口，请在浏览器中查看已打开的原页');
+    }
+    if (bound?.id !== tab.id || bound.windowId !== source.windowId) {
+      throw new ArenaError('浏览器未确认原页已移回当前工作台窗口');
+    }
+    if (!tabMatchesEntry(bound, targetUrl)) {
+      throw new ArenaError('原页在移动时已切换到其他网页，请重新点击打开原页');
+    }
+  }
+
+  if (bound.openerTabId !== source.id) {
+    try {
+      bound = await tabsApi.update(bound.id, { openerTabId: source.id });
+    } catch {
+      throw new ArenaError('浏览器未能将原页关联到当前工作台，请重新点击打开原页');
+    }
+    if (bound?.id !== tab.id || bound.windowId !== source.windowId || !tabMatchesEntry(bound, targetUrl)) {
+      throw new ArenaError('原页已变更，请重新点击打开原页');
+    }
+  }
+  await joinWorkbenchTabGroup(bound, source, tabsApi);
+  return bound;
+}
+
 /**
  * One in-flight open per session+seat. Two clicks before the first tab appears
  * join the same attempt, so a slow provider page can not produce two
@@ -565,14 +618,13 @@ async function openProviderTab(sessionId, providerId, configuredUrl = '', overri
 /**
  * Reuse the bound seat tab only when its readable metadata still proves it is
  * the configured entry page; otherwise leave that tab untouched and open a
- * fresh one. `overrides` exists for the Node regression test (fake tabs and
- * binding store); the extension always uses the real Chrome APIs.
+ * fresh one from the workbench tab that requested it.
  */
-async function openProviderTabOnce(sessionId, providerId, configuredUrl, key, overrides) {
+async function openProviderTabOnce(sessionId, providerId, configuredUrl, key, options) {
   const provider = PROVIDERS[providerId];
   if (!provider) throw new ArenaError('未知或不规范的席位标识');
-  const tabsApi = overrides.tabs || chrome.tabs;
-  const store = overrides.bindings || {
+  const tabsApi = options.tabs || chrome.tabs;
+  const store = options.bindings || {
     get: getBinding,
     set: setBinding,
     drop: dropBinding,
@@ -580,6 +632,9 @@ async function openProviderTabOnce(sessionId, providerId, configuredUrl, key, ov
   const targetUrl = typeof configuredUrl === 'string' && configuredUrl
     ? configuredUrl
     : provider.url;
+  const sourceTab = options.sourceTab;
+  const hasSource = Number.isInteger(sourceTab?.id) && sourceTab.id >= 0
+    && Number.isInteger(sourceTab.windowId) && sourceTab.windowId >= 0;
 
   let binding = null;
   try {
@@ -598,9 +653,12 @@ async function openProviderTabOnce(sessionId, providerId, configuredUrl, key, ov
       tab = null;
     }
 
-    try { await chrome.storage.local.set({ ['dbg.' + Date.now()]: { step: 'get', binding: binding.tabId, url: tab && tab.url, pendingUrl: tab && tab.pendingUrl, status: tab && tab.status, match: tab && tabMatchesEntry(tab, targetUrl) } }); } catch {}
     if (tab && Number.isInteger(tab.id) && tabMatchesEntry(tab, targetUrl)) {
-      await focusTab(tab, tabsApi, overrides.windows);
+      if (hasSource && (tab.windowId !== sourceTab.windowId || tab.openerTabId !== sourceTab.id
+        || (hasWorkbenchTabGroup(sourceTab) && tab.groupId !== sourceTab.groupId))) {
+        tab = await placeBoundTab(tab, sourceTab, targetUrl, tabsApi);
+      }
+      await focusTab(tab, tabsApi, options.windows);
       await store.set(key, {
         ...binding,
         provider: providerId,
@@ -621,10 +679,14 @@ async function openProviderTabOnce(sessionId, providerId, configuredUrl, key, ov
     }
   }
 
-  try { await chrome.storage.local.set({ ['dbg.' + Date.now()]: { step: 'create-before', targetUrl } }); } catch {}
-  const tab = await tabsApi.create({ url: targetUrl, active: true });
-  try { await chrome.storage.local.set({ ['dbg.' + Date.now()]: { step: 'created', id: tab && tab.id, url: tab && tab.url, pendingUrl: tab && tab.pendingUrl } }); } catch {}
+  const createProperties = { url: targetUrl, active: true };
+  if (hasSource) {
+    createProperties.windowId = sourceTab.windowId;
+    createProperties.openerTabId = sourceTab.id;
+  }
+  const tab = await tabsApi.create(createProperties);
   if (!tab || !Number.isInteger(tab.id)) throw new ArenaError('无法打开网页标签');
+  if (hasSource) await joinWorkbenchTabGroup(tab, sourceTab, tabsApi);
   await store.set(key, {
     tabId: tab.id,
     provider: providerId,
@@ -743,7 +805,7 @@ async function configuredLocalEntryUrl(provider) {
   return url;
 }
 
-async function commandOpen(message) {
+async function commandOpen(message, sourceTab) {
   const id = requireToken(message.id, 'id');
   if (!isProviderId(message.provider)) {
     throw new ArenaError('未知或不规范的席位标识');
@@ -758,12 +820,12 @@ async function commandOpen(message) {
     const entryUrl = AUTOMATION_SEATS.has(provider)
       ? await configuredLocalEntryUrl(provider)
       : '';
-    await openProviderTab(session.id, provider, entryUrl);
+    await openProviderTab(session.id, provider, entryUrl, { sourceTab });
     return { session };
   });
 }
 
-async function handleCommand(message) {
+async function handleCommand(message, sender) {
   if (!message || typeof message !== 'object') throw new ArenaError('命令格式无效');
   const type = message.type;
   if (typeof type !== 'string' || !COMMAND_TYPES.has(type)) {
@@ -781,7 +843,7 @@ async function handleCommand(message) {
     case 'delete':
       return commandDelete(message);
     case 'open':
-      return commandOpen(message);
+      return commandOpen(message, sender.tab);
     default:
       throw new ArenaError(`未知命令：${String(type)}`);
   }
@@ -804,10 +866,34 @@ function isTrustedSender(sender) {
 // Wiring
 // ---------------------------------------------------------------------------
 
+const LEGACY_TAB_DEBUG_STEPS = new Set(['get', 'create-before', 'created']);
+const TAB_DEBUG_CLEANUP_KEY = 'arena.migration.tabDebugCleanup.v1';
+
+async function cleanupLegacyTabDebugLogs() {
+  try {
+    const local = chrome.storage?.local;
+    if (!local) return;
+    const migration = await local.get(TAB_DEBUG_CLEANUP_KEY);
+    if (migration[TAB_DEBUG_CLEANUP_KEY] === true) return;
+    // get(null) works on the minimum supported Chrome. Delete only keys
+    // written by the old dbg.<Date.now()> logger in one storage operation.
+    const records = await local.get(null);
+    const keys = Object.keys(records).filter((key) =>
+      /^dbg\.[0-9]{13}$/.test(key) && LEGACY_TAB_DEBUG_STEPS.has(records[key]?.step),
+    );
+    if (keys.length > 0) await local.remove(keys);
+    await local.set({ [TAB_DEBUG_CLEANUP_KEY]: true });
+  } catch {
+    // Leave the migration incomplete so the next worker start can retry.
+  }
+}
+
 // automation.js owns every automation.* message and validates its own sender.
 // It only writes through the same two command paths used by the UI, so the
 // stored session remains the single source of truth.
 if (typeof chrome !== 'undefined' && chrome.runtime) {
+  // An unpacked extension can pick up new code without a version change.
+  void cleanupLegacyTabDebugLogs();
   automationApi = installAutomation({
     getSession: async (id) => (await commandGet({ id })).session,
     act: async (id, action, payload) => (await commandAct({ id, action, payload })).session,
@@ -843,7 +929,7 @@ if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage)
       return false;
     }
 
-    handleCommand(message).then(
+    handleCommand(message, sender).then(
       (data) => reply({ ok: true, ...data }),
       (error) => reply({ ok: false, error: errorMessage(error) }),
     );
