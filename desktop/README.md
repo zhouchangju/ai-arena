@@ -2,7 +2,7 @@
 
 这是一个使用系统 WebKit 的原生 macOS 应用。一个窗口里有 ChatGPT、Gemini 和 DeepSeek 各自的真实网页。流式正文、图片、表格、引用和交互控件由各站渲染。工具栏负责组织轮次，讨论记录保存在本机。
 
-本机已打好的 0.3.0（构建 3）位于 `desktop/build/releases/0.3.0/AI Arena.app`，压缩包在同一目录。这个目录属于本机构建产物；新检出的仓库可按下方命令构建。 [开场界面](../docs/evidence/native-0.3/composer.png) · [讨论界面](../docs/evidence/native-0.3/discussion.png)
+本机已打好的 0.3.0（构建 4，折纸三人组图标）位于 `desktop/build/releases/0.3.0/AI Arena.app`，压缩包在同一目录。这个目录属于本机构建产物；新检出的仓库可按下方命令构建。 [开场界面](../docs/evidence/native-0.3/composer.png) · [讨论界面](../docs/evidence/native-0.3/discussion.png)
 
 ## 第一次使用
 
