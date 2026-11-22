@@ -34,6 +34,7 @@
 //     "selectors": [...],                    // 可选，覆盖内置站点选择器
 //     "options": [...],                      // 可选，覆盖内置采样参数
 //     "knownDraftDigests": ["<sha256>"],     // 可选，最多 8 个
+//     "verifiedReadPrompt": "原文",          // 可选，仅 read；只读重建
 //     "scope": ...]                          // 忽略；作用域由本类固定
 //  也接受把同样内容放在 command["message"] 里。
 //
@@ -324,9 +325,9 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
     func bindVerifiedConversation(from response: [String: Any]) -> Bool {
         guard let site else { return false }
         guard let detail = response["detail"] as? [String: Any] else { return false }
-        let status = response["status"] as? String
-        let verified = (detail["userTurnVerified"] as? Bool) == true || status == "submitted"
-        guard verified else { return false }
+        // 只有驱动明确核对过“本轮精确用户消息”的回执才能固定会话。
+        // status 本身不够：临时路由上也可能返回 submitted。
+        guard (detail["userTurnVerified"] as? Bool) == true else { return false }
 
         let raw = (detail["href"] as? String) ?? (detail["url"] as? String)
         guard let raw, let url = URL(string: raw),
@@ -352,19 +353,222 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
     }
 
     private func isConversation(_ url: URL, site: SiteDescriptor) -> Bool {
-        if site.isTest { return url.path == site.homeURL.path }
-        let parts = url.path.split(separator: "/")
+        Self.isConversationURL(
+            url,
+            provider: provider,
+            homePath: site.homeURL.path,
+            isTest: site.isTest
+        )
+    }
+
+    /// 纯函数版本：绑定、恢复和定向测试共用同一套白名单。
+    ///
+    /// ChatGPT 在真正落稳之前会先把地址换成 `/c/local-chatgpt:<uuid>`，路径里的
+    /// 冒号也可能是百分号编码（`local-chatgpt%3A...`）。这是前端临时路由，不是
+    /// 会话地址：不持久化、不作为恢复目的地，也不允许固定成本席的上下文。
+    /// 只认稳定的 `/c/<id>`；其它站点的既有规则保持不变。
+    nonisolated static func isConversationURL(
+        _ url: URL,
+        provider: String,
+        homePath: String,
+        isTest: Bool
+    ) -> Bool {
+        if isTest { return url.path == homePath }
+        let parts = url.path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
         switch provider {
-        case "chatgpt": return parts.count == 2 && parts[0] == "c"
+        case "chatgpt":
+            guard parts.count == 2, parts[0] == "c" else { return false }
+            return isStableChatGPTConversationID(parts[1])
         case "gemini": return parts.count == 2 && parts[0] == "app"
-        case "deepseek": return parts.count == 4 && parts.prefix(3).map(String.init) == ["a", "chat", "s"]
+        case "deepseek": return parts.count == 4 && Array(parts.prefix(3)) == ["a", "chat", "s"]
         default: return false
         }
+    }
+
+    /// 稳定的 ChatGPT 会话 ID。除了解码后的路径不能含 `local-chatgpt`，
+    /// 还要求形如 `/c/<id>` 的单段 ID；临时路由里的冒号、编码片段都不合格。
+    nonisolated static func isStableChatGPTConversationID(_ raw: String) -> Bool {
+        var segment = raw
+        for _ in 0..<2 {
+            guard let decoded = segment.removingPercentEncoding, decoded != segment else { break }
+            segment = decoded
+        }
+        if segment.lowercased().contains("local-chatgpt") { return false }
+        return segment.range(
+            of: #"^[A-Za-z0-9][A-Za-z0-9-]{5,}$"#,
+            options: .regularExpression
+        ) != nil
     }
 
     /// 新建场次（或换一场讨论）时才允许解除固定。手工接管与恢复不重置。
     func resetConversationBinding() {
         boundConversationURL = nil
+    }
+
+    /// 一次受控只读恢复的地址条件：本席已固定会话、当前地址正是该会话、页面
+    /// 也没有正在进行的导航。满足时返回规范化的重载目标，否则 nil。纯函数，
+    /// 模型和定向检查共用；它不判断草稿或 stop，那些要由页面的 probe 回执确认。
+    nonisolated static func readRecoveryReloadTarget(
+        current: URL?,
+        bound: URL?,
+        origin: String,
+        isLoading: Bool
+    ) -> URL? {
+        guard !isLoading,
+              let current,
+              let bound,
+              let canonicalCurrent = canonicalConversationURL(current, origin: origin),
+              let canonicalBound = canonicalConversationURL(bound, origin: origin),
+              canonicalCurrent.absoluteString == canonicalBound.absoluteString
+        else { return nil }
+        return canonicalBound
+    }
+
+    /// 已确认发送、仍在等待原生完成标记的席位在长时间没有新内容时，由本席
+    /// 做一次受控的“只读恢复”：在同一个 WKWebView 内重新加载已经固定的会话
+    /// 地址。它不填写、不点击、不打开别的标签，也不改变会话绑定。
+    ///
+    /// 调用方必须先用只读 `probe` 确认输入框为空、没有活跃的 stop，并核对该
+    /// 任务仍属于当前场次；任一条件不满足就应放弃本次重载。返回是否真的发起
+    /// 了导航。
+    @discardableResult
+    func reloadBoundConversationForReadRecovery() -> Bool {
+        guard let site else { return false }
+        guard let target = Self.readRecoveryReloadTarget(
+            current: webView.url,
+            bound: boundConversationURL,
+            origin: site.origin,
+            isLoading: isLoading
+        ) else { return false }
+        isWebContentTerminated = false
+        open(target)
+        return true
+    }
+
+    // MARK: Probe-time document recovery
+
+    /// probe 阶段“最多一次”的恢复结果。助手只核对文档并（必要时）导航，
+    /// 不填写、不点击。
+    enum ProbeRecoveryOutcome: Equatable {
+        /// 文档其实已经 settled，只是 WebKit 的 documentReady/isLoading 没有
+        /// 更新。调用方应稍等后重新 probe，不要导航、不要点击。
+        case flagsCorrected
+        /// 已发起一次回到本席原页（已核验会话或从未开始时的入口）的导航。
+        case navigated(URL)
+        /// 不满足自动恢复条件；调用方保持原样，继续原有的有界等待。
+        case declined(String)
+    }
+
+    /// 冷启动恢复后，WK 内容进程被终止或一次瞬时网络导航失败可能让
+    /// `documentReady` 永远不成立。这里只读核对当前文档：
+    /// - 只要有可用文档（可能含未发送草稿），就只修正过期的 WebKit 标志；
+    /// - 只有确认没有可用文档、且失败可归因于内容进程终止或瞬态网络错误时，
+    ///   才允许一次导航回已核验会话 / 从未开始时的允许入口。
+    /// 离线、证书、认证、取消、地址不符和进行中的导航一律不自动导航。
+    func recoverStalledProbeDocument(canRecover: () -> Bool) async -> ProbeRecoveryOutcome {
+        guard let site else { return .declined("unsupported-site") }
+        if webView.isLoading { return .declined("navigation-in-progress") }
+
+        let current = webView.url
+        if let current, Self.originString(current) != site.origin {
+            // 登录、验证或认证页：地址已离开本席 origin，绝不自动回退。
+            return .declined("origin-mismatch")
+        }
+
+        let snapshot = await probeDocumentSnapshot()
+        guard canRecover(), webView.url == current, !webView.isLoading else {
+            return .declined("page-or-task-changed")
+        }
+        if let snapshot {
+            guard snapshot.settled else { return .declined("live-document-loading") }
+            guard let current, snapshot.locationMatches(current) else {
+                return .declined("document-location-mismatch")
+            }
+            // 有可用文档就是活页面：绝不导航离开它。
+            if documentReady && !isLoading {
+                return .declined("document-already-ready")
+            }
+            documentReady = true
+            if snapshot.readyState == "complete" {
+                isLoading = false
+                estimatedProgress = 1
+            }
+            if isWebContentTerminated {
+                isWebContentTerminated = false
+                if lastErrorCode == "web-content-terminated" {
+                    lastErrorCode = nil
+                    lastError = nil
+                }
+            }
+            return .flagsCorrected
+        }
+
+        // 没有可用文档：只有“内容进程终止”或“已确认的瞬态网络导航失败”
+        // 才允许一次自动导航；离线、证书、认证和其它失败留给人和原有的
+        // 有界等待。
+        let terminated = isWebContentTerminated
+        if Self.isHumanRequiredNavigationFailure(lastNavigationErrorCode) {
+            return .declined("needs-human")
+        }
+        guard terminated || Self.isRecoverableTransientNavigationFailure(lastNavigationErrorCode) else {
+            return .declined("no-confirmed-failure")
+        }
+
+        guard let target = Self.probeRecoveryNavigationTarget(
+            current: current,
+            bound: boundConversationURL,
+            siteOrigin: site.origin,
+            homePath: site.homeURL.path,
+            provider: provider,
+            isTest: site.isTest
+        ) else { return .declined("no-verified-target") }
+
+        isWebContentTerminated = false
+        open(target)
+        return .navigated(target)
+    }
+
+    private struct ProbeDocumentSnapshot {
+        let readyState: String
+        let href: URL?
+
+        var settled: Bool { readyState == "interactive" || readyState == "complete" }
+
+        func locationMatches(_ webViewURL: URL) -> Bool {
+            guard let href else { return false }
+            return SitePane.documentLocationsMatch(href, webViewURL)
+        }
+    }
+
+    /// 只读读取当前文档的 readyState 和 location；读不到（例如内容进程已终止）
+    /// 返回 nil，表示没有可用文档。
+    private func probeDocumentSnapshot() async -> ProbeDocumentSnapshot? {
+        let body = """
+        const state = document.readyState ? String(document.readyState) : "";
+        const href = (window.location && window.location.href) ? String(window.location.href) : "";
+        return { readyState: state, href: href };
+        """
+        let raw: Any
+        do {
+            raw = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Any, Error>) in
+                webView.callAsyncJavaScript(body, arguments: [:], in: nil, in: contentWorld) { result in
+                    switch result {
+                    case .success(let value):
+                        continuation.resume(returning: value)
+                    case .failure(let error):
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        } catch {
+            return nil
+        }
+        guard let dictionary = raw as? [String: Any],
+              let state = dictionary["readyState"] as? String,
+              !state.isEmpty
+        else { return nil }
+        let href = (dictionary["href"] as? String).flatMap(URL.init(string:))
+        return ProbeDocumentSnapshot(readyState: state, href: href)
     }
 
     /// 当前原页是否已经离开本席固定的会话。返回 nil 表示仍在原位（或尚未固定）。
@@ -752,7 +956,59 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
             message["knownDraftDigests"] = try Self.normalizedDraftDigests(rawDigests)
         }
 
+        // 可选、向后兼容：只读 `probe` 可以点名核对输入框是否正好是本轮完整
+        // 提示。该值只用于比较，永远不会写入输入框，也不授权点击。
+        if normalizedType == "arena.web.probe", let rawExpected = source["expectedPrompt"] {
+            if let prompt = try Self.validatedProbeExpectedPrompt(rawExpected) {
+                message["expectedPrompt"] = prompt
+            }
+        }
+
+        // 只读重建用的原文：只允许出现在 read 上，形状与 submit 的 prompt
+        // 同样严格（非空、有界、无 NUL）。是否携带由模型按持久化发送意图决定；
+        // 驱动还会要求 scope.href 是稳定的同站会话地址后才真正重建。
+        if normalizedType == "arena.web.read", let rawReadPrompt = source["verifiedReadPrompt"] {
+            if let prompt = try Self.validatedReadRecoveryPrompt(rawReadPrompt) {
+                message["verifiedReadPrompt"] = prompt
+            }
+        }
+
         return message
+    }
+
+    /// Shape check for the read-only rebuild prompt. It is never written to the
+    /// composer and never authorises a click by itself.
+    nonisolated static func validatedReadRecoveryPrompt(_ raw: Any?) throws -> String? {
+        guard let raw else { return nil }
+        guard let prompt = raw as? String else {
+            throw SitePaneError.invalidPrompt("verifiedReadPrompt 必须是字符串")
+        }
+        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              prompt.count <= 100_000,
+              !prompt.unicodeScalars.contains("\u{0}")
+        else {
+            throw SitePaneError.invalidPrompt("verifiedReadPrompt 为空或超长")
+        }
+        return prompt
+    }
+
+    /// Shape check for the optional read-only `probe` composer comparison. Like
+    /// the read prompt it is only a comparison string: it is never written to
+    /// the composer and never authorises a click.
+    nonisolated static func validatedProbeExpectedPrompt(_ raw: Any?) throws -> String? {
+        guard let raw else { return nil }
+        guard let prompt = raw as? String else {
+            throw SitePaneError.invalidPrompt("expectedPrompt 必须是字符串")
+        }
+        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              prompt.count <= 100_000,
+              !prompt.unicodeScalars.contains("\u{0}")
+        else {
+            throw SitePaneError.invalidPrompt("expectedPrompt 为空或超长")
+        }
+        return prompt
     }
 
     private static func normalizedDraftDigests(_ raw: Any) throws -> [String] {
@@ -1212,7 +1468,7 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
     }
 
     /// 精确 origin 比较：scheme + host + 有效端口；缺省端口规范化。
-    static func originString(_ url: URL) -> String? {
+    nonisolated static func originString(_ url: URL) -> String? {
         guard let scheme = url.scheme?.lowercased(),
               let rawHost = url.host?.lowercased(),
               scheme == "http" || scheme == "https"
@@ -1235,7 +1491,7 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
     /// - 路径像登录/授权/回调页的一律不保存；
     /// - 规范化后超长的一律不保存。
     /// 任何不满足的地址返回 nil，调用方据此“不绑定、不保存”，而不是存半截。
-    static func canonicalConversationURL(_ url: URL, origin: String) -> URL? {
+    nonisolated static func canonicalConversationURL(_ url: URL, origin: String) -> URL? {
         guard let actualOrigin = originString(url), actualOrigin == origin else { return nil }
         guard url.user == nil, url.password == nil else { return nil }
 
@@ -1254,6 +1510,105 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
         guard !segments.contains(where: authenticationSegments.contains) else { return nil }
 
         return URL(string: origin + path)
+    }
+
+    /// JS `location` 与 WebKit 记录的地址是否指向同一个文档：同源且规范化
+    /// 路径一致。query/片段常被站点自身改写，不作为“换页”依据。
+    nonisolated static func documentLocationsMatch(_ lhs: URL, _ rhs: URL) -> Bool {
+        guard let leftOrigin = originString(lhs),
+              let rightOrigin = originString(rhs),
+              leftOrigin == rightOrigin
+        else { return false }
+        return normalizedPath(lhs.path) == normalizedPath(rhs.path)
+    }
+
+    nonisolated static func normalizedPath(_ path: String) -> String {
+        var value = path.isEmpty ? "/" : path
+        if !value.hasPrefix("/") { value = "/" + value }
+        while value.count > 1 && value.hasSuffix("/") { value.removeLast() }
+        return value
+    }
+
+    /// query 阶段最多一次自动导航的目标：
+    /// - 本席已固定会话：只允许精确回到该会话，且当前地址仍与它一致；
+    /// - 从未固定会话（还没开始）：只允许回到本站允许的新对话入口；
+    /// - 其它情况返回 nil，宁可转人工也不猜目的地。
+    nonisolated static func probeRecoveryNavigationTarget(
+        current: URL?,
+        bound: URL?,
+        siteOrigin: String,
+        homePath: String,
+        provider: String,
+        isTest: Bool
+    ) -> URL? {
+        if let bound {
+            guard let canonicalBound = canonicalConversationURL(bound, origin: siteOrigin),
+                  isConversationURL(
+                    canonicalBound,
+                    provider: provider,
+                    homePath: homePath,
+                    isTest: isTest
+                  )
+            else { return nil }
+            if let current {
+                guard let canonicalCurrent = canonicalConversationURL(current, origin: siteOrigin),
+                      canonicalCurrent.absoluteString == canonicalBound.absoluteString
+                else { return nil }
+            }
+            return canonicalBound
+        }
+
+        guard let current,
+              let canonicalCurrent = canonicalConversationURL(current, origin: siteOrigin)
+        else { return nil }
+        let root = normalizedPath(homePath)
+        let isPermittedRoot = canonicalCurrent.path == root
+            || (provider == "deepseek" && canonicalCurrent.path == "/a/chat")
+        return isPermittedRoot ? canonicalCurrent : nil
+    }
+
+    /// 已确认的瞬态网络导航失败。离线（-1009）、证书（-1200…-1207）、
+    /// 认证与取消都不在其中：这些需要人来处理，自动导航解决不了问题，
+    /// 还会反复打断站点。
+    nonisolated static func isRecoverableTransientNavigationFailure(_ raw: String?) -> Bool {
+        let prefix = "NSURLErrorDomain#"
+        guard let raw, raw.hasPrefix(prefix),
+              let code = Int(raw.dropFirst(prefix.count))
+        else { return false }
+        switch code {
+        case NSURLErrorTimedOut,
+             NSURLErrorCannotFindHost,
+             NSURLErrorCannotConnectToHost,
+             NSURLErrorNetworkConnectionLost,
+             NSURLErrorDNSLookupFailed:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// 需要人工处理的导航失败：离线与证书/认证。即使内容进程随后被终止，
+    /// 也不自动导航，避免反复打断站点或掩盖需要用户登录/信任证书的问题。
+    nonisolated static func isHumanRequiredNavigationFailure(_ raw: String?) -> Bool {
+        let prefix = "NSURLErrorDomain#"
+        guard let raw, raw.hasPrefix(prefix),
+              let code = Int(raw.dropFirst(prefix.count))
+        else { return false }
+        switch code {
+        case NSURLErrorNotConnectedToInternet,
+             NSURLErrorSecureConnectionFailed,
+             NSURLErrorServerCertificateHasBadDate,
+             NSURLErrorServerCertificateUntrusted,
+             NSURLErrorServerCertificateHasUnknownRoot,
+             NSURLErrorServerCertificateNotYetValid,
+             NSURLErrorClientCertificateRejected,
+             NSURLErrorClientCertificateRequired,
+             NSURLErrorUserAuthenticationRequired,
+             NSURLErrorUserCancelledAuthentication:
+            return true
+        default:
+            return false
+        }
     }
 
     private static func isLoopbackURL(_ url: URL) -> Bool {

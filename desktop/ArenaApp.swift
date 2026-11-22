@@ -67,6 +67,31 @@ struct SitePaneView: NSViewRepresentable {
 
 // MARK: - 应用入口
 
+/// Launch arguments that change the workbench's startup behaviour.
+enum ArenaLaunchOptions {
+    /// `--continue-saved-discussion <id>` (or `=<id>`) asks for one explicit,
+    /// verified continuation of exactly that saved discussion. Without it a
+    /// relaunch stays in the conservative manual-verification mode.
+    static func continueSessionID() -> String? {
+        let arguments = CommandLine.arguments
+        var raw: String?
+        if let index = arguments.firstIndex(of: "--continue-saved-discussion"),
+           index + 1 < arguments.count {
+            raw = arguments[index + 1]
+        } else if let inline = arguments.first(where: {
+            $0.hasPrefix("--continue-saved-discussion=")
+        }) {
+            raw = String(inline.dropFirst("--continue-saved-discussion=".count))
+        }
+        guard let value = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty,
+              !value.hasPrefix("--") else {
+            return nil
+        }
+        return value
+    }
+}
+
 @main
 struct ArenaDesktopApp: App {
     @NSApplicationDelegateAdaptor(ArenaAppDelegate.self) private var appDelegate
@@ -75,7 +100,11 @@ struct ArenaDesktopApp: App {
     init() {
         // 冒烟配置不合法时必须在 ArenaModel 创建（会打开原页）之前退出。
         SmokeRunner.preflight()
-        _model = StateObject(wrappedValue: ArenaModel())
+        _model = StateObject(
+            wrappedValue: ArenaModel(
+                continueSessionID: ArenaLaunchOptions.continueSessionID()
+            )
+        )
     }
 
     var body: some Scene {
@@ -107,6 +136,7 @@ struct ArenaRootView: View {
     @ObservedObject var model: ArenaModel
 
     @State private var selectedProviders: Set<String> = Set(ArenaSeatCatalog.ordered)
+    @State private var roundLimit = 3
     private var hasStarted: Bool { model.session != nil }
     @State private var takenOver: Set<String> = []
     @State private var detailsRequest: ArenaDetailRequest?
@@ -131,7 +161,15 @@ struct ArenaRootView: View {
         .background(Color(nsColor: .windowBackgroundColor))
         .task {
             model.prepareHome()
+            if model.isRecovering && model.stageKey == "done" && !SmokeRunner.isEnabled {
+                presentDetails(provider: nil, tab: .report)
+            }
             SmokeRunner.shared.begin(model: model)
+        }
+        .onChange(of: model.stageKey) { stage in
+            if stage == "done", !model.isReadOnly, backfillRequest == nil {
+                presentDetails(provider: nil, tab: .report)
+            }
         }
         .sheet(item: $detailsRequest) { request in
             ArenaDetailsSheet(model: model, request: request)
@@ -170,6 +208,22 @@ struct ArenaRootView: View {
 
             HStack(spacing: 6) {
                 stagePill
+                HStack(spacing: 3) {
+                    Text("轮数")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                    Picker("", selection: $roundLimit) {
+                        ForEach(1...5, id: \.self) { value in
+                            Text("\(value)").tag(value)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .controlSize(.small)
+                    .fixedSize()
+                    .disabled(model.session != nil)
+                    .help("新场次最多讨论轮数（含首轮独立作答、互评、候选与表态，默认 3）")
+                }
                 Spacer(minLength: 6)
                 Button("开始", action: startDiscussion)
                     .buttonStyle(.borderedProminent)
@@ -461,7 +515,7 @@ struct ArenaRootView: View {
             return
         }
         takenOver = []
-        model.start(providers)
+        model.start(providers, maxRounds: roundLimit)
     }
 
     private func pauseOrResume() {
@@ -475,6 +529,7 @@ struct ArenaRootView: View {
     private func newDiscussion() {
         takenOver = []
         selectedProviders = Set(ArenaSeatCatalog.ordered)
+        roundLimit = 3
         detailsRequest = nil
         backfillRequest = nil
         backfillTarget = nil
@@ -573,6 +628,14 @@ struct ArenaRootView: View {
         var text = ArenaStageNames.label(stage)
         if stage != "done" && !stage.isEmpty {
             text += " · 第 \(round) 轮"
+        }
+        if let tasks = session["tasks"] as? [[String: Any]], !tasks.isEmpty, stage != "done" {
+            let answered = tasks.filter { ($0["status"] as? String) == "answered" }.count
+            text += " · 已收到 " + String(answered) + "/" + String(tasks.count)
+            let pending = tasks.filter { ($0["status"] as? String) == "pending" }
+            if pending.count == 1, let seat = pending[0]["provider"] as? String {
+                text += " · 等待 " + ArenaSeatCatalog.name(seat)
+            }
         }
         if paused { text += " · 已暂停" }
         return text
@@ -1522,6 +1585,31 @@ final class SmokeRunner {
             exit(4)
         }
 
+        if CommandLine.arguments.contains("--smoke-check-restart") {
+            // Prove the ordinary relaunch path stays conservative: wait long
+            // enough for a stray dispatch to show, then report without sending.
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            let payload: [String: Any] = [
+                "ok": true,
+                "reason": "restart-conservative",
+                "didContinue": model.didContinueSavedDiscussion,
+                "statuses": model.statuses,
+                "stage": model.session?.arenaString("stage") ?? "",
+                "session": model.session ?? [:],
+            ]
+            Self.write(payload, to: resultPath)
+            Self.writeStderr("[smoke] ordinary restart checked; no dispatch expected")
+            exit(0)
+        }
+        if CommandLine.arguments.contains("--smoke-prepare-recovery") {
+            await runPrepareRecovery(model: model, resultPath: resultPath, timeout: timeout)
+            return
+        }
+        if CommandLine.arguments.contains("--smoke-continue-recovery") {
+            await runContinueRecovery(model: model, resultPath: resultPath, timeout: timeout)
+            return
+        }
+
         if CommandLine.arguments.contains("--smoke-restore") {
             guard let session = model.session, session["stage"] as? String == "done" else {
                 Self.write(["error": "没有恢复已完成的场次"], to: resultPath)
@@ -1579,6 +1667,117 @@ final class SmokeRunner {
             detail: "等待 stage=done 超时（\(Int(timeout))s）",
             model: model,
             extra: ["providers": SmokeRunner.providers]
+        )
+        exit(1)
+    }
+
+    /// First half of the isolated continuation check: start a normal
+    /// discussion on the fixture pages and stop as soon as two first-round
+    /// answers are recorded and the third seat is stuck before send with a
+    /// durable `.prepared` intent. Nothing is forced into the session.
+    @MainActor
+    private func runPrepareRecovery(model: ArenaModel, resultPath: String, timeout: Double) async {
+        let question = "【恢复验收】如果只有两个周末，个人笔记工具应先做移动端采集，还是先补桌面检索？请给出判断和一个可验证的理由。"
+        model.question = question
+        Self.writeStderr("[smoke] preparing a two-answered, one-prepared first round")
+        model.start(SmokeRunner.providers)
+
+        let deadline = Date().addingTimeInterval(min(max(timeout, 30), 120))
+        while Date() < deadline {
+            if (model.session?["stage"] as? String) == "independent",
+               let tasks = model.session?["tasks"] as? [[String: Any]],
+               tasks.count == SmokeRunner.providers.count {
+                let answered = tasks.filter { ($0["status"] as? String) == "answered" }
+                let pending = tasks.filter { ($0["status"] as? String) == "pending" }
+                if answered.count == 2, pending.count == 1,
+                   let provider = pending.first?["provider"] as? String,
+                   model.deliveryPhase(for: provider) == "prepared" {
+                    let payload: [String: Any] = [
+                        "ok": true,
+                        "reason": "recovery-armed",
+                        "sessionID": model.session?.arenaString("id") ?? "",
+                        "stage": model.session?.arenaString("stage") ?? "",
+                        "statuses": model.statuses,
+                        "pendingProvider": provider,
+                        "pendingPhase": "prepared",
+                        "session": model.session ?? [:],
+                    ]
+                    Self.write(payload, to: resultPath)
+                    Self.writeStderr("[smoke] recovery armed: two answers saved, \(provider) is prepared")
+                    exit(0)
+                }
+            }
+            try? await Task.sleep(nanoseconds: 150_000_000)
+        }
+
+        writeDiagnostics(
+            path: resultPath,
+            reason: "prepare-recovery-timeout",
+            detail: "等待“两席已答、一席 prepared”超时（\(Int(timeout))s）",
+            model: model,
+            extra: ["providers": SmokeRunner.providers]
+        )
+        exit(8)
+    }
+
+    /// Second half: the app was launched with `--continue-saved-discussion`
+    /// already; wait for the normal multi-round flow to reach the report.
+    @MainActor
+    private func runContinueRecovery(model: ArenaModel, resultPath: String, timeout: Double) async {
+        guard model.didContinueSavedDiscussion else {
+            writeDiagnostics(
+                path: resultPath,
+                reason: "continue-not-authorized",
+                detail: "指定的场次未通过显式恢复检查",
+                model: model
+            )
+            exit(9)
+        }
+        guard let sessionID = model.session?.arenaString("id") else {
+            writeDiagnostics(
+                path: resultPath,
+                reason: "no-saved-session",
+                detail: "没有可继续的已保存场次",
+                model: model
+            )
+            exit(9)
+        }
+
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if (model.session?["stage"] as? String) == "done" {
+                do {
+                    try ArenaExporter.makeMarkdown(model: model).write(
+                        to: URL(fileURLWithPath: resultPath)
+                            .deletingLastPathComponent()
+                            .appendingPathComponent("export.md"),
+                        atomically: true,
+                        encoding: .utf8
+                    )
+                } catch {
+                    Self.writeStderr("[smoke] export failed: \(error.localizedDescription)")
+                    exit(6)
+                }
+                let payload: [String: Any] = [
+                    "ok": true,
+                    "reason": "recovered",
+                    "sessionID": sessionID,
+                    "statuses": model.statuses,
+                    "session": model.session ?? [:],
+                ]
+                Self.write(payload, to: resultPath)
+                Self.writeStderr("[smoke] recovered discussion finished; result written")
+                exit(0)
+            }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+
+        writeDiagnostics(
+            path: resultPath,
+            reason: "continue-timeout",
+            detail: "显式恢复后等待 stage=done 超时（\(Int(timeout))s）",
+            model: model,
+            extra: ["sessionID": sessionID]
         )
         exit(1)
     }

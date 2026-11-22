@@ -39,6 +39,20 @@ struct ArenaManualTarget: Equatable {
     let version: Int?
 }
 
+/// One bounded read-only recovery is allowed per delivered task after this many
+/// seconds without any visible new content. It sits inside the agreed 30–45 s
+/// window and is never a completion signal by itself.
+let arenaStalledReadRecoverySeconds: TimeInterval = 35
+
+/// A Gemini seat whose send control stays missing/hidden before any click is
+/// repaired once per task by reloading this seat's own bound conversation. The
+/// repair waits for either this long or this many consecutive driver-confirmed
+/// pre-click refusals, stays inside the agreed 15–25 s window, and never clicks.
+let arenaPreClickReloadAfterSeconds: TimeInterval = 20
+let arenaPreClickReloadAfterRefusals = 3
+/// How long the reloaded page may take to mount a usable composer again.
+let arenaPreClickReloadReadySeconds: TimeInterval = 20
+
 @MainActor
 final class ArenaModel: ObservableObject {
 
@@ -71,9 +85,15 @@ final class ArenaModel: ObservableObject {
     @Published private(set) var isRecovering: Bool = false
     @Published private(set) var recoveryNotice: String = ""
 
+    /// True only when this launch used `--continue-saved-discussion <id>` and
+    /// the saved discussion passed every safety check, so the dispatcher was
+    /// restarted for the existing session. A normal launch stays manual.
+    @Published private(set) var didContinueSavedDiscussion: Bool = false
+
     // MARK: Private state
 
     private let engine: ArenaEngine
+    private let explicitContinueID: String?
     private var runToken = UUID()
     private var dispatcher: Task<Void, Never>?
     private var workers: [String: Task<Void, Never>] = [:]
@@ -81,6 +101,32 @@ final class ArenaModel: ObservableObject {
     private var manualProviders: Set<String> = []
     private var blockedTasks: Set<String> = []
     private var intents: [String: ArenaDeliveryIntent] = [:]
+
+    /// Per delivered task: the last visible progress fingerprint and when that
+    /// exact fingerprint was first seen. Cleared when content moves, when the
+    /// task is delivered, and when a new discussion starts. Deliberately
+    /// in-memory only: a restart must observe a fresh stall before reloading;
+    /// whether the one reload was already spent travels on the intent.
+    private var readRecoveryStalls: [String: ReadRecoveryStall] = [:]
+
+    private struct ReadRecoveryStall {
+        var fingerprint: String
+        var since: Date
+    }
+
+    /// Per task: the first driver-confirmed `missing`/`hidden` pre-click send
+    /// refusal in the current streak and how many have followed it. Cleared
+    /// when the streak breaks, when the task is delivered, and when a new run
+    /// starts. Deliberately in-memory only: a restart must observe a fresh
+    /// streak before it may reload anything.
+    private var preClickStalls: [String: PreClickStall] = [:]
+    /// Tasks whose single automatic pre-click reload was already spent this run.
+    private var preClickReloadedTasks: Set<String> = []
+
+    private struct PreClickStall {
+        var since: Date
+        var refusals: Int
+    }
 
     private var currentID: String?
     private var createdAt: Double = 0
@@ -95,11 +141,17 @@ final class ArenaModel: ObservableObject {
     private static let fixtureProbeWindowSeconds: TimeInterval = 6
     /// Bounded read-only window used to re-check a task whose submit may have
     /// already run. Only `read` is used inside it.
-    private static let verifyWindowSeconds: TimeInterval = 20
+    private static let verifyWindowSeconds: TimeInterval = 90
+    /// A probe blocked on `document-not-ready` may navigate back to its own
+    /// page at most once after this long. It is deliberately just above the
+    /// 10 s document-readiness wait, so a normally slow site is never raced.
+    private static let probeRecoveryDelaySeconds: TimeInterval = 10
 
     // MARK: Init / restore
 
-    init() {
+    init(continueSessionID: String? = nil) {
+        let requested = continueSessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.explicitContinueID = (requested?.isEmpty == false) ? requested : nil
         self.engine = ArenaEngine()
         if let issue = engine.configurationIssue {
             self.errorMessage = issue
@@ -107,6 +159,11 @@ final class ArenaModel: ObservableObject {
         refreshHistoryCache()
         restoreLastSession()
         prepareInitialPanes()
+        // Only the explicit, verified continuation restarts dispatch. A normal
+        // launch of a saved discussion deliberately stays manual.
+        if didContinueSavedDiscussion {
+            startDispatcher(token: runToken)
+        }
     }
 
     /// Saved discussions, newest first. Reading this never sends anything.
@@ -118,10 +175,15 @@ final class ArenaModel: ObservableObject {
 
     /// Start a new discussion with two or three distinct provider ids.
     ///
+    /// `maxRounds` is the total round budget (1-5, default 3 for a new desktop
+    /// session): the first independent/critique/proposal/vote round plus up to
+    /// four targeted follow-ups. A shared extension session keeps the original
+    /// two-round budget because it never passes this option.
+    ///
     /// The core session is created first, then every seat's original site is
     /// opened at its new-conversation entry page. Independent answers, peer
     /// critique, proposal and same-version votes are then driven in parallel.
-    func start(_ providers: [String]) {
+    func start(_ providers: [String], maxRounds: Int = 3) {
         let trimmed = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             errorMessage = "请先输入要讨论的问题"
@@ -140,6 +202,10 @@ final class ArenaModel: ObservableObject {
             errorMessage = "请选择两席或三席参与讨论"
             return
         }
+        guard (1...5).contains(maxRounds) else {
+            errorMessage = "互评轮数请选择 1 到 5 轮"
+            return
+        }
 
         var configs: [String: ArenaSiteConfig] = [:]
         for provider in providers {
@@ -155,7 +221,11 @@ final class ArenaModel: ObservableObject {
 
         let created: [String: Any]
         do {
-            created = try engine.createSession(question: trimmed, providers: providers)
+            created = try engine.createSession(
+                question: trimmed,
+                providers: providers,
+                maxRounds: maxRounds
+            )
         } catch {
             errorMessage = "无法建立场次：\(error.localizedDescription)"
             return
@@ -164,6 +234,7 @@ final class ArenaModel: ObservableObject {
         session = created
         isReadOnly = false
         isRecovering = false
+        didContinueSavedDiscussion = false
         recoveryNotice = ""
         isPaused = false
         storageFailed = false
@@ -172,6 +243,7 @@ final class ArenaModel: ObservableObject {
         blockedTasks.removeAll()
         previews.removeAll()
         statuses.removeAll()
+        readRecoveryStalls.removeAll()
         currentID = created.arenaString("id")
         createdAt = Self.nowMillis()
         errorMessage = ""
@@ -584,6 +656,7 @@ final class ArenaModel: ObservableObject {
         blockedTasks.removeAll()
         previews.removeAll()
         statuses.removeAll()
+        readRecoveryStalls.removeAll()
         isReadOnly = false
         isRecovering = false
         isPaused = false
@@ -722,7 +795,11 @@ final class ArenaModel: ObservableObject {
                     token: token
                 )
             case .prepared:
-                break // The submit command was never issued for this intent.
+                // A relaunched WKWebView may still be navigating. Probe before
+                // claiming a new submit attempt, just as for a fresh task.
+                guard await probeSeat(provider: provider, taskID: taskID, config: config,
+                                      pane: pane, token: token) != nil else { return false }
+                if intents[taskID]?.phase == .submitted { return true }
             }
         } else {
             guard await probeSeat(
@@ -776,7 +853,7 @@ final class ArenaModel: ObservableObject {
                 setStatus(provider, "本地保存失败，未发送；请先处理存储")
                 return false
             }
-            setStatus(provider, "发送中…")
+            setStatus(provider, "填入本轮提示并发送…")
 
             let response: [String: Any]
             do {
@@ -827,10 +904,11 @@ final class ArenaModel: ObservableObject {
 
             // 已核验本轮用户消息后，把本席真实会话的 origin+path 固定下来，
             // 供下一轮发送前的地址核对与持久化恢复。
-            pane.bindVerifiedConversation(from: response)
+            persistVerifiedBinding(pane, from: response, taskID: taskID)
 
             let status = response.arenaString("status") ?? ""
-            if status == "submitted" || status == "pending" || status == "done" {
+            let turnVerified = (response["detail"] as? [String: Any])?["userTurnVerified"] as? Bool == true
+            if status == "submitted" || (status == "pending" && turnVerified) || status == "done" {
                 intent.phase = .submitted
                 intent.submittedAt = Self.nowMillis()
                 intent.pageURL = pane.boundConversationURL?.absoluteString ?? intent.pageURL
@@ -861,7 +939,16 @@ final class ArenaModel: ObservableObject {
                 intent.phase = .prepared
                 intents[taskID] = intent
                 persist()
-                setStatus(provider, "等待发送控件…")
+                setStatus(provider, Self.preClickStatus(detail))
+                if case .blocked = await repairPreClickSendIfNeeded(
+                    provider: provider,
+                    taskID: taskID,
+                    config: config,
+                    pane: pane,
+                    token: token,
+                    prompt: intent.prompt,
+                    detail: detail
+                ) { return false }
                 attempt += 1
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
             case "prompt-already-sent":
@@ -878,7 +965,16 @@ final class ArenaModel: ObservableObject {
                     intent.phase = .prepared
                     intents[taskID] = intent
                     persist()
-                    setStatus(provider, "等待发送控件…")
+                    setStatus(provider, Self.preClickStatus(detail))
+                    if case .blocked = await repairPreClickSendIfNeeded(
+                        provider: provider,
+                        taskID: taskID,
+                        config: config,
+                        pane: pane,
+                        token: token,
+                        prompt: intent.prompt,
+                        detail: detail
+                    ) { return false }
                     attempt += 1
                     try? await Task.sleep(nanoseconds: 1_500_000_000)
                 } else if code == "draft-conflict" {
@@ -911,7 +1007,7 @@ final class ArenaModel: ObservableObject {
         }
 
         blockedTasks.insert(taskID)
-        setStatus(provider, "发送控件长时间未就绪，请核对原页")
+        setStatus(provider, "发送控件长时间未就绪；原页可能已填入本轮提示，请核对")
         return false
     }
 
@@ -930,7 +1026,9 @@ final class ArenaModel: ObservableObject {
             ? Self.realProbeWindowSeconds
             : Self.fixtureProbeWindowSeconds
         let deadline = Date().addingTimeInterval(window)
+        let startedAt = Date()
         var attempt = 0
+        var attemptedProbeRecovery = false
 
         while true {
             guard !Task.isCancelled else { return nil }
@@ -957,7 +1055,7 @@ final class ArenaModel: ObservableObject {
                 if status == "ready" {
                     if let detail = response["detail"] as? [String: Any],
                        let known = detail["knownTask"] as? [String: Any],
-                       (known.arenaString("status") == "submitted"
+                       ((known.arenaString("status") == "submitted" && known.arenaBool("verified") == true)
                         || known.arenaString("status") == "done") {
                         // The page still remembers this task id: adopt it and
                         // read only. Never submit a second time.
@@ -969,7 +1067,8 @@ final class ArenaModel: ObservableObject {
                             phase: .submitted,
                             preparedAt: intents[taskID]?.preparedAt ?? Self.nowMillis(),
                             submittedAt: Self.nowMillis(),
-                            pageURL: pane.boundConversationURL?.absoluteString
+                            pageURL: pane.boundConversationURL?.absoluteString,
+                            reloadAttempted: intents[taskID]?.reloadAttempted
                         )
                         persist()
                         setStatus(provider, "已发送，只读核对中…")
@@ -992,6 +1091,39 @@ final class ArenaModel: ObservableObject {
                 // 本轮会话被换走：立即转人工，不做 34 秒的瞬态重试。
                 if stopOnConversationChange(error, provider: provider, taskID: taskID) {
                     return nil
+                }
+                // 冷启动恢复后，WK 内容进程终止或一次瞬时网络导航失败会让
+                // 文档永远等不到 didFinish。此时允许一次回到本席原页的导航；
+                // 助手只在确认没有可用文档时才导航，且从不填写或点击。
+                // 暂停、接管、离线、证书/认证页和地址不符都在这里或助手里排除。
+                if !attemptedProbeRecovery,
+                   Date() < deadline,
+                   Date().timeIntervalSince(startedAt) >= Self.probeRecoveryDelaySeconds,
+                   let paneError = error as? SitePaneError,
+                   case .documentNotReady = paneError,
+                   !isPaused,
+                   !manualProviders.contains(provider),
+                   isCurrentPending(taskID) {
+                    attemptedProbeRecovery = true
+                    let recovery = await pane.recoverStalledProbeDocument {
+                        !Task.isCancelled && !self.isPaused && self.callbackIsCurrent(
+                            token: token, taskID: taskID, provider: provider
+                        )
+                    }
+                    switch recovery {
+                    case .flagsCorrected:
+                        // 文档其实已经 settled，只是 WebKit 标志过期：稍等后
+                        // 重新 probe，不导航、不点击。
+                        setStatus(provider, "原页已就绪，继续核对…")
+                        try? await Task.sleep(nanoseconds: 400_000_000)
+                        continue
+                    case .navigated:
+                        setStatus(provider, "原页未就绪，已自动回到本席原页一次；继续核对，不会点击…")
+                        try? await Task.sleep(nanoseconds: 1_500_000_000)
+                        continue
+                    case .declined:
+                        break
+                    }
                 }
                 if Date() < deadline, !Task.isCancelled {
                     attempt += 1
@@ -1031,11 +1163,21 @@ final class ArenaModel: ObservableObject {
             guard isCurrentPending(taskID) else { return }
 
             do {
+                // A read may carry the exact persisted prompt so a driver that
+                // lost its in-memory record (page reload, new process, seat
+                // reopened) can rebuild a read-only record instead of stopping
+                // for a human. The prompt is only present when this app really
+                // persisted a delivery intent; `prepared` never counts.
+                let recoveryPrompt = ArenaEngine.readRecoveryPrompt(
+                    phase: intents[taskID]?.phase,
+                    prompt: intents[taskID]?.prompt
+                )
                 let response = try await pane.command(
                     engine.driverMessage(
                         kind: "read",
                         taskID: taskID,
                         prompt: nil,
+                        verifiedReadPrompt: recoveryPrompt,
                         config: config
                     )
                 )
@@ -1044,7 +1186,7 @@ final class ArenaModel: ObservableObject {
                 guard callbackIsCurrent(token: token, taskID: taskID, provider: provider) else {
                     return
                 }
-                pane.bindVerifiedConversation(from: response)
+                persistVerifiedBinding(pane, from: response, taskID: taskID)
                 consecutiveErrors = 0
                 let status = response.arenaString("status") ?? ""
                 let code = response.arenaString("error") ?? ""
@@ -1062,12 +1204,37 @@ final class ArenaModel: ObservableObject {
                     deliver(provider: provider, task: task, text: text)
                     return
                 case "pending":
-                    if let detail = response["detail"] as? [String: Any],
-                       let preview = detail["preview"] as? [String: Any],
+                    let detail = response["detail"] as? [String: Any]
+                    if let preview = detail?["preview"] as? [String: Any],
                        let text = preview.arenaString("text") {
                         previews[provider] = text
                     }
-                    setStatus(provider, "正在生成…")
+                    let reason = detail?.arenaString("reason")
+                    let stalledFor = noteReadProgress(taskID: taskID, detail: detail)
+                    let outcome = await recoverStalledReadIfNeeded(
+                        provider: provider,
+                        taskID: taskID,
+                        config: config,
+                        pane: pane,
+                        token: token,
+                        detail: detail,
+                        stalledFor: stalledFor
+                    )
+                    switch outcome {
+                    case .reloaded:
+                        // The helper already set the precise status.
+                        break
+                    case .held(let text):
+                        setStatus(provider, text)
+                    case .none:
+                        setStatus(
+                            provider,
+                            Self.pendingReadStatus(
+                                reason: reason,
+                                recoveryUsed: intents[taskID]?.reloadAttempted == true
+                            )
+                        )
+                    }
                 case "submitted", "ready":
                     if !showedSubmitted {
                         setStatus(provider, "已发送，等待回答…")
@@ -1111,6 +1278,442 @@ final class ArenaModel: ObservableObject {
         }
     }
 
+    // MARK: Bounded read-only recovery
+
+    private enum StalledReadOutcome {
+        /// Not a candidate (wrong seat, unconfirmed, already used, progress moved,
+        /// or the user paused / took over).
+        case none
+        /// A candidate whose page state (or a reservation that could not be
+        /// saved) forbids a reload; keep reading only.
+        case held(String)
+        /// The one allowed reload was started in this seat's own WKWebView.
+        case reloaded
+    }
+
+    /// Visible progress only: the preview text/length and the reported partial
+    /// length. Elapsed time, `stableMs` and `timedOut` keep growing while the
+    /// page is stuck, so they must never count as progress.
+    nonisolated static func readProgressFingerprint(_ detail: [String: Any]?) -> String {
+        guard let detail else { return "" }
+        let preview = detail["preview"] as? [String: Any]
+        let text = preview?.arenaString("text") ?? ""
+        let chars = preview?.arenaInt("chars") ?? text.count
+        let partial = detail.arenaInt("partialChars") ?? 0
+        let reason = detail.arenaString("reason") ?? ""
+        return "\(reason)|\(chars)|\(partial)|\(text)"
+    }
+
+    /// One reload per delivered Gemini task, and only while the page itself has
+    /// verified this round's turn, has no active stop control and is still on
+    /// the bound conversation. A pending preview is never a completion signal.
+    nonisolated static func isStalledReadRecoveryCandidate(
+        provider: String,
+        phase: ArenaDeliveryIntent.Phase?,
+        alreadyUsed: Bool,
+        userTurnVerified: Bool,
+        stopActive: Bool,
+        boundMatchesCurrent: Bool,
+        stalledFor: TimeInterval
+    ) -> Bool {
+        provider == "gemini"
+            && phase == .submitted
+            && !alreadyUsed
+            && userTurnVerified
+            && !stopActive
+            && boundMatchesCurrent
+            && stalledFor >= arenaStalledReadRecoverySeconds
+    }
+
+    /// One automatic pre-click send repair per Gemini task. Only the driver's
+    /// explicit `pre-click` + `clickAttempted == false` answer with a
+    /// `missing`/`hidden` send control counts: a disabled control, a
+    /// composer-changed refusal, or any post-click state is not evidence that
+    /// reloading this seat's own bound conversation would help.
+    nonisolated static func isPreClickReloadCandidate(
+        provider: String,
+        phase: ArenaDeliveryIntent.Phase?,
+        reportedPhase: String?,
+        clickAttempted: Bool?,
+        reason: String?,
+        alreadyReloaded: Bool,
+        elapsed: TimeInterval,
+        refusals: Int
+    ) -> Bool {
+        provider == "gemini"
+            && phase == .prepared
+            && reportedPhase == "pre-click"
+            && clickAttempted == false
+            && (reason == "missing" || reason == "hidden")
+            && !alreadyReloaded
+            && (elapsed >= arenaPreClickReloadAfterSeconds
+                || refusals >= arenaPreClickReloadAfterRefusals)
+    }
+
+    /// A reload may only move a composer that is empty or already holds exactly
+    /// this round's complete prompt (as judged by the driver's own `sameText`),
+    /// and only while the page shows no live Stop control.
+    nonisolated static func isPreClickComposerSafe(
+        draftEmpty: Bool,
+        matchesExpectedPrompt: Bool,
+        stopActive: Bool
+    ) -> Bool {
+        (draftEmpty || matchesExpectedPrompt) && !stopActive
+    }
+
+    nonisolated static func pendingReadStatus(reason: String?, recoveryUsed: Bool) -> String {
+        let suffix = recoveryUsed ? "（已试只读重载）" : ""
+        switch reason {
+        case "completion-signal-missing":
+            return "原页文本已停止更新，等待原生完成标记\(suffix)…"
+        case "answer-updating":
+            return "回答仍在更新\(suffix)…"
+        case "awaiting-answer":
+            return "等待回答出现\(suffix)…"
+        case "generating":
+            return "正在生成…"
+        default:
+            return "继续只读等待原生完成标记\(suffix)…"
+        }
+    }
+
+    /// Track one task's visible progress and return how long the current
+    /// fingerprint has been unchanged. A changed fingerprint resets the clock.
+    private func noteReadProgress(taskID: String, detail: [String: Any]?) -> TimeInterval {
+        let fingerprint = Self.readProgressFingerprint(detail)
+        let now = Date()
+        if let existing = readRecoveryStalls[taskID], existing.fingerprint == fingerprint {
+            return now.timeIntervalSince(existing.since)
+        }
+        readRecoveryStalls[taskID] = ReadRecoveryStall(fingerprint: fingerprint, since: now)
+        return 0
+    }
+
+    /// One bounded, read-only recovery for a delivered task whose page stopped
+    /// updating. It runs inside this seat's own worker only, so another seat's
+    /// dispatch never waits on it. It never fills, clicks or calls `submit`.
+    private func recoverStalledReadIfNeeded(
+        provider: String,
+        taskID: String,
+        config: ArenaSiteConfig,
+        pane: SitePane,
+        token: UUID,
+        detail: [String: Any]?,
+        stalledFor: TimeInterval
+    ) async -> StalledReadOutcome {
+        let userTurnVerified = detail?.arenaBool("userTurnVerified") == true
+        let reason = detail?.arenaString("reason")
+        let boundMatches = pane.boundConversationURL != nil
+            && pane.currentURL != nil
+            && pane.conversationMismatch() == nil
+        guard Self.isStalledReadRecoveryCandidate(
+            provider: provider,
+            phase: intents[taskID]?.phase,
+            alreadyUsed: intents[taskID]?.reloadAttempted == true,
+            userTurnVerified: userTurnVerified,
+            stopActive: reason == "generating",
+            boundMatchesCurrent: boundMatches,
+            stalledFor: stalledFor
+        ) else { return .none }
+
+        // Re-check the user's control right before touching the page.
+        guard token == runToken, !isReadOnly, !isPaused,
+              !manualProviders.contains(provider), isCurrentPending(taskID) else {
+            return .none
+        }
+
+        // The read receipt does not carry the composer, so confirm with the
+        // read-only probe: empty composer, no live stop, still the same page.
+        let probe: [String: Any]
+        do {
+            probe = try await pane.command(
+                engine.driverMessage(kind: "probe", taskID: taskID, prompt: nil, config: config)
+            )
+        } catch {
+            // `read` will surface the real error on its own path; this helper
+            // must not block the loop with its own retries.
+            return .none
+        }
+        guard callbackIsCurrent(token: token, taskID: taskID, provider: provider) else {
+            return .none
+        }
+
+        let probeDetail = probe["detail"] as? [String: Any]
+        let composerEmpty = (probeDetail?["composer"] as? [String: Any])?
+            .arenaBool("draftEmpty") == true
+        let stopActive = (probeDetail?["stop"] as? [String: Any])?
+            .arenaBool("active") == true
+
+        guard probe.arenaString("status") == "ready" else {
+            // Page is still loading or rejected the probe. Restart the stall
+            // clock so this check is not repeated every poll tick.
+            readRecoveryStalls[taskID] = ReadRecoveryStall(
+                fingerprint: Self.readProgressFingerprint(detail),
+                since: Date()
+            )
+            return .none
+        }
+        guard composerEmpty, !stopActive else {
+            readRecoveryStalls[taskID] = ReadRecoveryStall(
+                fingerprint: Self.readProgressFingerprint(detail),
+                since: Date()
+            )
+            return .held(
+                composerEmpty
+                    ? "原页仍有生成控件，未自动重载…"
+                    : "原页有未发送草稿，未自动重载…"
+            )
+        }
+
+        // The probe awaited the page, so the user may have paused the
+        // discussion since the pre-probe check. Re-check the control right
+        // before navigating: a pause must win over the reload.
+        guard token == runToken, !isReadOnly, !isPaused,
+              !manualProviders.contains(provider), isCurrentPending(taskID) else {
+            return .none
+        }
+
+        // Reserve the one reload durably *before* the page moves. A reload that
+        // is not recorded could be borrowed again after a restart, so a failed
+        // save leaves the page untouched.
+        let priorReloadFlag = intents[taskID]?.reloadAttempted
+        guard var reservation = intents[taskID] else { return .none }
+        reservation.reloadAttempted = true
+        intents[taskID] = reservation
+        guard persist() else {
+            reservation.reloadAttempted = priorReloadFlag
+            intents[taskID] = reservation
+            // Do not probe again on every tick while storage is failing.
+            readRecoveryStalls[taskID] = ReadRecoveryStall(
+                fingerprint: Self.readProgressFingerprint(detail),
+                since: Date()
+            )
+            return .held("本地保存失败，未自动重载；请先处理存储")
+        }
+
+        guard pane.reloadBoundConversationForReadRecovery() else {
+            readRecoveryStalls[taskID] = ReadRecoveryStall(
+                fingerprint: Self.readProgressFingerprint(detail),
+                since: Date()
+            )
+            return .held("地址或页面状态已变化，未自动重载；请核对原页")
+        }
+
+        setStatus(provider, "长时间无新内容，已只读重载同一会话一次；继续等待原生完成标记…")
+        return .reloaded
+    }
+
+    // MARK: Bounded pre-click send repair
+
+    private enum PreClickRepair {
+        /// Not a candidate, or the page/task changed: do nothing.
+        case none
+        /// The one reload happened; the caller may continue its normal loop.
+        case reloaded
+        /// The page showed something we must not disturb; a human decides.
+        case blocked
+    }
+
+    private enum ReloadWaitOutcome {
+        case ready
+        /// Pause, takeover, run change or a moved page: stop without blocking.
+        case stopped
+        /// The page never mounted a usable composer after the reload.
+        case timedOut
+    }
+
+    private struct PreClickComposerState {
+        var draftEmpty: Bool
+        var matchesExpectedPrompt: Bool
+        var stopActive: Bool
+
+        var safe: Bool {
+            ArenaModel.isPreClickComposerSafe(
+                draftEmpty: draftEmpty,
+                matchesExpectedPrompt: matchesExpectedPrompt,
+                stopActive: stopActive
+            )
+        }
+    }
+
+    /// A real-site Gemini composer can stay missing/hidden long enough to burn
+    /// a whole submit loop even though the same bound conversation sends at
+    /// once after a reopen (observed 2026-11-22, vote round, ~90 s). This
+    /// records one driver-confirmed pre-click refusal and, once per task, may
+    /// reload this seat's own pane. It never fills, clicks or submits.
+    private func repairPreClickSendIfNeeded(
+        provider: String,
+        taskID: String,
+        config: ArenaSiteConfig,
+        pane: SitePane,
+        token: UUID,
+        prompt: String,
+        detail: [String: Any]?
+    ) async -> PreClickRepair {
+        guard provider == "gemini" else { return .none }
+
+        let reason = detail?["reason"] as? String
+        // Only a consecutive run of missing/hidden refusals counts; any other
+        // pre-click answer (composer-changed, not-clickable, disabled) resets
+        // the streak instead of borrowing this repair.
+        guard (detail?["clickAttempted"] as? Bool) == false,
+              (detail?["phase"] as? String) == "pre-click",
+              reason == "missing" || reason == "hidden" else {
+            preClickStalls[taskID] = nil
+            return .none
+        }
+
+        let now = Date()
+        var stall = preClickStalls[taskID] ?? PreClickStall(since: now, refusals: 0)
+        stall.refusals += 1
+        preClickStalls[taskID] = stall
+        let elapsed = now.timeIntervalSince(stall.since)
+        guard Self.isPreClickReloadCandidate(
+            provider: provider,
+            phase: intents[taskID]?.phase,
+            reportedPhase: detail?["phase"] as? String,
+            clickAttempted: detail?["clickAttempted"] as? Bool,
+            reason: reason,
+            alreadyReloaded: preClickReloadedTasks.contains(taskID),
+            elapsed: elapsed,
+            refusals: stall.refusals
+        ) else { return .none }
+
+        // The user's control and this task's place must still hold.
+        guard token == runToken, !isReadOnly, !isPaused,
+              !manualProviders.contains(provider), isCurrentPending(taskID),
+              intents[taskID]?.phase == .prepared else { return .none }
+        // Only this seat's already bound, same canonical conversation may be
+        // reloaded. `conversationMismatch()` is nil while bound and in place.
+        guard pane.boundConversationURL != nil, pane.currentURL != nil,
+              pane.conversationMismatch() == nil else {
+            preClickStalls[taskID] = nil
+            return .none
+        }
+
+        // Read-only confirmation of the live composer. The probe carries the
+        // exact round prompt only as a comparison value and writes nothing.
+        guard let composer = await probePreClickComposer(
+            provider: provider,
+            taskID: taskID,
+            config: config,
+            pane: pane,
+            token: token,
+            prompt: prompt
+        ) else { return .none }
+        guard composer.safe else {
+            // A human draft or a live Stop: never reload over it.
+            blockedTasks.insert(taskID)
+            setStatus(provider, "原页有未发送草稿或生成控件；未重载、未发送，请核对原页")
+            return .blocked
+        }
+
+        // The probe awaited the page, so re-check the user's control right
+        // before navigating. A pause or takeover must win over the reload.
+        guard token == runToken, !isReadOnly, !isPaused,
+              !manualProviders.contains(provider), isCurrentPending(taskID) else {
+            return .none
+        }
+
+        // Mark this repair as used for this run before the page moves.
+        preClickReloadedTasks.insert(taskID)
+        guard pane.reloadBoundConversationForReadRecovery() else {
+            preClickReloadedTasks.remove(taskID)
+            preClickStalls[taskID] = nil
+            return .none
+        }
+        preClickStalls[taskID] = nil
+        setStatus(provider, "发送前检查长时间未通过，已只重载本席同一会话一次；未点击发送")
+
+        switch await waitForReloadedComposer(
+            provider: provider,
+            taskID: taskID,
+            config: config,
+            pane: pane,
+            token: token,
+            prompt: prompt
+        ) {
+        case .ready:
+            return .reloaded
+        case .stopped:
+            return .none
+        case .timedOut:
+            blockedTasks.insert(taskID)
+            setStatus(provider, "重载后原页仍未就绪；已停止自动发送，请核对原页")
+            return .blocked
+        }
+    }
+
+    /// The same bound pane must mount a usable composer again before the normal
+    /// submit loop may continue. Read-only: probes only, no fill and no click.
+    private func waitForReloadedComposer(
+        provider: String,
+        taskID: String,
+        config: ArenaSiteConfig,
+        pane: SitePane,
+        token: UUID,
+        prompt: String
+    ) async -> ReloadWaitOutcome {
+        let deadline = Date().addingTimeInterval(arenaPreClickReloadReadySeconds)
+        while Date() < deadline {
+            if Task.isCancelled { return .stopped }
+            guard token == runToken, !isReadOnly, !isPaused,
+                  !manualProviders.contains(provider), isCurrentPending(taskID) else {
+                return .stopped
+            }
+            if pane.conversationMismatch() != nil { return .stopped }
+            if let composer = await probePreClickComposer(
+                provider: provider,
+                taskID: taskID,
+                config: config,
+                pane: pane,
+                token: token,
+                prompt: prompt
+            ), composer.safe {
+                return .ready
+            }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+        return .timedOut
+    }
+
+    /// Read-only `probe` with the optional composer comparison. Returns nil for
+    /// any non-ready answer or transport error; the caller then leaves the page
+    /// untouched instead of guessing.
+    private func probePreClickComposer(
+        provider: String,
+        taskID: String,
+        config: ArenaSiteConfig,
+        pane: SitePane,
+        token: UUID,
+        prompt: String
+    ) async -> PreClickComposerState? {
+        var message = engine.driverMessage(
+            kind: "probe",
+            taskID: taskID,
+            prompt: nil,
+            config: config
+        )
+        message["expectedPrompt"] = prompt
+        do {
+            let response = try await pane.command(message)
+            guard callbackIsCurrent(token: token, taskID: taskID, provider: provider) else {
+                return nil
+            }
+            guard response.arenaString("status") == "ready" else { return nil }
+            let detail = response["detail"] as? [String: Any]
+            let composer = detail?["composer"] as? [String: Any]
+            let stop = detail?["stop"] as? [String: Any]
+            return PreClickComposerState(
+                draftEmpty: composer?.arenaBool("draftEmpty") == true,
+                matchesExpectedPrompt: composer?.arenaBool("matchesExpectedPrompt") == true,
+                stopActive: stop?.arenaBool("active") == true
+            )
+        } catch {
+            return nil
+        }
+    }
+
     // MARK: Deliver
 
     private func deliver(provider: String, task: [String: Any], text: String) {
@@ -1120,6 +1723,9 @@ final class ArenaModel: ObservableObject {
         }
         guard let session, !isReadOnly else { return }
         guard let taskID = task.arenaString("id"), isCurrentPending(taskID) else { return }
+        readRecoveryStalls[taskID] = nil
+        preClickStalls[taskID] = nil
+        preClickReloadedTasks.remove(taskID)
 
         var payload: [String: Any] = [
             "taskId": taskID,
@@ -1172,6 +1778,8 @@ final class ArenaModel: ObservableObject {
         dispatcher = nil
         for (_, task) in workers { task.cancel() }
         workers.removeAll()
+        preClickStalls.removeAll()
+        preClickReloadedTasks.removeAll()
     }
 
     private func waitWhilePaused(_ token: UUID) async -> Bool {
@@ -1199,6 +1807,26 @@ final class ArenaModel: ObservableObject {
         guard isCurrentPending(taskID) else { return false }
         guard !manualProviders.contains(provider) else { return false }
         return true
+    }
+
+    /// Say precisely where a pre-click attempt stopped. The driver fills the
+    /// composer before it waits for the send control, so `which == "send"`
+    /// means the round's prompt is already in the page: call that what it is
+    /// instead of leaving a generic "sending" status on screen.
+    private static func preClickStatus(_ detail: [String: Any]?) -> String {
+        let which = detail?["which"] as? String
+        let reason = detail?["reason"] as? String
+        if which == "send" {
+            switch reason {
+            case "disabled": return "已填入，发送按钮暂不可用…"
+            case "hidden", "missing": return "已填入，等待发送按钮…"
+            default: return "已填入，等待发送按钮…"
+            }
+        }
+        if which == "composer" || reason == "composer-changed" {
+            return "原页改动了输入内容，等待重新填入…"
+        }
+        return "已填入，等待发送控件…"
     }
 
     /// The pre-click states a normal start may retry while a real site's
@@ -1265,18 +1893,26 @@ final class ArenaModel: ObservableObject {
                 return .stopped
             }
             do {
+                // Only a persisted intent that may already have clicked may
+                // supply the exact original prompt. The driver still needs a
+                // stable conversation binding and a verbatim latest turn.
+                let recoveryPrompt = ArenaEngine.readRecoveryPrompt(
+                    phase: intents[taskID]?.phase,
+                    prompt: intents[taskID]?.prompt
+                )
                 let response = try await pane.command(
                     engine.driverMessage(
                         kind: "read",
                         taskID: taskID,
                         prompt: nil,
+                        verifiedReadPrompt: recoveryPrompt,
                         config: config
                     )
                 )
                 guard callbackIsCurrent(token: token, taskID: taskID, provider: provider) else {
                     return .stopped
                 }
-                pane.bindVerifiedConversation(from: response)
+                persistVerifiedBinding(pane, from: response, taskID: taskID)
                 let status = response.arenaString("status") ?? ""
                 let code = response.arenaString("error") ?? ""
                 switch status {
@@ -1285,8 +1921,12 @@ final class ArenaModel: ObservableObject {
                         .trimmingCharacters(in: .whitespacesAndNewlines)
                     return text.isEmpty ? .unconfirmed("原页回答为空") : .answered(text)
                 case "pending":
-                    // The driver only knows a task after a submit started.
-                    return .generating
+                    if (response["detail"] as? [String: Any])?.arenaBool("userTurnVerified") == true {
+                        return .generating
+                    }
+                    if Date() >= deadline { return .unconfirmed("原页尚未出现本轮完整提问") }
+                    try? await Task.sleep(nanoseconds: 1_200_000_000)
+                    continue
                 case "unknown":
                     return .unconfirmed(Self.friendly(errorCode: code.isEmpty ? "unknown" : code))
                 default:
@@ -1465,9 +2105,20 @@ final class ArenaModel: ObservableObject {
         (try? engine.config(for: provider))?.label ?? provider
     }
 
+    private func persistVerifiedBinding(_ pane: SitePane, from response: [String: Any], taskID: String) {
+        let prior = pane.boundConversationURL
+        guard pane.bindVerifiedConversation(from: response),
+              let current = pane.boundConversationURL, current != prior else { return }
+        intents[taskID]?.pageURL = current.absoluteString
+        persist()
+    }
+
     private func setStatus(_ provider: String, _ text: String) {
         if statuses[provider] != text {
             statuses[provider] = text
+            if ProcessInfo.processInfo.environment["ARENA_TRACE_STATUS"] == "1" {
+                FileHandle.standardError.write(Data("[Arena] \(stageKey) \(provider) \(text)\n".utf8))
+            }
         }
     }
 
@@ -1612,19 +2263,46 @@ final class ArenaModel: ObservableObject {
               let saved = Self.decodeSession(file.sessionJSON) else {
             return
         }
+
+        // `file.manualProviders` is the durable record of seats the user really
+        // took over by hand; a normal startup widens that set for safety below
+        // but never writes it back without a new user action.
+        let savedPaused = saved.arenaBool("paused") ?? false
+        let savedTakenOver = Set(file.manualProviders)
+        let savedStage = saved.arenaString("stage") ?? ""
+        let requested = explicitContinueID
+        let idMatches = requested != nil && requested == id
+        let canContinue = idMatches && !savedPaused && savedTakenOver.isEmpty && savedStage != "done"
+
         session = saved
         currentID = file.id
         question = file.question
         createdAt = file.createdAt
         intents = Dictionary(uniqueKeysWithValues: file.intents.map { ($0.taskId, $0) })
-        manualProviders = Set(saved.arenaStringArray("providers"))
         blockedTasks.removeAll()
         previews.removeAll()
         isReadOnly = false
         isRecovering = true
-        isPaused = saved.arenaBool("paused") ?? false
+        isPaused = savedPaused
         statuses.removeAll()
+        didContinueSavedDiscussion = canContinue
+        refreshStage()
 
+        if canContinue {
+            // Explicit continuation keeps only the seats that were genuinely
+            // taken over (none passed the check above), so the saved delivery
+            // intents and task ownership remain exactly as they were.
+            manualProviders = []
+            for provider in saved.arenaStringArray("providers") {
+                setStatus(provider, continueStatus(for: provider))
+            }
+            recoveryNotice = "已按指定场次继续讨论。已收齐的席位不重发；尚未发送的席位自动派发；可能已发送的席位只做只读核对。"
+            return
+        }
+
+        // Conservative restart: every seat waits for a human. This is the
+        // behaviour a plain relaunch keeps.
+        manualProviders = Set(saved.arenaStringArray("providers"))
         for provider in saved.arenaStringArray("providers") {
             if let pending = pendingTask(for: provider) {
                 if let phase = intents[pending.arenaString("id") ?? ""]?.phase,
@@ -1633,14 +2311,52 @@ final class ArenaModel: ObservableObject {
                 } else {
                     setStatus(provider, "已恢复：请核对原页（不会重发）")
                 }
-            } else if saved.arenaString("stage") == "done" {
+            } else if savedStage == "done" {
                 setStatus(provider, finalStatus(for: provider))
             } else {
                 setStatus(provider, "本轮已完成")
             }
         }
-        recoveryNotice = "已恢复上次讨论。为避免重复发送，本场改为人工核对：可打开原页核对后粘贴回答，或跳过；新建讨论才会恢复自动派发。"
-        refreshStage()
+
+        if let requested, requested != id {
+            recoveryNotice = "指定的场次 \(requested) 与当前场次 \(id) 不一致，未自动恢复；已按人工核对方式打开当前场次。"
+        } else if requested != nil && savedPaused {
+            recoveryNotice = "当前场次处于暂停状态，未自动恢复；请先核对原页，再手动继续。"
+        } else if requested != nil && !savedTakenOver.isEmpty {
+            recoveryNotice = "当前场次有席位处于手工接管，未自动恢复；请核对接管席位后手动继续。"
+        } else if requested != nil && savedStage == "done" {
+            recoveryNotice = "当前场次已经结束，没有需要继续的轮次。"
+        } else {
+            recoveryNotice = "已恢复上次讨论。为避免重复发送，本场改为人工核对：可打开原页核对后粘贴回答，或跳过；新建讨论才会恢复自动派发。"
+        }
+    }
+
+    /// The resting status of one seat in a verified explicit continuation.
+    /// It distinguishes the three persisted intent states so a seat that never
+    /// sent is described as ready to dispatch, not as "sending".
+    private func continueStatus(for provider: String) -> String {
+        guard let pending = pendingTask(for: provider),
+              let taskID = pending.arenaString("id") else {
+            return stageKey == "done" ? finalStatus(for: provider) : "本轮已完成"
+        }
+        switch intents[taskID]?.phase {
+        case .submitted:
+            return "已恢复：此前已发送，只读继续读取回答…"
+        case .inflight, .uncertain:
+            return "已恢复：可能已发送，只读核对原页（不会重发）…"
+        case .prepared, .none:
+            return "已恢复：本轮尚未发送，准备自动派发…"
+        }
+    }
+
+    /// Read-only diagnostic used by the isolated acceptance runner: the
+    /// persisted delivery phase of that seat's current pending task, if any.
+    func deliveryPhase(for provider: String) -> String? {
+        guard let pending = pendingTask(for: provider),
+              let taskID = pending.arenaString("id") else {
+            return nil
+        }
+        return intents[taskID]?.phase.rawValue
     }
 
     private func refreshHistoryCache() {
@@ -1686,6 +2402,8 @@ final class ArenaModel: ObservableObject {
         case "prompt-already-sent": return "原页已有本轮提问，不再重发"
         case "submit-unconfirmed": return "可能已发送，只能人工核对"
         case "user-turn-mismatch": return "未核对到本轮提问"
+        case "task-prompt-mismatch": return "原页记录与持久化原文不一致"
+        case "recovery-timeout": return "只读核对超时，原页仍未挂载本轮消息"
         case "send-pending": return "发送控件暂未就绪"
         case "send-unavailable": return "发送控件不可用"
         case "fill-failed", "fill-mismatch": return "填写未通过核对"

@@ -26,6 +26,7 @@
  *     },
  *     options: { sampleMs: 250, stableSamples: 3, stableMs: 600, requireDoneMarker: false },
  *     scope: { origin: 'http://localhost:3000', hrefPrefix: 'http://localhost:3000/' },
+ *     verifiedReadPrompt: '同一 taskId 持久化过的发送原文（仅 read，可选）',
  *   }, { frameId: 0 });
  *
  * 每个 selector 既可以是字符串，也可以是有序候选数组（先命中的一组生效）。
@@ -47,7 +48,9 @@
  *   detail : 诊断信息（基线计数、拒绝原因、稳定采样结果等），可直接记日志
  *
  * 硬性行为：
- *   1. read 绝不填写、绝不点击、绝不改页面（无提交副作用）。
+ *   1. read 绝不填写、绝不点击发送、绝不改提交内容。唯一允许的页面动作是点开
+ *      当前用户消息自身的原生“显示更多/Show more”，以便读到本轮全文；点开后
+ *      仍必须逐字等价比对，前缀永远不算送达。
  *   2. submit 前记录基线；只接受“提交后新出现、且文本等于本轮 prompt”的用户消息，
  *      再取其后新出现、且不等于基线旧文本的回答消息。
  *   3. 已有非空且与本轮 prompt 不同的草稿：拒绝（draft-conflict），绝不覆盖。
@@ -83,6 +86,24 @@
  *      等于基线后缀（且确实少了一个）时才核对成功（detail.historyTrimmed）；
  *      回答仍必须排在本轮用户节点之后并排除基线里的全部旧回答文本。
  *      没有可识别旧节点、后缀不匹配或同题多份时保持原判定。其它站点不变。
+ *      ChatGPT 前端会先跳到临时路由 /c/local-chatgpt:<uuid>（也可能百分号
+ *      编码），再换成稳定 /c/<id>。临时路由不是会话地址：既不能作为
+ *      scope.href 的恢复目的地，也不能用于窗口裁切恢复。同源换址仍可
+ *      只读经过它，但每换一次地址都必须重新核对唯一本轮用户消息。
+ *
+ *   8. 只读重建（跨重开/换进程）：页面重载后驱动没有记录时，read 可以带
+ *      `verifiedReadPrompt`（原生只在确实持久化过发送意图时才携带）。仅当
+ *      scope.href 是一个可信的同站稳定会话地址（非首页、非临时路由；
+ *      ChatGPT /c/<id>、DeepSeek /a/chat/s/<id>、Gemini /app/<id>）且当前页
+ *      就是它时，才用原文重建一条只读记录：最新用户节点必须唯一、规范化后
+ *      与原文全等，回答与完成/生成标记都必须严格排在它之后，再走同一套
+ *      稳定采样。重建不会进入发送路径：没有 attempted，后续 submit 只会
+ *      返回既有状态。消息暂时没挂载或被窗口裁切时只读重试到 pendingTimeoutMs，
+ *      超时返回 unknown/recovery-timeout，由人接管。原文对不上返回
+ *      error/task-prompt-mismatch；没有稳定绑定返回 unknown/task-unknown。
+ *      已有记录上遇到 user-turn-mismatch / history-changed 且携带原文一致时，
+ *      同样在期限内保持 pending（detail.reason=read-recovery-pending），
+ *      不因一次没找到就永久停下。
  *
  * 错误码（status:error 时 error 字段）：
  *   bad-message, foreign-sender, not-authorized-page, document-not-ready,
@@ -91,7 +112,7 @@
  *   prompt-too-long, prompt-already-sent, task-id-conflict, selector-changed,
  *   input-uneditable, input-disabled, input-readonly, draft-conflict, busy,
  *   fill-failed, fill-mismatch, send-pending, send-unavailable,
- *   submit-unconfirmed, user-turn-mismatch, internal
+ *   submit-unconfirmed, user-turn-mismatch, task-prompt-mismatch, internal
  *
  * send-pending（点击前，安全重试）：
  *   detail = { which:'send'|'composer', phase:'pre-click',
@@ -103,12 +124,14 @@
  *   detail = { possiblySubmitted:true, clickAttempted:true, ... }
  *
  * 未知任务（status:unknown 时 error 字段）：
- *   task-unknown（页面重载/丢状态）, page-changed, history-changed
+ *   task-unknown（页面重载/丢状态）, page-changed, history-changed,
+ *   recovery-timeout（只读重建在期限内仍未挂载）
  *
  * pending 的 detail.reason：
  *   awaiting-user-turn, generating, awaiting-answer, answer-equal-old,
  *   answer-empty, answer-before-user-turn, answer-order-unverified,
- *   answer-updating, answer-disappeared, completion-signal-missing
+ *   answer-updating, answer-disappeared, completion-signal-missing,
+ *   read-recovery-pending（只读重建暂缺，detail.transientCode 说明原因）
  */
 
 (function () {
@@ -141,6 +164,8 @@
   const CHATGPT_CONVERSATION_RE = /^\/c\/[A-Za-z0-9][A-Za-z0-9-]{5,}$/;
   const DEEPSEEK_ORIGIN = 'https://chat.deepseek.com';
   const DEEPSEEK_CONVERSATION_RE = /^\/a\/chat\/s\/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+  const GEMINI_ORIGIN = 'https://gemini.google.com';
+  const GEMINI_CONVERSATION_RE = /^\/app\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
   const REQUIRED_SELECTOR_KEYS = ['input', 'send', 'user', 'answer'];
   const DEFAULT_OPTIONS = Object.freeze({
     sampleMs: 250,
@@ -293,6 +318,27 @@
   }
 
   /**
+   * ChatGPT 前端在落稳之前会先给出 `/c/local-chatgpt:<uuid>` 这类临时路由
+   * （路径里的冒号也可能是百分号编码，甚至被双重编码）。它不是可保存的
+   * 会话地址，也不是恢复目的地。这里按解码后的路径判断，宁可多拒绝。
+   */
+  function isTemporaryChatGPTConversationPath(pathname) {
+    if (typeof pathname !== 'string' || !pathname) return false;
+    let decoded = pathname;
+    for (let index = 0; index < 2; index += 1) {
+      let next;
+      try {
+        next = decodeURIComponent(decoded);
+      } catch (e) {
+        break;
+      }
+      if (next === decoded) break;
+      decoded = next;
+    }
+    return decoded.toLowerCase().indexOf('local-chatgpt') !== -1;
+  }
+
+  /**
    * 已登记的对话地址：ChatGPT（`/c/<id>`）与 DeepSeek（`/a/chat/s/<id>`），
    * 都要求无查询串与片段。只有这种“发前就已存在”的对话地址才允许窗口裁切
    * 恢复；两边的新建会话首页和任何其它站点都不适用。
@@ -303,7 +349,10 @@
       const url = new URL(value);
       if (url.protocol !== 'https:') return false;
       if (url.search || url.hash) return false;
-      if (url.origin === CHATGPT_ORIGIN) return CHATGPT_CONVERSATION_RE.test(url.pathname);
+      if (url.origin === CHATGPT_ORIGIN) {
+        if (isTemporaryChatGPTConversationPath(url.pathname)) return false;
+        return CHATGPT_CONVERSATION_RE.test(url.pathname);
+      }
       if (url.origin === DEEPSEEK_ORIGIN) return DEEPSEEK_CONVERSATION_RE.test(url.pathname);
       return false;
     } catch (e) {
@@ -317,29 +366,73 @@
     return node.textContent || '';
   }
 
+  const EXPAND_CONTROL_LABEL = /^(显示更多|展开全文|展开|收起|Show more|Show less|Read more|Read less)$/i;
+
+  /** The one visible native expander inside a user message, if exactly one. */
+  function expandControlOf(node) {
+    const controls = Array.from(node.querySelectorAll('button,[role="button"]')).filter(
+      (control) => isVisible(control) && EXPAND_CONTROL_LABEL.test(collapse(control.textContent)),
+    );
+    return controls.length === 1 ? controls[0] : null;
+  }
+
+  /**
+   * Remove only the trailing UI-only expander marker the page rendered around a
+   * long user message. Two different real renderings exist:
+   *
+   *   full text … Show more   -> the DOM already holds the whole round;
+   *   prefix    … Show more   -> only a prefix is rendered.
+   *
+   * The marker is removed when either the remaining text is *exactly* the
+   * expected round (proof of the full message), or the removed suffix carries
+   * a real ellipsis (a genuine prefix; never accepted as the full round).
+   * A bare trailing label without an ellipsis is only removed when it leaves
+   * the exact expected text, so a message genuinely ending in those words is
+   * kept intact.
+   */
+  function stripExpandMarker(text, label, expected) {
+    const value = String(text == null ? '' : text);
+    if (!label) return value;
+    const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const withEllipsis = new RegExp('(?:…|⋯|\\.{3})\\s*' + escaped + '\\s*$', 'i');
+    const trimmed = value.replace(withEllipsis, '');
+    if (trimmed !== value) return trimmed;
+    const plain = new RegExp('\\s*' + escaped + '\\s*$', 'i');
+    const withoutLabel = value.replace(plain, '');
+    if (withoutLabel !== value && expected && collapse(withoutLabel) === collapse(expected)) {
+      return withoutLabel;
+    }
+    return value;
+  }
+
+  /**
+   * User-message text as the page actually shows it. For ChatGPT's
+   * `data-content-search-unit-key="…:user"` node the visible `innerText` is the
+   * evidence (a clone's `textContent` can include hidden/duplicated content),
+   * so only the exact native expander suffix is stripped and everything else
+   * is compared verbatim.
+   */
   function userTextOf(node, expected = '') {
     if (node.localName === 'user-query') {
       const lines = Array.from(node.querySelectorAll('.query-text-line'));
       if (lines.length) return lines.map((line) => line.textContent.trim()).join('\n');
     }
     if (!node.matches('[data-content-search-unit-key$=":user"]')) return textOf(node);
-    const controls = Array.from(node.querySelectorAll('button')).filter(
-      (button) => isVisible(button) && /^(显示更多|收起|Show more|Show less)$/i.test(button.textContent.trim()),
-    );
-    if (controls.length !== 1) return node.textContent || '';
-    const control = controls[0];
-    const copy = node.cloneNode(true);
-    copy.querySelectorAll('button')[Array.from(node.querySelectorAll('button')).indexOf(control)].remove();
-    const text = copy.textContent || '';
-    if (/^(显示更多|Show more)$/i.test(control.textContent.trim())) {
-      const match = text.match(/^([\s\S]*?)(?:…|\.{3})\s*$/);
-      const prefix = match && collapse(match[1]);
-      if (prefix && prefix !== expected && expected.startsWith(prefix)) {
-        control.click();
-        return '';
-      }
+    const visible = textOf(node);
+    const control = expandControlOf(node);
+    if (!control) return visible;
+    const stripped = stripExpandMarker(visible, collapse(control.textContent), expected);
+    if (stripped === visible) return visible;
+    const shown = collapse(stripped);
+    const wanted = collapse(expected);
+    if (!wanted || shown === wanted) return stripped;
+    // A rendered prefix is still a prefix: expand this one native control and
+    // report no text for this sample. The next read compares the full message.
+    if (shown && wanted.startsWith(shown)) {
+      clickElement(control);
+      return '';
     }
-    return text;
+    return stripped;
   }
 
   function isElement(node) {
@@ -469,11 +562,20 @@
       scope.homeHref = raw.homeHref;
     }
     // 可选会话约束：已核验的对话地址。规范化后仍不合格就整条拒绝，
-    // 绝不解成“只比 origin”。
+    // 绝不解成“只比 origin”。ChatGPT 的临时路由（local-chatgpt:，含编码
+    // 形式）不是会话地址：即使旧调用方把它当 href 传来，也在这里失败关闭。
     if (raw.href !== undefined && raw.href !== null && raw.href !== '') {
       if (typeof raw.href !== 'string' || raw.href.length > 2000) return { error: 'href' };
       const canonical = canonicalHref(raw.href);
       if (!canonical) return { error: 'href' };
+      try {
+        const parsed = new URL(canonical);
+        if (parsed.origin === CHATGPT_ORIGIN && isTemporaryChatGPTConversationPath(parsed.pathname)) {
+          return { error: 'href-temporary' };
+        }
+      } catch (e) {
+        return { error: 'href' };
+      }
       scope.href = canonical;
     }
     if (raw.allowNavigation === true) scope.allowNavigation = true;
@@ -574,9 +676,26 @@
       }
       prompt = message.prompt;
     }
+    // 可选、只读：调用方点名要核对「输入框是否正好是本轮完整提示」时才解析。
+    // 缺省为 null，既有 probe 回执的形状与语义完全不变。
+    let expectedPrompt = null;
+    if (message.expectedPrompt !== undefined && message.expectedPrompt !== null) {
+      if (typeof message.expectedPrompt !== 'string') {
+        return { error: fail('bad-message', { field: 'expectedPrompt' }) };
+      }
+      if (
+        !collapse(message.expectedPrompt) ||
+        message.expectedPrompt.length > MAX_PROMPT_CHARS ||
+        message.expectedPrompt.indexOf('\u0000') !== -1
+      ) {
+        return { error: fail('bad-message', { field: 'expectedPrompt' }) };
+      }
+      expectedPrompt = message.expectedPrompt;
+    }
     return {
       taskId: message.taskId,
       prompt: prompt,
+      expectedPrompt: expectedPrompt,
       selectors: selectors.value,
       options: parseOptions(message.options),
       scope: scope.value,
@@ -1182,6 +1301,17 @@
     const answers = listNodes(req.selectors.answer, container);
     const draft = cleanText(composerText(composerRoot(input)));
     const record = state.records.get(req.taskId) || null;
+    const composer = {
+      kind: kind,
+      draftChars: draft.length,
+      draftEmpty: !collapse(draft),
+      enabled: elementEnabled(input),
+    };
+    // 只读比对：只有调用方带 expectedPrompt 时才多返回一个布尔值；它用与
+    // submit 相同的规范化 sameText，绝不写入输入框，也不授权点击。
+    if (req.expectedPrompt !== null) {
+      composer.matchesExpectedPrompt = sameText(draft, req.expectedPrompt);
+    }
 
     return reply('ready', {
       detail: {
@@ -1190,12 +1320,7 @@
         url: location.href,
         href: canonicalHref(location.href),
         frame: window.top === window ? 'top' : 'sub',
-        composer: {
-          kind: kind,
-          draftChars: draft.length,
-          draftEmpty: !collapse(draft),
-          enabled: elementEnabled(input),
-        },
+        composer: composer,
         send: { visible: isVisible(send), enabled: elementEnabled(send) },
         stop: { configured: Boolean(req.selectors.stop), present: stop.present, active: stop.active },
         done: { configured: Boolean(req.selectors.done), present: done.present, active: done.active },
@@ -1431,6 +1556,7 @@
       stableSince: null,
       completedText: null,
       completedAt: null,
+      completedHref: null,
     };
     remember(state, record);
 
@@ -1505,10 +1631,11 @@
    * 完成标记必须绑定到本轮用户消息之后：
    * - allowNavigation 的站点（同一会话里旧回答与新回答并存）一直如此；
    * - requireDoneMarker 的站点更严格：任何被当作完成证据的标记都必须排在本轮
-   *   用户消息之后，否则上一轮工具栏的闪现会让本轮提前结束。
+   *   用户消息之后，否则上一轮工具栏的闪现会让本轮提前结束；
+   * - 只读重建的任务没有提交基线可依赖，完成控件同样必须在本轮用户节点之后。
    */
   function doneAnchor(record, userNode) {
-    return record.allowNavigation || record.requireDoneMarker ? userNode : null;
+    return record.allowNavigation || record.requireDoneMarker || record.readOnlyRecovery ? userNode : null;
   }
 
   async function sampleAnswer(record, selectors, container, userNode, options, allNodes) {
@@ -1609,8 +1736,10 @@
   }
 
   async function evaluate(record, selectors, options, container) {
-    // 已完成的任务保持幂等；不因轮询重复判定。
-    if (record.completedText != null) {
+    // 已完成的任务保持幂等；但只对完成时所在的那个地址生效。同源换址
+    // （首页 → 临时路由 → 正式对话）之后必须在新页面上重新核对本轮用户
+    // 消息和对应回答，不能把上一地址的缓存正文直接当作本页结果。
+    if (record.completedText != null && record.completedHref === location.href) {
       return reply('done', {
         text: record.completedText,
         detail: {
@@ -1668,11 +1797,20 @@
     if (done.error) return done.error;
     if (done.active) record.sawDoneMarker = true;
 
+    const verifiedHref = location.href;
     const sampled = await sampleAnswer(record, selectors, container, located.turn.node, options, located.trimmed);
+    if (verifiedHref !== location.href) {
+      return unknown('page-changed', {reason: 'navigation-during-sampling'});
+    }
     if (sampled.error) return sampled.error;
+    if (!located.turn.node.isConnected ||
+        collapse(userTextOf(located.turn.node, record.promptCollapsed)) !== record.promptCollapsed) {
+      return unknown('history-changed', {reason: 'user-turn-changed-during-sampling'});
+    }
     if (sampled.done) {
       record.completedText = sampled.text;
       record.completedAt = Date.now();
+      record.completedHref = location.href;
       return reply('done', {
         text: sampled.text,
         detail: taskDetail(record, {
@@ -1742,7 +1880,7 @@
     record.verified = true;
     record.verifiedAt = Date.now();
     record.lastHref = href;
-    if (!record.contextHref) record.contextHref = href;
+    record.contextHref = href;
     record.navigation = {
       from: previousHref,
       to: href,
@@ -1759,6 +1897,195 @@
     };
   }
 
+  // ---------------------------------------------------------------------------
+  // read：同一已绑定会话上的只读重建与暂缺恢复（G1/G3）
+  // ---------------------------------------------------------------------------
+
+  /**
+   * 可信的稳定对话地址：与 desktop/SitePane.swift 的绑定白名单同规则，
+   * 只认三家已登记的会话路径，且排除临时路由（ChatGPT local-chatgpt:）。
+   * Gemini 的 `/app/<id>` 与 DeepSeek 的 `/a/chat/s/<id>` 同样适用。
+   */
+  function stableConversationHref(value) {
+    const canonical = canonicalHref(value);
+    if (!canonical) return null;
+    try {
+      const url = new URL(canonical);
+      if (url.protocol !== 'https:') return null;
+      if (url.search || url.hash) return null;
+      if (url.origin === CHATGPT_ORIGIN) {
+        if (isTemporaryChatGPTConversationPath(url.pathname)) return null;
+        return CHATGPT_CONVERSATION_RE.test(url.pathname) ? canonical : null;
+      }
+      if (url.origin === DEEPSEEK_ORIGIN) {
+        return DEEPSEEK_CONVERSATION_RE.test(url.pathname) ? canonical : null;
+      }
+      if (url.origin === GEMINI_ORIGIN) {
+        return GEMINI_CONVERSATION_RE.test(url.pathname) ? canonical : null;
+      }
+      return null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /**
+   * 只读重建的唯一入口：当前页必须就是本席传入的那个稳定会话地址
+   * （scope.href，已由原生按白名单核验），同源、非新建首页、非临时路由。
+   * 任何一个条件缺失都返回 null，调用方只能回到 task-unknown。
+   */
+  function stableReadBinding(req) {
+    const scope = req.scope;
+    if (!scope || !scope.href) return null;
+    const canonical = canonicalHref(location.href);
+    if (!canonical || canonical !== scope.href) return null;
+    try {
+      if (scope.origin && new URL(canonical).origin !== scope.origin) return null;
+    } catch (e) {
+      return null;
+    }
+    if (scope.homeHref) {
+      const home = canonicalHref(scope.homeHref);
+      if (home && home === canonical) return null;
+    }
+    return stableConversationHref(canonical);
+  }
+
+  /** `verifiedReadPrompt` 只允许出现在 read 上，且必须是完整的原文。 */
+  function readRecoveryPrompt(message) {
+    const raw = message.verifiedReadPrompt;
+    if (raw === undefined || raw === null || raw === '') return { value: null };
+    if (typeof raw !== 'string' || raw.length > MAX_PROMPT_CHARS) {
+      return { error: fail('bad-message', { field: 'verifiedReadPrompt' }) };
+    }
+    if (raw.indexOf('\u0000') !== -1 || !collapse(raw)) {
+      return { error: fail('bad-message', { field: 'verifiedReadPrompt', reason: 'empty' }) };
+    }
+    return { value: raw };
+  }
+
+  /**
+   * 页面重载/换进程后驱动不保留记录。只有原生确实持久化过发送意图、
+   * 仍然绑定同一稳定会话时，才允许用原文重建一个**只读**记录：
+   * attempted=false，之后的 submit 只会走既有记录的 evaluate，绝不会再点击。
+   */
+  function createReadOnlyRecoveryRecord(req, prompt) {
+    const now = Date.now();
+    return {
+      taskId: req.taskId,
+      prompt: prompt,
+      promptCollapsed: collapse(prompt),
+      selectorSignature: selectorSignature(req.selectors),
+      selectors: req.selectors,
+      baseline: {
+        userCount: 0,
+        answerCount: 0,
+        userTexts: [],
+        answerTexts: [],
+        href: location.href,
+        at: now,
+      },
+      href: location.href,
+      lastHref: location.href,
+      contextHref: location.href,
+      navigation: null,
+      navigationCount: 0,
+      allowNavigation: false,
+      requireDoneMarker: true,
+      startedAt: now,
+      attempted: false,
+      readOnlyRecovery: true,
+      recoverySince: now,
+      verified: false,
+      verifiedAt: null,
+      sawGenerating: false,
+      sawDoneMarker: false,
+      lastAnswerText: null,
+      stableSince: null,
+      completedText: null,
+      completedAt: null,
+      completedHref: null,
+    };
+  }
+
+  /**
+   * 用当前页面构造“提交基线”，好让既有 locateUserTurn/locateAnswer/evaluate
+   * 全部复用，而不另写一套采样：
+   *   - 最新用户节点必须唯一、与原文规范化后全等，并且就是最后一个用户节点；
+   *   - 它之前的全部用户/回答都进入基线，回答必须严格排在它之后。
+   * 任何一条不满足都只返回 pending（稍后只读重试），绝不猜、绝不点击。
+   */
+  function prepareRecoveryBaseline(record, selectors, container) {
+    const users = listNodes(selectors.user, container);
+    if (!users.length) return { pending: true };
+    const items = users.map((node, index) => {
+      const raw = userTextOf(node, record.promptCollapsed);
+      return {
+        node: node,
+        index: index,
+        collapsed: collapse(raw),
+        chrome: touchesSelector(node, selectors.input) || touchesSelector(node, selectors.send),
+      };
+    });
+    const matches = items.filter((item) => item.collapsed === record.promptCollapsed && !item.chrome);
+    if (!matches.length) return { pending: true };
+    if (matches.length > 1) return { pending: true, duplicate: matches.length };
+    const turn = matches[0];
+    if (turn.index !== items.length - 1) return { pending: true, notLast: true };
+    const answers = listNodes(selectors.answer, container);
+    const before = answers.filter((answer) => compareOrder(answer, turn.node) !== 'after');
+    record.baseline = {
+      userCount: turn.index,
+      answerCount: before.length,
+      userTexts: items.slice(0, turn.index).map((item) => item.collapsed),
+      answerTexts: before.map((answer) => collapse(textOf(answer))),
+      href: record.baseline.href,
+      at: Date.now(),
+    };
+    return { ok: true, index: turn.index };
+  }
+
+  /**
+   * 只读的“暂缺”状态：消息还没挂载、窗口裁切或 DOM 正在重排时，一次读不到
+   * 不代表任务失败。限定在 pendingTimeoutMs 内继续 pending，超时才报
+   * recovery-timeout 交人工。绝不填入、绝不点击、绝不重发。
+   */
+  function recoveryHold(record, options, extra) {
+    const now = Date.now();
+    if (!record.recoverySince) record.recoverySince = now;
+    const waited = now - record.recoverySince;
+    if (waited > options.pendingTimeoutMs) {
+      return unknown('recovery-timeout', Object.assign({
+        taskId: record.taskId,
+        waitedMs: waited,
+        url: location.href,
+      }, extra));
+    }
+    return reply('pending', {
+      detail: Object.assign({
+        taskId: record.taskId,
+        reason: 'read-recovery-pending',
+        userTurnVerified: false,
+        waitedMs: waited,
+        timedOut: false,
+        url: location.href,
+        href: canonicalHref(location.href),
+      }, extra),
+    });
+  }
+
+  /** 已有记录上的暂时失配（临时未挂载/裁切）也只读重试到期限。 */
+  function holdTransientMiss(record, options, result) {
+    const code = result && result.error;
+    const transient = (result.status === 'error' && code === 'user-turn-mismatch')
+      || (result.status === 'unknown' && code === 'history-changed');
+    if (!transient) return result;
+    return recoveryHold(record, options, {
+      transientCode: code,
+      cause: 'unmounted-or-clipped',
+    });
+  }
+
   async function read(state, message) {
     const req = parseCommon(message, false);
     if (req.error) return req.error;
@@ -1769,7 +2096,24 @@
     if (containerRes.error) return containerRes.error;
     const container = containerRes.value;
 
-    const record = state.records.get(req.taskId);
+    const recoveryPrompt = readRecoveryPrompt(message);
+    if (recoveryPrompt.error) return recoveryPrompt.error;
+    const expectedPrompt = recoveryPrompt.value;
+
+    let record = state.records.get(req.taskId);
+    if (!record && expectedPrompt) {
+      // 只有“原生确实持久化过发送意图 + 仍是同一稳定会话”才重建记录；
+      // 重建出来的记录只读，没有 attempted，后续 submit 也不会再点击。
+      if (!stableReadBinding(req)) {
+        return unknown('task-unknown', {
+          taskId: req.taskId,
+          url: location.href,
+          hint: '没有稳定的已绑定会话地址（非首页、非临时路由）可供只读重建；请打开原页人工核对。',
+        });
+      }
+      record = createReadOnlyRecoveryRecord(req, expectedPrompt);
+      remember(state, record);
+    }
     if (!record) {
       return unknown('task-unknown', {
         taskId: req.taskId,
@@ -1780,36 +2124,72 @@
     if (record.selectorSignature !== selectorSignature(req.selectors)) {
       return fail('selector-changed', { taskId: req.taskId });
     }
-    if (location.href !== record.baseline.href) {
+    const canHold = Boolean(expectedPrompt) && record.promptCollapsed === collapse(expectedPrompt);
+    if (expectedPrompt && !canHold) {
+      // 同一 taskId 的原文对不上：绝不把另一轮的用户消息认成本轮。
+      return fail('task-prompt-mismatch', { taskId: req.taskId });
+    }
+
+    if (record.readOnlyRecovery) {
+      // 每轮先用当前页面重建基线；消息暂时没挂载/被裁切时继续只读等待。
+      const prepared = prepareRecoveryBaseline(record, req.selectors, container);
+      if (!prepared.ok) {
+        return recoveryHold(record, req.options, {
+          duplicateUserTurns: prepared.duplicate,
+          turnNotLast: prepared.notLast,
+        });
+      }
+    }
+
+    const currentHref = location.href;
+    const trackedHref = record.lastHref || record.baseline.href;
+    if (currentHref !== record.baseline.href) {
       let sameOrigin = false;
       try {
-        sameOrigin = new URL(location.href).origin === new URL(record.baseline.href).origin;
+        sameOrigin = new URL(currentHref).origin === new URL(record.baseline.href).origin;
       } catch (e) {
         sameOrigin = false;
       }
       if (!record.allowNavigation || !sameOrigin) {
-        return unknown('page-changed', { expectedHref: record.baseline.href, actualHref: location.href });
+        return unknown('page-changed', { expectedHref: record.baseline.href, actualHref: currentHref });
       }
-      if (!record.verified) {
-        // 提交后页面自己换了同源地址（新建页 → 对话页）：只读核对，绝不重发。
+      if (currentHref !== trackedHref || !record.verified) {
+        // 提交后页面自己换了同源地址（首页 → 临时路由 → 正式对话）：每次换址
+        // 都只读重新核对唯一本轮用户消息，绝不重发。上一地址已核对过也不能
+        // 沿用：临时路由（ChatGPT local-chatgpt:）不能被当成本轮上下文。
         const recovery = await recoverSameOriginNavigation(record, req.selectors, container, req.options);
         if (recovery.error) return recovery.error;
         if (!recovery.verified) {
           return unknown('page-changed', {
             reason: 'spa-navigation-unverified',
             expectedHref: record.baseline.href,
-            actualHref: location.href,
+            actualHref: currentHref,
             waitedMs: recovery.waitedMs,
           });
         }
       }
-      record.lastHref = location.href;
+      record.lastHref = currentHref;
     }
 
     const overlap = detectOverlap(req.selectors, container);
     if (overlap) return fail('selector-overlap', { which: 'user/answer' });
 
-    return evaluate(record, req.selectors, req.options, container);
+    const result = await evaluate(record, req.selectors, req.options, container);
+    // A live renderer can evict the same nodes as a reloaded renderer. If
+    // this attempt still cannot locate the round, apply the same strict
+    // bound-conversation recovery without waiting for an app restart.
+    const reason = result.detail && result.detail.reason;
+    const lostWindow = result.error === 'history-changed' || result.error === 'user-turn-mismatch'
+      || (result.status === 'pending' && (result.detail?.userTurnVerified === false || reason === 'awaiting-answer'));
+    if (lostWindow && canHold && !record.readOnlyRecovery && stableReadBinding(req)
+        && !record.baseline.userTexts.includes(record.promptCollapsed)) {
+      const recovered = createReadOnlyRecoveryRecord(req, expectedPrompt);
+      if (prepareRecoveryBaseline(recovered, req.selectors, container).ok) {
+        remember(state, recovered);
+        return evaluate(recovered, req.selectors, req.options, container);
+      }
+    }
+    return canHold ? holdTransientMiss(record, req.options, result) : result;
   }
 
   // ---------------------------------------------------------------------------

@@ -72,6 +72,12 @@ struct ArenaDeliveryIntent: Codable, Equatable {
     var preparedAt: Double
     var submittedAt: Double?
     var pageURL: String?
+
+    /// `true` once this task spent its one bounded read-only reload. Optional
+    /// with a default so sessions saved before the field still decode; `nil`
+    /// means "not attempted yet". It lives on the intent because a restart must
+    /// not hand the same task a second reload it already used.
+    var reloadAttempted: Bool? = nil
 }
 
 // MARK: - Persisted session file
@@ -271,8 +277,10 @@ final class ArenaCore {
         do {
             try evaluate(
                 """
-                globalThis.__arenaCreate = function (question, providersJSON) {
-                  return JSON.stringify(createSession(question, JSON.parse(providersJSON)));
+                globalThis.__arenaCreate = function (question, providersJSON, maxRounds) {
+                  return JSON.stringify(
+                    createSession(question, JSON.parse(providersJSON), { maxRounds })
+                  );
                 };
                 globalThis.__arenaApply = function (sessionJSON, action, payloadJSON) {
                   return JSON.stringify(
@@ -286,11 +294,15 @@ final class ArenaCore {
         }
     }
 
-    func createSession(question: String, providers: [String]) throws -> [String: Any] {
+    func createSession(
+        question: String,
+        providers: [String],
+        maxRounds: Int
+    ) throws -> [String: Any] {
         let providersJSON = try Self.jsonString(providers)
         return try callBridge(
             "__arenaCreate",
-            arguments: [question, providersJSON],
+            arguments: [question, providersJSON, maxRounds],
             label: "createSession"
         )
     }
@@ -439,8 +451,16 @@ final class ArenaEngine {
         return known + extras
     }
 
-    func createSession(question: String, providers: [String]) throws -> [String: Any] {
-        try loadedCore().createSession(question: question, providers: providers)
+    func createSession(
+        question: String,
+        providers: [String],
+        maxRounds: Int
+    ) throws -> [String: Any] {
+        try loadedCore().createSession(
+            question: question,
+            providers: providers,
+            maxRounds: maxRounds
+        )
     }
 
     func apply(
@@ -458,6 +478,7 @@ final class ArenaEngine {
         kind: String,
         taskID: String,
         prompt: String?,
+        verifiedReadPrompt: String? = nil,
         config: ArenaSiteConfig
     ) -> [String: Any] {
         var message: [String: Any] = [
@@ -474,7 +495,31 @@ final class ArenaEngine {
         if let prompt {
             message["prompt"] = prompt
         }
+        if kind == "read", let verifiedReadPrompt {
+            message["verifiedReadPrompt"] = verifiedReadPrompt
+        }
         return message
+    }
+
+    /// The exact original prompt a `read` may carry for a read-only rebuild.
+    ///
+    /// Only a click that may already have reached the page (`inflight`,
+    /// `uncertain`, or `submitted`) can authorise this. A `prepared` intent was
+    /// recorded *before* the submit command was issued, so it must never turn a
+    /// read into an "already sent" claim; a missing intent has no evidence at
+    /// all. The web-driver still requires a stable conversation binding, an
+    /// exact full-text match, an answer strictly after that turn, and a live
+    /// completion signal before reporting anything as done.
+    nonisolated static func readRecoveryPrompt(
+        phase: ArenaDeliveryIntent.Phase?,
+        prompt: String?
+    ) -> String? {
+        guard let phase, phase != .prepared else { return nil }
+        guard let prompt else { return nil }
+        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, prompt.count <= 100_000,
+              !prompt.unicodeScalars.contains("\u{0}") else { return nil }
+        return prompt
     }
 
     // MARK: Site loading

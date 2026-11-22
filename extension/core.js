@@ -30,8 +30,13 @@
  *
  * Stages:
  *   independent -> critique -> proposal -> vote -> done
- * A vote with explicit opposition runs one targeted critique round
- * (round 2, the maximum of two critique rounds) and then stops.
+ * A vote that does not settle the discussion runs one more targeted critique
+ * round, a revised candidate and a fresh vote on that candidate version.
+ * The budget is `maxRounds` (1-5, default 2). The default keeps the original
+ * behaviour: explicit opposition gets one follow-up round and conditional
+ * agreement stops immediately. A new desktop session states a budget
+ * explicitly and also follows unresolved conditions. At the limit the session
+ * stops with the remaining opposition or conditions reported verbatim.
  *
  * Frozen material is embedded verbatim: a long answer is never shortened in
  * the middle, so a unique objection in the middle of a peer answer still
@@ -60,6 +65,14 @@ const PROVIDER_ID_RE = /^[a-z0-9]+(?:[-_][a-z0-9]+)*$/;
  */
 export const MIN_SEATS = 2;
 export const MAX_SEATS = 3;
+
+// Total discussion rounds, including the first independent/critique/proposal/
+// vote round. Two is the original, extension-compatible budget: one targeted
+// follow-up for explicit opposition only. A desktop session may request up to
+// five and then also follows unresolved conditions.
+export const MIN_ROUNDS = 1;
+export const MAX_ROUNDS = 5;
+export const DEFAULT_MAX_ROUNDS = 2;
 
 // A manually relayed answer may be corrected only inside the round it belongs
 // to, and only while another seat in that same round is still pending. Once
@@ -95,12 +108,67 @@ const STANCE_LABELS = {
   oppose: '反对',
 };
 
+function normalizeMaxRounds(options) {
+  const raw =
+    typeof options === 'number'
+      ? options
+      : options && typeof options === 'object' && !Array.isArray(options)
+        ? options.maxRounds
+        : undefined;
+  if (raw === undefined || raw === null) return DEFAULT_MAX_ROUNDS;
+  if (
+    !Number.isInteger(raw) ||
+    raw < MIN_ROUNDS ||
+    raw > MAX_ROUNDS
+  ) {
+    throw new Error(
+      `maxRounds must be an integer between ${MIN_ROUNDS} and ${MAX_ROUNDS}`,
+    );
+  }
+  return raw;
+}
+
+/**
+ * A caller that names a round budget is an explicit new-session choice (the
+ * desktop workbench). Such a session follows unresolved conditions while
+ * rounds remain. The extension and every session saved before this option
+ * existed keep the original conditional-stop behaviour.
+ */
+function hasExplicitRoundBudget(options) {
+  return (
+    typeof options === 'number' ||
+    Boolean(
+      options &&
+        typeof options === 'object' &&
+        options.maxRounds !== undefined &&
+        options.maxRounds !== null,
+    )
+  );
+}
+
+function sessionMaxRounds(session) {
+  const raw = Number(session?.maxRounds);
+  if (
+    Number.isInteger(raw) &&
+    raw >= MIN_ROUNDS &&
+    raw <= MAX_ROUNDS
+  ) {
+    return raw;
+  }
+  // Sessions saved before the round budget existed had exactly two rounds.
+  return DEFAULT_MAX_ROUNDS;
+}
+
 /**
  * Create the initial, independent-answer stage for two or three distinct
  * canonical lowercase provider ids. The same opening prompt goes to every
  * seat; nothing here assumes exactly two participants.
+ *
+ * `options` may be a number or `{ maxRounds }`. Omitting it keeps the original
+ * two-round budget, so the extension's call site and every saved session keep
+ * working unchanged.
  */
-export function createSession(question, providers) {
+export function createSession(question, providers, options) {
   if (typeof question !== 'string' || question.trim().length === 0) {
     throw new Error('question must be a non-empty string');
   }
@@ -135,6 +203,8 @@ export function createSession(question, providers) {
     providers: providers.slice(),
     stage: 'independent',
     round: 1,
+    maxRounds: normalizeMaxRounds(options),
+    followConditions: hasExplicitRoundBudget(options),
     paused: false,
     tasks: [],
     history: [],
@@ -688,13 +758,28 @@ function advanceFromVote(session) {
       task.proposalDigest === digest,
   );
   const anyOppose = votes.some((task) => task.stance === 'oppose');
+  const anyConditional = votes.some(
+    (task) => task.stance === 'conditional',
+  );
   const allProvidersVoted = session.providers.every((provider) =>
     votes.some((task) => task.provider === provider),
   );
+  const maxRounds = sessionMaxRounds(session);
 
-  // One targeted critique round for explicit, unresolved opposition.
-  if (anyOppose && session.round < 2) {
-    const opposition = votes.filter((task) => task.stance === 'oppose');
+  // A targeted follow-up is due for explicit opposition in every budget. A
+  // conditional vote is only followed by a session that was explicitly given
+  // a round budget (a new desktop session) and where every seat has voted;
+  // older sessions and the extension keep the conditional-stop behaviour.
+  const conditionalFollowUp =
+    session.followConditions === true && allProvidersVoted && anyConditional;
+  const needsFollowUp = anyOppose || conditionalFollowUp;
+
+  if (needsFollowUp && session.round < maxRounds) {
+    const concerns = votes.filter(
+      (task) =>
+        task.stance === 'oppose' ||
+        (task.stance === 'conditional' && session.followConditions === true),
+    );
     session.round += 1;
     session.stage = 'critique';
     for (const provider of session.providers) {
@@ -708,7 +793,7 @@ function advanceFromVote(session) {
             session.question,
             provider,
             proposal,
-            opposition,
+            concerns,
           ),
         ),
       );
@@ -1084,40 +1169,60 @@ function votePrompt(session, provider, proposal) {
   return PUBLIC_AUTOMATION_PROVIDER_IDS.includes(provider) ? prompt + PUBLIC_WEB_VOTE_FORMAT : prompt;
 }
 
-function targetedCritiquePrompt(question, provider, proposal, opposition) {
-  const ownOpposition = opposition.find((task) => task.provider === provider);
+function targetedCritiquePrompt(question, provider, proposal, concerns) {
+  const ownConcern = concerns.find((task) => task.provider === provider);
+  const blocks =
+    concerns.length > 0
+      ? concerns.map(concernBlock).join('\n\n')
+      : '没有记录到未解决的反对或附加条件。';
+
   const lines = [
     '【原始问题】',
     question,
     '',
-    `你是席位「${provider}」。上一轮表决出现了明确反对，本轮是定向质询，只处理这个分歧。`,
+    `你是席位「${provider}」。上一轮表决没有形成全体同意；本轮是定向质询，只处理未解决的分歧与条件（明确反对或有条件同意）。`,
     '',
     '【当前候选结论】',
     proposal ? sourceBlock(proposal) : '没有可用的候选结论。',
     '',
-    '【未解决的明确反对】',
-    opposition.length > 0
-      ? opposition.map(sourceBlock).join('\n\n')
-      : '没有记录到明确反对。',
+    '【未解决的分歧与条件（原文）】',
+    blocks,
   ];
 
-  if (ownOpposition) {
-    lines.push('', '你上一轮明确选择了反对。请重新检验自己的反对理由，也明确说明什么证据会改变它。');
+  if (ownConcern) {
+    if (ownConcern.stance === 'oppose') {
+      lines.push(
+        '',
+        '你上一轮明确选择了反对。请重新检验自己的反对理由，也明确说明什么证据会改变它。',
+      );
+    } else {
+      lines.push(
+        '',
+        '你上一轮选择了有条件同意，并写明了条件。请重新检验该条件是否已被当前候选满足，也明确说明什么证据会让它变成无条件同意或明确反对。',
+      );
+    }
   }
 
   lines.push(
     '',
     '请完成：',
-    '1. 复述反对意见的核心命题；',
-    '2. 用材料中的证据判断它是否成立，并直接回应这个反例；',
-    '3. 明确说明你的主张是否改变，以及改变所需的新事实；',
-    '4. 如果仍无法解决，保留分歧并说明原因；',
+    '1. 逐条复述反对意见或附加条件的核心命题；',
+    '2. 用材料中的证据判断每条是否成立，并直接回应；',
+    '3. 明确说明你的主张或条件是否改变，以及改变所需的新事实；',
+    '4. 如果仍无法解决，保留该反对或条件并说明原因；',
     '5. 引用材料时保留来源编号（如 S1、S2）。',
     '',
-    '不要声称已经达成共识；只有每位席位对同一版本明确同意才算共识。',
+    '不要声称已经达成共识；也不要把“有条件同意”当作“反对”，或把未解决的条件当作已接受。只有每位席位对同一版本明确同意且没有附加条件才构成全体一致。',
   );
 
   return lines.join('\n');
+}
+
+function concernBlock(task) {
+  return [
+    `[${task.sourceId ?? 'S?'} · ${task.provider} · 表决 · 第${task.round}轮 · ${STANCE_LABELS[task.stance] ?? task.stance}]`,
+    String(task.answer ?? ''),
+  ].join('\n');
 }
 
 function sourceBlock(task) {
@@ -1231,6 +1336,8 @@ function buildReport(session, reason) {
   const lines = ['# AI Arena 讨论结论', ''];
   lines.push('## 状态', '');
   lines.push(`- ${statusLabel(reason)}`);
+  const maxRounds = sessionMaxRounds(session);
+  lines.push(`- 讨论轮次：第 ${session.round} 轮 / 上限 ${maxRounds} 轮`);
   lines.push(`- 候选版本：${version > 0 ? `v${version}` : '无'}`);
   lines.push(`- 参与席位：${session.providers.map((p) => `\`${p}\``).join('、')}`);
   const independentSeats = session.providers.filter((provider) =>
@@ -1256,7 +1363,18 @@ function buildReport(session, reason) {
   lines.push(
     `- 本轮交叉质询席位：${crossReviewSeats.map((p) => `\`${p}\``).join('、') || '无'}（${crossReviewSeats.length}/${session.providers.length}）`,
   );
-  lines.push(`- 质询轮次：${critiqueRoundCount(history)} / 2`);
+  lines.push(`- 质询轮次：${critiqueRoundCount(history)} / ${maxRounds}`);
+  if (session.round >= maxRounds) {
+    if (reason === 'conditional-agreement') {
+      lines.push(
+        `- 已到轮数上限（${maxRounds} 轮）：仍有附加条件未解决，这些条件保留在下方原文中，未计为无条件同意。`,
+      );
+    } else if (reason === 'unresolved-opposition') {
+      lines.push(
+        `- 已到轮数上限（${maxRounds} 轮）：仍有明确反对未解决，分歧保留在下方原文中。`,
+      );
+    }
+  }
   if (reason === 'user-finished') {
     const last = history.length > 0 ? history[history.length - 1] : null;
     lines.push(

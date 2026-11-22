@@ -6,8 +6,10 @@ import { createSession, applyAction } from '../extension/core.js';
 const QUESTION = '我的笔记工具值不值得先做移动端？我只有两个周末。';
 const PROVIDERS = ['chatgpt', 'claude'];
 
-function start() {
-  return createSession(QUESTION, PROVIDERS);
+function start(maxRounds) {
+  return maxRounds === undefined
+    ? createSession(QUESTION, PROVIDERS)
+    : createSession(QUESTION, PROVIDERS, { maxRounds });
 }
 
 function pendingTask(session, provider) {
@@ -39,8 +41,9 @@ function skipFor(session, provider) {
 /** Drive a fresh session to the first vote stage with distinct answers. */
 function toVote(
   candidate = 'CANDIDATE_V1 先用手机快捷入口验证采集频次，再决定是否做完整移动端。[S1][S3]',
+  maxRounds,
 ) {
-  let session = start();
+  let session = start(maxRounds);
   session = answerFor(
     session,
     'chatgpt',
@@ -1358,6 +1361,223 @@ test('opposition resolved in the second round still requires every seat to agree
   assert.match(session.report, /R2_NOW_AGREE/);
   assert.match(session.report, /往轮表决/);
   assert.match(session.report, /ROUND1_OPPOSE/);
+});
+
+// ---------------------------------------------------------------------------
+// Multi-round budget (desktop 1–5 rounds, extension default 2)
+// ---------------------------------------------------------------------------
+
+test('a new session accepts a 1–5 round budget and keeps the original two by default', () => {
+  assert.equal(start().maxRounds, 2);
+  assert.equal(start().followConditions, false);
+  assert.equal(createSession(QUESTION, PROVIDERS, 2).followConditions, true);
+  assert.equal(createSession(QUESTION, PROVIDERS, 1).maxRounds, 1);
+  assert.equal(createSession(QUESTION, PROVIDERS, 5).maxRounds, 5);
+  assert.equal(createSession(QUESTION, PROVIDERS, { maxRounds: 4 }).maxRounds, 4);
+
+  for (const invalid of [0, 6, 1.5, '3', Number.NaN]) {
+    assert.throws(
+      () => createSession(QUESTION, PROVIDERS, { maxRounds: invalid }),
+      /maxRounds must be an integer between 1 and 5/,
+    );
+  }
+});
+
+test('a three-round desktop session follows conditions across v1, v2 and v3 and keeps the last condition', () => {
+  let session = toVote(undefined, 3);
+  session = answerFor(session, 'chatgpt', 'R1_AGREE 同意 v1。', {
+    stance: 'agree',
+  });
+  session = answerFor(
+    session,
+    'claude',
+    'R1_COND 只有先验证采集频次才同意 v1。',
+    { stance: 'conditional' },
+  );
+
+  assert.equal(session.stage, 'critique');
+  assert.equal(session.round, 2);
+  for (const task of session.tasks) {
+    assert.match(task.prompt, /R1_COND/);
+    assert.match(task.prompt, /有条件同意/);
+    assert.doesNotMatch(task.prompt, /上一轮表决出现了明确反对/);
+  }
+  const claudeRound2 = session.tasks.find((task) => task.provider === 'claude');
+  assert.match(claudeRound2.prompt, /你上一轮选择了有条件同意/);
+  assert.doesNotMatch(claudeRound2.prompt, /你上一轮明确选择了反对/);
+
+  session = answerFor(session, 'chatgpt', 'R2_CRITIQUE_CHATGPT 回应采集条件。');
+  session = answerFor(session, 'claude', 'R2_CRITIQUE_CLAUDE 条件仍未满足。');
+  assert.equal(session.stage, 'proposal');
+  session = answerFor(session, 'chatgpt', 'CANDIDATE_V2 修订后的候选。[S8][S9]');
+  assert.equal(session.stage, 'vote');
+  assert.equal(session.tasks[0].version, 2);
+
+  session = voteAll(
+    session,
+    { chatgpt: 'agree', claude: 'conditional' },
+    {
+      chatgpt: 'R2_AGREE 同意 v2。',
+      claude: 'R2_COND 仍要先验证采集频次，才接受 v2。',
+    },
+  );
+  assert.equal(session.stage, 'critique');
+  assert.equal(session.round, 3);
+  assert.match(session.tasks[0].prompt, /R2_COND/);
+  assert.match(session.tasks[0].prompt, /有条件同意/);
+  assert.doesNotMatch(session.tasks[0].prompt, /R1_COND/);
+
+  session = answerFor(session, 'chatgpt', 'R3_CRITIQUE_CHATGPT 条件仍未闭环。');
+  session = answerFor(session, 'claude', 'R3_CRITIQUE_CLAUDE 保留条件。');
+  session = answerFor(session, 'chatgpt', 'CANDIDATE_V3 第三次修订。[S13][S14]');
+  assert.equal(session.stage, 'vote');
+  assert.equal(session.tasks[0].version, 3);
+
+  session = voteAll(
+    session,
+    { chatgpt: 'agree', claude: 'conditional' },
+    {
+      chatgpt: 'R3_AGREE 同意 v3。',
+      claude: 'R3_COND 采集频次仍未验证，保留条件。',
+    },
+  );
+
+  assert.equal(session.stage, 'done');
+  assert.equal(session.stopReason, 'conditional-agreement');
+  assert.equal(session.round, 3);
+  assert.match(session.report, /讨论轮次：第 3 轮 \/ 上限 3 轮/);
+  assert.match(session.report, /质询轮次：3 \/ 3/);
+  assert.match(session.report, /候选版本：v3/);
+  assert.match(session.report, /R3_COND/);
+  assert.match(session.report, /附加条件/);
+  assert.match(session.report, /已到轮数上限（3 轮）/);
+  assert.match(session.report, /R1_COND/);
+  assert.doesNotMatch(session.report, /全体一致/);
+});
+
+test('an explicit two-round desktop budget follows one condition and then stops at the cap', () => {
+  let session = toVote(undefined, 2);
+  session = answerFor(session, 'chatgpt', 'R1_AGREE 同意 v1。', {
+    stance: 'agree',
+  });
+  session = answerFor(
+    session,
+    'claude',
+    'R1_COND 只有先验证采集频次才同意。',
+    { stance: 'conditional' },
+  );
+  assert.equal(session.stage, 'critique');
+  assert.equal(session.round, 2);
+
+  session = answerFor(session, 'chatgpt', 'R2_CRITIQUE_CHATGPT 回应条件。');
+  session = answerFor(session, 'claude', 'R2_CRITIQUE_CLAUDE 条件仍未满足。');
+  session = answerFor(session, 'chatgpt', 'CANDIDATE_V2 修订候选。[S8][S9]');
+  session = voteAll(
+    session,
+    { chatgpt: 'agree', claude: 'conditional' },
+    {
+      chatgpt: 'R2_AGREE 同意 v2。',
+      claude: 'R2_COND 仍保留采集条件。',
+    },
+  );
+
+  assert.equal(session.stage, 'done');
+  assert.equal(session.stopReason, 'conditional-agreement');
+  assert.equal(session.round, 2);
+  assert.match(session.report, /讨论轮次：第 2 轮 \/ 上限 2 轮/);
+  assert.match(session.report, /R2_COND/);
+  assert.match(session.report, /已到轮数上限（2 轮）/);
+  assert.doesNotMatch(session.report, /全体一致/);
+});
+
+test('a three-round desktop session stops at the cap with explicit opposition still reported', () => {
+  let session = toVote(undefined, 3);
+  session = answerFor(session, 'chatgpt', 'R1_AGREE 同意 v1。', {
+    stance: 'agree',
+  });
+  session = answerFor(
+    session,
+    'claude',
+    'R1_OPPOSE 抽样证据不足，反对 v1。',
+    { stance: 'oppose' },
+  );
+  assert.equal(session.round, 2);
+  assert.match(session.tasks[0].prompt, /R1_OPPOSE/);
+
+  session = answerFor(session, 'chatgpt', 'R2_CRITIQUE_CHATGPT 回应反对。');
+  session = answerFor(session, 'claude', 'R2_CRITIQUE_CLAUDE 反对理由仍成立。');
+  session = answerFor(session, 'chatgpt', 'CANDIDATE_V2 修订候选。[S8][S9]');
+  session = voteAll(
+    session,
+    { chatgpt: 'agree', claude: 'oppose' },
+    {
+      chatgpt: 'R2_AGREE 同意 v2。',
+      claude: 'R2_OPPOSE 仍反对 v2。',
+    },
+  );
+  assert.equal(session.stage, 'critique');
+  assert.equal(session.round, 3);
+  assert.match(session.tasks[0].prompt, /R2_OPPOSE/);
+  assert.match(session.tasks[0].prompt, /· 反对\]/);
+
+  session = answerFor(session, 'chatgpt', 'R3_CRITIQUE_CHATGPT 再回应。');
+  session = answerFor(session, 'claude', 'R3_CRITIQUE_CLAUDE 仍保留反对。');
+  session = answerFor(session, 'chatgpt', 'CANDIDATE_V3 第三次修订。[S13][S14]');
+  session = voteAll(
+    session,
+    { chatgpt: 'agree', claude: 'oppose' },
+    {
+      chatgpt: 'R3_AGREE 同意 v3。',
+      claude: 'R3_OPPOSE 证据仍不足，反对 v3。',
+    },
+  );
+
+  assert.equal(session.stage, 'done');
+  assert.equal(session.stopReason, 'unresolved-opposition');
+  assert.equal(session.round, 3);
+  assert.match(session.report, /讨论轮次：第 3 轮 \/ 上限 3 轮/);
+  assert.match(session.report, /候选版本：v3/);
+  assert.match(session.report, /R3_OPPOSE/);
+  assert.match(session.report, /未解决分歧/);
+  assert.match(session.report, /已到轮数上限（3 轮）/);
+  assert.doesNotMatch(session.report, /^- 全体一致/m);
+});
+
+test('real unanimous agreement stops early even when more rounds remain', () => {
+  let session = toVote(undefined, 5);
+  session = voteAll(
+    session,
+    { chatgpt: 'agree', claude: 'agree' },
+    {
+      chatgpt: 'EARLY_AGREE_A 同意 v1。',
+      claude: 'EARLY_AGREE_B 同意 v1。',
+    },
+  );
+  assert.equal(session.stage, 'done');
+  assert.equal(session.stopReason, 'consensus');
+  assert.equal(session.round, 1);
+  assert.match(session.report, /讨论轮次：第 1 轮 \/ 上限 5 轮/);
+
+  // After one opposition follow-up, a unanimous v2 still converges without
+  // spending the remaining rounds.
+  let later = toVote(undefined, 5);
+  later = answerFor(later, 'chatgpt', 'R1_AGREE 同意 v1。', { stance: 'agree' });
+  later = answerFor(later, 'claude', 'R1_OPPOSE 反对 v1。', { stance: 'oppose' });
+  later = answerFor(later, 'chatgpt', 'R2_CRITIQUE_CHATGPT 回应。');
+  later = answerFor(later, 'claude', 'R2_CRITIQUE_CLAUDE 新证据可接受。');
+  later = answerFor(later, 'chatgpt', 'CANDIDATE_V2 修订候选。[S8][S9]');
+  later = voteAll(
+    later,
+    { chatgpt: 'agree', claude: 'agree' },
+    {
+      chatgpt: 'R2_AGREE 同意 v2。',
+      claude: 'R2_NOW_AGREE 同意 v2。',
+    },
+  );
+  assert.equal(later.stage, 'done');
+  assert.equal(later.stopReason, 'consensus');
+  assert.equal(later.round, 2);
+  assert.match(later.report, /讨论轮次：第 2 轮 \/ 上限 5 轮/);
 });
 
 // ---------------------------------------------------------------------------

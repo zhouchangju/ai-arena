@@ -44,10 +44,19 @@ const ADAPTERS = {
         'div.ProseMirror[contenteditable="true"]',
         '#prompt-textarea',
       ],
+      /**
+       * 站点见证（2026-11-22，原生 WK 英文页）：题面已填入，发送箭头尚未点击，
+       * 该布局没有 `data-testid`，旧候选因此匹配不到发送控件。新增的
+       * `aria-label="Send"` 取自参考适配器（../ai-arena-extension）里同一站点的
+       * 精确标签；只收精确 label，不用 `*="Send"`，避免把语音、停止、附件或
+       * 编辑控件当成发送。若这些标记都不存在，驱动返回 send-pending 且不点击，
+       * 也不以回车或任意箭头兜底。已在登录态 WK 原页核对 Send 按钮与本轮用户消息。
+       */
       send: [
         'button[data-testid="send-button"]',
         'button[aria-label="发送"]',
         'button[aria-label="Send prompt"]',
+        'button[aria-label="Send"]',
       ],
       user: ['[data-content-search-unit-key$=":user"]', '[data-message-author-role="user"]'],
       answer: ['[data-response-body]', '[data-message-author-role="assistant"] .markdown', '[data-message-author-role="assistant"]'],
@@ -55,9 +64,11 @@ const ADAPTERS = {
         'button[data-testid="stop-button"]',
         'button[aria-label="Stop generating"]',
         'button[aria-label="Stop streaming"]',
+        'button[aria-label="Stop"]',
         'button[aria-label^="停止"]',
       ],
       done: [
+        '[data-turn-key]:has([data-response-body]) button:is([aria-label="Read aloud"], [aria-label="朗读"])',
         'article:has([data-response-body]) button[data-testid="copy-turn-action-button"]',
         '[data-message-author-role="assistant"] button[data-testid="copy-turn-action-button"]',
         'article:has([data-response-body]) button:is([aria-label="复制"], [aria-label="Copy"])',
@@ -188,6 +199,7 @@ const ADAPTERS = {
         '.ds-message:has(.ds-assistant-message-main-content) .ds-flex :is(button, [role="button"])[aria-label="Read aloud"]',
         '.ds-message:has(.ds-assistant-message-main-content) :is(button, [role="button"])[aria-label="Read aloud"]',
         '.ds-flex :is(button, [role="button"])[aria-label="朗读"]',
+        '.ds-flex :is(button, [role="button"])[aria-label="Read aloud"]',
       ],
     },
     options: {
