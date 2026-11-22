@@ -1863,6 +1863,33 @@ textarea {
   line-height: 1.65;
 }
 
+.critique-context {
+  display: grid;
+  align-self: start;
+  gap: 4px;
+  max-width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.critique-citations,
+.critique-materials {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  column-gap: 8px;
+  row-gap: 3px;
+}
+
+.critique-context .report-cite {
+  font-size: inherit;
+}
+
 .stance-chip {
   display: inline-flex;
   align-items: center;
@@ -2459,6 +2486,7 @@ textarea {
   flex-direction: column;
   gap: 7px;
   padding: 10px 12px 10px 15px;
+  scroll-margin-block-start: 10px;
   border: 1px solid transparent;
   border-left: 2px solid rgba(26, 40, 86, 0.2);
   border-radius: 0 12px 12px 0;
@@ -2644,6 +2672,10 @@ noscript {
 }
 
 @media (max-width: 980px) {
+  .app:has(.sidebar.is-history-compact) .timeline-item {
+    scroll-margin-block-start: calc(64px + env(safe-area-inset-top));
+  }
+
   .app {
     grid-template-columns: 1fr;
   }

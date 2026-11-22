@@ -625,7 +625,8 @@ class WorkspaceUI:
             f"[data-task-id=\"{tid}\"]",
             f"[data-turn-id='{tid}']",
         ]
-        cards: list[Locator] = []
+        # A task card can now show the names of peer providers in source links.
+        cards = self.page.locator(f"article.seat-card[data-task-id='{tid}']").all()
         seat_cards = self.page.locator("article.seat-card")
         for index in range(min(seat_cards.count(), 20)):
             node = seat_cards.nth(index)
