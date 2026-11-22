@@ -2,6 +2,8 @@
 
 这是一个使用系统 WebKit 的原生 macOS 应用。一个窗口里有 ChatGPT、Gemini 和 DeepSeek 各自的真实网页。流式正文、图片、表格、引用和交互控件由各站渲染。工具栏负责组织轮次，讨论记录保存在本机。
 
+本机已打好的 0.3.0（构建 3）位于 `desktop/build/releases/0.3.0/AI Arena.app`，压缩包在同一目录。这个目录属于本机构建产物；新检出的仓库可按下方命令构建。 [开场界面](../docs/evidence/native-0.3/composer.png) · [讨论界面](../docs/evidence/native-0.3/discussion.png)
+
 ## 第一次使用
 
 1. 双击 `AI Arena.app`，在各席原页里按站点提示登录。应用使用自己的持久 WebKit 数据存储，需要在这个应用里建立登录会话。
@@ -10,6 +12,14 @@
 4. 讨论结束会打开报告。也可从「详情」查看发言、出处和报告，用「导出」保存 Markdown。「历史」打开已有记录。应用重启会恢复上次讨论；未完成席先进入人工核对，避免重复发送。记录默认存放在 `~/Library/Application Support/AI Arena/`。
 
 首次登录需要站点本人验证。Google 可能限制嵌入式 WebView 登录。已在本机登录态核对三站的原页收发；具体轮次与验收覆盖见迭代记录。Chrome 扩展的历史、权限和账号属于它自己的浏览器环境。 [Google 授权说明](https://developers.google.com/identity/protocols/oauth2/native-app#disallowed_useragent)
+
+## 一席停住时怎么看
+
+| 席位提示 | 原页上发生了什么 | 如何处理 |
+|---|---|---|
+| 已填入，等待发送按钮 | 提示已写入编辑框，工作台正在等发送控件就绪。 | 先等自动重试。若提示“长时间未就绪”，在该席菜单接管，核对原页上的草稿或已发消息。 |
+| 发送结果待确认 | 点击可能已到达站点，工作台正在查找本轮原始提问及随后出现的答复。 | 保持当前会话，让工作台读回，避免手动再发一遍。 |
+| 已收到回答，但缺少明确立场 | 本轮表态未能解析出同意、有条件同意或反对。 | 查看原文，只在立场明确时接管并选择相应表态；无法判断时可跳过，该席计为缺席。 |
 
 ## 构建和验收
 
@@ -29,7 +39,7 @@ python3 tests/native_desktop_acceptance.py --app "desktop/build/AI Arena.app" --
 python3 tests/native_desktop_acceptance.py --app "desktop/build/AI Arena.app" --out /tmp/arena-native-takeover --takeover
 ```
 
-两条命令都会从指定的应用包复制出 AI Arena QA，使用独立的应用标识、WebKit 资料和临时讨论目录访问回环测试页。测试会核对同版投票、重启后的 Cookie 和 Markdown 导出，第二条还覆盖人工接管。用这两个入口可在开发时保留正式应用和已登录的三个网页。真实账号验收使用定稿的同一份正式构建。
+两条命令都会从指定的应用包复制出 AI Arena QA，使用独立的应用标识、WebKit 资料和临时讨论目录访问回环测试页。测试会核对同版投票、重启后的 Cookie 和 Markdown 导出，第二条还覆盖人工接管。如需专门核对中途重启，运行 `python3 tests/native_resume_acceptance.py --app "desktop/build/AI Arena.app" --out /tmp/arena-native-resume`。该用例从两席已答、第三席待发的记录继续，核对已有回答没有重复发送。真实账号验收使用定稿的同一份正式构建。
 
 ## 运行时和钥匙串
 
