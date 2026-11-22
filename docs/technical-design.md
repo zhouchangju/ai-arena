@@ -14,6 +14,14 @@
 
 这两套实现的可复用边界是独立模块和测试材料。直接 fork Arena 能最快看到现成的群聊与九个站点入口，但保留了多个发送入口、整套附属功能以及按服务标识归属的旧逻辑。若目标变成原样维护上游，这个取舍值得重评。当前选择在空仓库新建协调器，按需迁入经过验证的小模块；以 Panelize 整包为底会额外承担嵌入网页的维护工作。
 
+自用版沿用参考 Arena 的分席标签、网页正文轮询和局部界面更新。站点适配器定义输入、发送、用户消息、回答和生成状态的定位逻辑。任务先保存发送意图，再核对原页出现的本轮用户消息。实时正文只作为预览；每席的完整正文单独归入本轮。手动接管对该席生效，其他席仍可读取和提交。
+
+### 在一个工作台观察各席
+
+参考 Arena 的群聊路径先在浏览器打开站点标签，然后读回正文，通过 `chatStreamUpdate` 更新群聊。群聊代码里用于摘要的 iframe 承载生成的 HTML。Panelize 的网页面板使用 iframe，并有独立的站点嵌入兼容逻辑。 [Arena 打开标签](../../ai-arena-extension/src/background.js) · [Arena 群聊读取](../../ai-arena-extension/src/chat-bus.js) · [Panelize iframe 消息协议](../../Panelize/modules/panel-message-contract.js)
+
+本轮公开入口检查发现 Gemini 返回 `X-Frame-Options: DENY`，ChatGPT 的 `frame-ancestors` 只允许自身和列出的扩展来源，DeepSeek 请求返回 429，无法判断其嵌入策略。工作台继续由各站普通标签收发，在同一页并排显示准备发送或已核对的提示、网页正文和发送状态。点「打开原页」可查看实际网站界面及控件。 [浏览器嵌入规则](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Security-Policy/frame-ancestors)
+
 ## 核心流程与工程边界
 
 ```mermaid
