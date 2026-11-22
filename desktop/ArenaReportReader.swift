@@ -6,6 +6,7 @@ struct ArenaReportReader: View {
     let session: [String: Any]?
     let ballot: [String: Any]?
     @State private var showCandidate = false
+    @State private var showQuestion = false
     @State private var showSources = false
     @State private var showArchive = false
     @State private var selectedSource: ArenaTaskRow?
@@ -41,6 +42,11 @@ struct ArenaReportReader: View {
     private var currentSources: [ArenaTaskRow] {
         rows.filter { $0.status == "answered" && $0.answer?.isEmpty == false }
     }
+    private var question: String? {
+        guard let raw = session?["question"] as? String,
+              !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return raw
+    }
 
     var body: some View {
         Group {
@@ -49,13 +55,13 @@ struct ArenaReportReader: View {
             } else {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 23) {
-                        Text(session?["question"] as? String ?? "讨论报告")
-                            .font(.system(size: 28, weight: .semibold))
-                            .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
                         if currentSources.isEmpty, let original = ArenaSessionDigest.report(session) {
                             ArenaMarkdownView(text: original)
+                            if let question { questionSection(question) }
                         } else {
+                            Text("讨论报告")
+                                .font(.system(size: 24, weight: .semibold))
+                                .accessibilityAddTraits(.isHeader)
                             decisionLine
                             if let proposal, let answer = proposal.answer {
                                 candidate(answer, author: proposal)
@@ -64,6 +70,7 @@ struct ArenaReportReader: View {
                                     .foregroundStyle(.secondary)
                             }
                             if !participants.isEmpty { positions }
+                            if let question { questionSection(question) }
                             Divider()
                             DisclosureGroup(isExpanded: $showSources) {
                                 if showSources { sourceList }
@@ -175,6 +182,22 @@ struct ArenaReportReader: View {
                 }.buttonStyle(.plain)
             }
         }.padding(.top, 8)
+    }
+
+    private func questionSection(_ question: String) -> some View {
+        DisclosureGroup(isExpanded: $showQuestion) {
+            if showQuestion {
+                Text(verbatim: question)
+                    .font(.system(size: 16))
+                    .lineSpacing(4)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.top, 10)
+            }
+        } label: {
+            Label("原始问题", systemImage: "text.quote")
+        }
     }
 
     private func sourceReader(_ row: ArenaTaskRow) -> some View {
