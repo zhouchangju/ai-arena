@@ -1,6 +1,6 @@
 # AI Arena Extension 功能与验证清单
 
-每项记录参考版本的行为、自用版的取舍、开发时应执行的验证。排除项验证其从自用版界面、导出或运行时移除。以下为源码分析与验收设计，实测结果尚待填写。版本见[源码分析](reference-review.md)。
+这是早期扩展阶段的上游源码调研与验收设计。「自用版取舍」记录当时的方案。当前 macOS 工作台的功能与验收见[产品设计](product-design.md)和[试用指引](try-it.md)。上游版本见[参考项目分析](reference-review.md)。
 
 <a id="a01"></a>
 
@@ -11,7 +11,7 @@
 - **参照版复核**　在原版从工具栏打开群聊，再从侧栏打开群聊；观察哪个窗口被聚焦、状态是否一致。
 - **自用版取舍**　首版·单一工作台。
 - **验证**　连续点两次扩展图标，回到同一场讨论；关闭工作台再打开能读到刚才的进展。
-- **源码**　[background.js](../../ai-arena-extension/src/background.js) · [popup.js](../../ai-arena-extension/src/popup.js) · [sidepanel.js](../../ai-arena-extension/src/sidepanel.js)
+- **源码**　[background.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/background.js) · [popup.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup.js) · [sidepanel.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/sidepanel.js)
 
 <a id="a02"></a>
 
@@ -22,7 +22,7 @@
 - **参照版复核**　新配置逐步完成加席、登录、首答、再加席；分别跳过、重开教程，确认已记住的进度。
 - **自用版取舍**　改造·保留就绪指引。
 - **验证**　新配置从零加入两位成员并开始首问；缺登录时有具体操作；再次打开无需重走。
-- **源码**　[welcome.js](../../ai-arena-extension/src/welcome.js) · [popup-onboarding.js](../../ai-arena-extension/src/popup-onboarding.js) · [popup-tutorial.js](../../ai-arena-extension/src/popup-tutorial.js) · [popup-help-fab.js](../../ai-arena-extension/src/popup-help-fab.js)
+- **源码**　[welcome.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/welcome.js) · [popup-onboarding.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-onboarding.js) · [popup-tutorial.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-tutorial.js) · [popup-help-fab.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-help-fab.js)
 
 <a id="a03"></a>
 
@@ -33,7 +33,7 @@
 - **参照版复核**　新配置与已有成员配置分别打开，记录起始模式和辩论按钮点亮条件；从更多菜单找回折叠操作。
 - **自用版取舍**　改造·核心动作常驻。
 - **验证**　两份完整答复到齐可进入互评；只收到一份时说明缺谁，键盘也能到达。
-- **源码**　[popup-simple-mode.js](../../ai-arena-extension/src/popup-simple-mode.js) · [popup-progressive.js](../../ai-arena-extension/src/popup-progressive.js) · [popup-feature-tour.js](../../ai-arena-extension/src/popup-feature-tour.js) · [popup-more-menu.js](../../ai-arena-extension/src/popup-more-menu.js)
+- **源码**　[popup-simple-mode.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-simple-mode.js) · [popup-progressive.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-progressive.js) · [popup-feature-tour.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-feature-tour.js) · [popup-more-menu.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-more-menu.js)
 
 <a id="a04"></a>
 
@@ -44,7 +44,7 @@
 - **参照版复核**　添加三席后尝试第四席；分别先加千问和最后加千问，检查提示。点一键组合核对实际成员。
 - **自用版取舍**　首版·两席起步，按实测开放组合。
 - **验证**　分别试千问先入/后入；记录旧版限制。新版同一站多个会话须能分别归属，否则禁用该组合。
-- **源码**　[popup-members.js](../../ai-arena-extension/src/popup-members.js) · [background.js](../../ai-arena-extension/src/background.js) · [chat-bus.js](../../ai-arena-extension/src/chat-bus.js)
+- **源码**　[popup-members.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-members.js) · [background.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/background.js) · [chat-bus.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/chat-bus.js)
 
 <a id="a05"></a>
 
@@ -55,7 +55,7 @@
 - **参照版复核**　关闭一席对应的网页，分别点击唤起、重开、登录复查，记录能否回到原会话。
 - **自用版取舍**　首版。
 - **验证**　一个成员退出登录，其他成员继续；重新登录后恢复该席，不能误绑同站另一段对话。
-- **源码**　[background.js](../../ai-arena-extension/src/background.js) · [popup-members.js](../../ai-arena-extension/src/popup-members.js)
+- **源码**　[background.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/background.js) · [popup-members.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-members.js)
 
 <a id="a06"></a>
 
@@ -66,7 +66,7 @@
 - **参照版复核**　在标签、并列、Mini Bar 间切换；在双屏下观察新窗口位置，检查小窗成员状态、展开后尺寸。
 - **自用版取舍**　首版用标签；排窗与 Mini Bar 后续。
 - **验证**　切换显示器、展开折叠、移除一席，各动作均不新发问题；窗口尺寸与原标签身份可核对。
-- **源码**　[popup-window-mode.js](../../ai-arena-extension/src/popup-window-mode.js) · [popup-mini-mode.js](../../ai-arena-extension/src/popup-mini-mode.js) · [popup-mini-roster.js](../../ai-arena-extension/src/popup-mini-roster.js) · [background.js](../../ai-arena-extension/src/background.js)
+- **源码**　[popup-window-mode.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-window-mode.js) · [popup-mini-mode.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-mini-mode.js) · [popup-mini-roster.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-mini-roster.js) · [background.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/background.js)
 
 <a id="a07"></a>
 
@@ -77,7 +77,7 @@
 - **参照版复核**　广播一句唯一文本，另发 @ 单席文本；逐页核对收件人、发送次数。分别从群聊和侧栏开始。
 - **自用版取舍**　首版。
 - **验证**　广播一次两页各收一份；仅选 B 时 A 不收到；检查两个入口触发同一发送命令。
-- **源码**　[popup.js](../../ai-arena-extension/src/popup.js) · [popup-roster.js](../../ai-arena-extension/src/popup-roster.js) · [sidepanel.js](../../ai-arena-extension/src/sidepanel.js) · [background.js](../../ai-arena-extension/src/background.js)
+- **源码**　[popup.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup.js) · [popup-roster.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-roster.js) · [sidepanel.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/sidepanel.js) · [background.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/background.js)
 
 <a id="a08"></a>
 
@@ -88,7 +88,7 @@
 - **参照版复核**　在普通网页选一句话并点右键菜单，确认侧栏收到的草稿与选区相同。
 - **自用版取舍**　后续·只进入草稿。
 - **验证**　选一段正文后进入预览，能修改或取消；取消时各站没有新增消息。
-- **源码**　[background.js](../../ai-arena-extension/src/background.js)
+- **源码**　[background.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/background.js)
 
 <a id="a09"></a>
 
@@ -99,7 +99,7 @@
 - **参照版复核**　从侧栏粘图、选文本、移除附件，查看实际发送内容；在群聊中核对上传引导。
 - **自用版取舍**　后续·两条入口分别验。
 - **验证**　粘两图删除一张，再加一份文本；逐席核对实际收到的内容。缺附件的一席不能声称已看图。
-- **源码**　[sidepanel.js](../../ai-arena-extension/src/sidepanel.js) · [popup.html](../../ai-arena-extension/src/popup.html) · [inject-images.js](../../ai-arena-extension/src/inject-images.js)
+- **源码**　[sidepanel.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/sidepanel.js) · [popup.html](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup.html) · [inject-images.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/inject-images.js)
 
 <a id="a10"></a>
 
@@ -110,7 +110,7 @@
 - **参照版复核**　分别提供可正常发送、按钮禁用和仅可填入的页面样本，记录站点结果及后台广播状态。
 - **自用版取舍**　改造·区分填好和已提交。
 - **验证**　已填但未提交时留在待发送；回执丢失时先对账；页面只出现一份相同问题。
-- **源码**　[background.js](../../ai-arena-extension/src/background.js) · [content-shared.js](../../ai-arena-extension/src/content-shared.js) · [content-chatgpt.js](../../ai-arena-extension/src/content-chatgpt.js)
+- **源码**　[background.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/background.js) · [content-shared.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/content-shared.js) · [content-chatgpt.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/content-chatgpt.js)
 
 <a id="a11"></a>
 
@@ -121,7 +121,7 @@
 - **参照版复核**　页面预放一条旧答，新答分三段且中途暂停；比对气泡、状态及最终采用文字。
 - **自用版取舍**　首版。
 - **验证**　回放旧答、思考停顿、两段等长文字、复制按钮噪声及纯图片结果；只将可归属的完成正文投入互评。
-- **源码**　[chat-bus.js](../../ai-arena-extension/src/chat-bus.js) · [content-shared.js](../../ai-arena-extension/src/content-shared.js) · [qwen-noise-filter.js](../../ai-arena-extension/src/qwen-noise-filter.js)
+- **源码**　[chat-bus.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/chat-bus.js) · [content-shared.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/content-shared.js) · [qwen-noise-filter.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/qwen-noise-filter.js)
 
 <a id="a12"></a>
 
@@ -132,7 +132,7 @@
 - **参照版复核**　阅读流式长文中途上滚、折叠、展开、查看提示词并复制；在侧栏悬停观察预览。
 - **自用版取舍**　首版·按轮次读。
 - **验证**　滚动查上一轮时新字不抢位置；点击旧轮提示词能看到当时版本；复制折叠长文得到完整内容。
-- **源码**　[popup.js](../../ai-arena-extension/src/popup.js) · [popup-bubble-actions.js](../../ai-arena-extension/src/popup-bubble-actions.js) · [popup-compact-mode.js](../../ai-arena-extension/src/popup-compact-mode.js) · [popup-arena-badge.js](../../ai-arena-extension/src/popup-arena-badge.js) · [sidepanel.js](../../ai-arena-extension/src/sidepanel.js)
+- **源码**　[popup.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup.js) · [popup-bubble-actions.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-bubble-actions.js) · [popup-compact-mode.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-compact-mode.js) · [popup-arena-badge.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-arena-badge.js) · [sidepanel.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/sidepanel.js)
 
 <a id="a13"></a>
 
@@ -143,7 +143,7 @@
 - **参照版复核**　在一条回答放标题、表格、公式、代码和 SVG 样例，在普通显示、源码、预览间切换。
 - **自用版取舍**　首版正文及代码；可执行预览排除。
 - **验证**　含表格、公式及 HTML 示例的回答能读、能复制；来自模型的内容始终不会操作扩展页面。
-- **源码**　[popup-markdown.js](../../ai-arena-extension/src/popup-markdown.js) · [popup-codepreview.js](../../ai-arena-extension/src/popup-codepreview.js)
+- **源码**　[popup-markdown.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-markdown.js) · [popup-codepreview.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-codepreview.js)
 
 <a id="a14"></a>
 
@@ -154,7 +154,7 @@
 - **参照版复核**　仅一份回答时尝试开辩；两席分别处于生成中、过短或沿用上次内容时检查提示。
 - **自用版取舍**　首版。
 - **验证**　一份旧答加一份有效答不能开始正式互评；很短的有效回答可人工核实，保留判断依据。
-- **源码**　[background.js](../../ai-arena-extension/src/background.js) · [popup-tasks.js](../../ai-arena-extension/src/popup-tasks.js)
+- **源码**　[background.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/background.js) · [popup-tasks.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-tasks.js)
 
 <a id="a15"></a>
 
@@ -165,7 +165,7 @@
 - **参照版复核**　同样两份回答分别启动自由和协作，查看每位收到的提示和本轮引导，核对排除了自己。
 - **自用版取舍**　首版自由互评；协作作为可选策略。
 - **验证**　给两人不同的限定条件，检查双方下一轮确实看到了对方那条条件，同轮看不到对方正在写的草稿。
-- **源码**　[debate-engine.js](../../ai-arena-extension/src/debate-engine.js) · [templates-builtin.js](../../ai-arena-extension/src/templates-builtin.js)
+- **源码**　[debate-engine.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/debate-engine.js) · [templates-builtin.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/templates-builtin.js)
 
 <a id="a16"></a>
 
@@ -176,7 +176,7 @@
 - **参照版复核**　取消选中一席，编辑另一席的转发材料后失焦，再触发新一帧更新，检查保存和接收方。
 - **自用版取舍**　改造·派生副本。
 - **验证**　把一句引述改成假设，预览显示“用户编辑”；原回答与引用仍可单独查看。
-- **源码**　[popup-roster.js](../../ai-arena-extension/src/popup-roster.js) · [background.js](../../ai-arena-extension/src/background.js)
+- **源码**　[popup-roster.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-roster.js) · [background.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/background.js)
 
 <a id="a17"></a>
 
@@ -187,7 +187,7 @@
 - **参照版复核**　准备过长队友答复和一席失败场景，比较压缩前后发送内容并检查仅失败席被补发。
 - **自用版取舍**　首版·保全未解反例。
 - **验证**　把唯一反例放在长文中间。转发预算到顶后仍可定位该反例；补发 B 不改 A 的答复。
-- **源码**　[debate-engine.js](../../ai-arena-extension/src/debate-engine.js) · [popup-tasks.js](../../ai-arena-extension/src/popup-tasks.js) · [background.js](../../ai-arena-extension/src/background.js)
+- **源码**　[debate-engine.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/debate-engine.js) · [popup-tasks.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-tasks.js) · [background.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/background.js)
 
 <a id="a18"></a>
 
@@ -198,7 +198,7 @@
 - **参照版复核**　拖动排序后依次发言，对照后发者的实际 prompt；空问题和重复顺序应得到对应提示。
 - **自用版取舍**　后续·单独协议。
 - **验证**　交换 A、B 顺序，验证首次发言者看不到后来者观点；中途断线能指出停在哪一席。
-- **源码**　[popup-tasks.js](../../ai-arena-extension/src/popup-tasks.js) · [background.js](../../ai-arena-extension/src/background.js)
+- **源码**　[popup-tasks.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-tasks.js) · [background.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/background.js)
 
 <a id="a19"></a>
 
@@ -209,7 +209,7 @@
 - **参照版复核**　开启队长模式，比较首位和另一位的真实 prompt；设置角色后在只看队长视图来回切换。
 - **自用版取舍**　后续·独立首轮保持同题。
 - **验证**　检查角色提示仅发给被指定者；切换只看队长后，其余原文和异议仍保留。
-- **源码**　[captain-mode.js](../../ai-arena-extension/src/captain-mode.js) · [popup-role-hats.js](../../ai-arena-extension/src/popup-role-hats.js) · [popup-bubble-actions.js](../../ai-arena-extension/src/popup-bubble-actions.js)
+- **源码**　[captain-mode.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/captain-mode.js) · [popup-role-hats.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-role-hats.js) · [popup-bubble-actions.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-bubble-actions.js)
 
 <a id="a20"></a>
 
@@ -220,7 +220,7 @@
 - **参照版复核**　选裁判分别生成文本/结构化报告，输入合法、回显模板及截断输出，观察解析、回退和下载行为。
 - **自用版取舍**　首版·引用到具体轮次。
 - **验证**　首轮独有反例进入报告；截断 JSON、错误引用、漏掉一名成员时报告保持草稿或部分结果。
-- **源码**　[debate-engine.js](../../ai-arena-extension/src/debate-engine.js) · [debate-summary-template.js](../../ai-arena-extension/src/debate-summary-template.js) · [background.js](../../ai-arena-extension/src/background.js)
+- **源码**　[debate-engine.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/debate-engine.js) · [debate-summary-template.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/debate-summary-template.js) · [background.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/background.js)
 
 <a id="a21"></a>
 
@@ -231,7 +231,7 @@
 - **参照版复核**　指定浓缩官、长度、立场，检查简报流入主输入框，允许改写再使用。
 - **自用版取舍**　后续。
 - **验证**　分别选中立和鼓励反方，生成后核对关键事实和分歧；草稿需可编辑，不能直接发给新成员。
-- **源码**　[baton-prompts.js](../../ai-arena-extension/src/baton-prompts.js) · [popup-tasks.js](../../ai-arena-extension/src/popup-tasks.js)
+- **源码**　[baton-prompts.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/baton-prompts.js) · [popup-tasks.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-tasks.js)
 
 <a id="a22"></a>
 
@@ -242,7 +242,7 @@
 - **参照版复核**　用一轮长短不同的答复打开对比，复制 Markdown 和导出 HTML；用会话导出检查覆盖的轮次。
 - **自用版取舍**　首版并排与 Markdown；HTML 后续。
 - **验证**　比较首轮和末轮，导出能区别二者；字数不参与质量评定；断网可读已导出的结果。
-- **源码**　[popup-compare.js](../../ai-arena-extension/src/popup-compare.js) · [export-engine.js](../../ai-arena-extension/src/export-engine.js) · [background.js](../../ai-arena-extension/src/background.js)
+- **源码**　[popup-compare.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-compare.js) · [export-engine.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/export-engine.js) · [background.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/background.js)
 
 <a id="a23"></a>
 
@@ -253,7 +253,7 @@
 - **参照版复核**　从日期目录检索问答并跳转，分别检查清屏、重置会话和彻底重置清掉哪些数据。
 - **自用版取舍**　首版·按场次存储。
 - **验证**　建两场同题讨论，搜索可定位各自回答；取消删除无变化，只删除一场时另一场仍可完整恢复。
-- **源码**　[popup-history.js](../../ai-arena-extension/src/popup-history.js) · [state-machine.js](../../ai-arena-extension/src/state-machine.js) · [popup-tasks.js](../../ai-arena-extension/src/popup-tasks.js)
+- **源码**　[popup-history.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-history.js) · [state-machine.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/state-machine.js) · [popup-tasks.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-tasks.js)
 
 <a id="a24"></a>
 
@@ -264,7 +264,7 @@
 - **参照版复核**　修改一项内置字段，创建自定义模板；逐项复位和全部复位后核对自建记录。
 - **自用版取舍**　首版固定版本；个人模板后续。
 - **验证**　改第 2 轮模板，历史场次保留原版本；重置内置项保留自建项；空字段有回退。
-- **源码**　[templates-builtin.js](../../ai-arena-extension/src/templates-builtin.js) · [template-store.js](../../ai-arena-extension/src/template-store.js) · [popup-templates.js](../../ai-arena-extension/src/popup-templates.js)
+- **源码**　[templates-builtin.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/templates-builtin.js) · [template-store.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/template-store.js) · [popup-templates.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-templates.js)
 
 <a id="a25"></a>
 
@@ -275,7 +275,7 @@
 - **参照版复核**　分别从气泡和原站摘录，复核来源与顺序，依次引用、复制、删除、清空。
 - **自用版取舍**　后续。
 - **验证**　从两个不同轮次摘录相同文字，核对来源。删除摘录不改写回答。
-- **源码**　[memo-store.js](../../ai-arena-extension/src/memo-store.js) · [popup-memos.js](../../ai-arena-extension/src/popup-memos.js) · [content-shared.js](../../ai-arena-extension/src/content-shared.js)
+- **源码**　[memo-store.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/memo-store.js) · [popup-memos.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-memos.js) · [content-shared.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/content-shared.js)
 
 <a id="a26"></a>
 
@@ -286,7 +286,7 @@
 - **参照版复核**　用合成的手机号和私网地址触发提示，分别取消、遮盖和原文放行，再查相同值的白名单行为。
 - **自用版取舍**　改造·按实际转发内容及接收方预览。
 - **验证**　用虚构号码分别走首问和跨站转发，选择遮盖后核对每份实际输入。一次放行不应意外影响下一场。
-- **源码**　[gatekeeper-engine.js](../../ai-arena-extension/src/gatekeeper-engine.js) · [gatekeeper-rules.js](../../ai-arena-extension/src/gatekeeper-rules.js) · [gatekeeper-store.js](../../ai-arena-extension/src/gatekeeper-store.js) · [popup-gatekeeper-bridge.js](../../ai-arena-extension/src/popup-gatekeeper-bridge.js)
+- **源码**　[gatekeeper-engine.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/gatekeeper-engine.js) · [gatekeeper-rules.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/gatekeeper-rules.js) · [gatekeeper-store.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/gatekeeper-store.js) · [popup-gatekeeper-bridge.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-gatekeeper-bridge.js)
 
 <a id="a27"></a>
 
@@ -297,7 +297,7 @@
 - **参照版复核**　模拟标签缺失、脚本未就绪和登出，对照三项体检、对应操作、日志及全场无进展提示。
 - **自用版取舍**　首版。
 - **验证**　关闭 B 后出现可处理的原因；重提取仅重读；跳过标记缺席；诊断去掉问题正文。
-- **源码**　[popup-doctor.js](../../ai-arena-extension/src/popup-doctor.js) · [popup-log.js](../../ai-arena-extension/src/popup-log.js) · [popup-stuck-sentinel.js](../../ai-arena-extension/src/popup-stuck-sentinel.js) · [arena-errors.js](../../ai-arena-extension/src/arena-errors.js)
+- **源码**　[popup-doctor.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-doctor.js) · [popup-log.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-log.js) · [popup-stuck-sentinel.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-stuck-sentinel.js) · [arena-errors.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/arena-errors.js)
 
 <a id="a28"></a>
 
@@ -308,7 +308,7 @@
 - **参照版复核**　在有正在生成及待总结的任务时重启后台；检查轮询恢复、旧轮截断标记和报告关联。
 - **自用版取舍**　改造·独立原文存储。
 - **验证**　生成中结束后台进程并重新打开工作台，原文可读，任务状态明确，裁判只产出一份报告。
-- **源码**　[state-machine.js](../../ai-arena-extension/src/state-machine.js) · [chat-bus.js](../../ai-arena-extension/src/chat-bus.js)
+- **源码**　[state-machine.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/state-machine.js) · [chat-bus.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/chat-bus.js)
 
 <a id="a29"></a>
 
@@ -319,7 +319,7 @@
 - **参照版复核**　比较不同构建配方的清单与配置来源；用无效选择器配置样本检查本地回退。
 - **自用版取舍**　改造·站点适配随自用版本更新。
 - **验证**　离线加载时无需上游地址；单站样本变更应只使该站的对应能力降级。
-- **源码**　[selectors-config.js](../../ai-arena-extension/src/selectors-config.js) · [selectors-remote.js](../../ai-arena-extension/src/selectors-remote.js) · [manifest.json](../../ai-arena-extension/src/manifest.json) · [build.mjs](../../ai-arena-extension/src/../build.mjs)
+- **源码**　[selectors-config.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/selectors-config.js) · [selectors-remote.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/selectors-remote.js) · [manifest.json](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/manifest.json) · [build.mjs](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/build.mjs)
 
 <a id="a30"></a>
 
@@ -330,7 +330,7 @@
 - **参照版复核**　普通工坊分别选择文案、图片、PPTX；SUPER 走选版、填稿、编辑、导出，核对两条入口不同。
 - **自用版取舍**　排除·独立制片工作流。
 - **验证**　检查任务菜单、导出格式、构建包，均无演示稿流程和模板资产。
-- **源码**　[ppt-prompts.js](../../ai-arena-extension/src/ppt-prompts.js) · [popup-tasks.js](../../ai-arena-extension/src/popup-tasks.js) · [ppt-super.js](../../ai-arena-extension/src/ppt-super/ppt-super.js) · [ppt-fill.js](../../ai-arena-extension/src/ppt-super/ppt-fill.js)
+- **源码**　[ppt-prompts.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/ppt-prompts.js) · [popup-tasks.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-tasks.js) · [ppt-super.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/ppt-super/ppt-super.js) · [ppt-fill.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/ppt-super/ppt-fill.js)
 
 <a id="a31"></a>
 
@@ -341,7 +341,7 @@
 - **参照版复核**　累计提问并切换本次/累计/模型页，核对成就条件、估算值和固定日期的外部榜单。
 - **自用版取舍**　排除·仅留本场用时和状态。
 - **验证**　多次跑完整场，不生成成就、累计排名或外部榜单链接；单场仍可查耗时与失败。
-- **源码**　[popup-stats.js](../../ai-arena-extension/src/popup-stats.js) · [popup-achievements.js](../../ai-arena-extension/src/popup-achievements.js) · [popup-members.js](../../ai-arena-extension/src/popup-members.js)
+- **源码**　[popup-stats.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-stats.js) · [popup-achievements.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-achievements.js) · [popup-members.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-members.js)
 
 <a id="a32"></a>
 
@@ -352,7 +352,7 @@
 - **参照版复核**　分别检查安装材料、推广页、设置和更新入口，标注哪些出现于运行时、哪些只在仓库宣传材料。
 - **自用版取舍**　排除推广、上游更新、皮肤包。
 - **验证**　首次打开、设置、结束报告、导出均无引流、二维码或更新弹窗；法律声明中的来源仍可查。
-- **源码**　[popup-update-check.js](../../ai-arena-extension/src/popup-update-check.js) · [popup-settings.js](../../ai-arena-extension/src/popup-settings.js) · [popup-logo-style.js](../../ai-arena-extension/src/popup-logo-style.js) · [README.md](../../ai-arena-extension/src/../README.md)
+- **源码**　[popup-update-check.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-update-check.js) · [popup-settings.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-settings.js) · [popup-logo-style.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup-logo-style.js) · [README.md](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/README.md)
 
 <a id="a33"></a>
 
@@ -363,4 +363,4 @@
 - **参照版复核**　后台放置一个慢页面，观察侧栏预览、单席唤起和全体唤起；比较不同发布构建的可用能力。
 - **自用版取舍**　改造·按席打开原页。
 - **验证**　一席进入后台后停住，前台已有答案仍可读。切去处理慢席再返回时进度不倒退。
-- **源码**　[sidepanel.js](../../ai-arena-extension/src/sidepanel.js) · [background.js](../../ai-arena-extension/src/background.js) · [bootstrap-main-world.js](../../ai-arena-extension/src/bootstrap-main-world.js) · [cdp-extractor.js](../../ai-arena-extension/src/cdp-extractor.js)
+- **源码**　[sidepanel.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/sidepanel.js) · [background.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/background.js) · [bootstrap-main-world.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/bootstrap-main-world.js) · [cdp-extractor.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/cdp-extractor.js)

@@ -1,8 +1,8 @@
-# AI Arena for macOS
+# macOS 构建与排障
 
 这是一个使用系统 WebKit 的原生 macOS 应用。一个窗口里有 ChatGPT、Gemini 和 DeepSeek 各自的真实网页。流式正文、图片、表格、引用和交互控件由各站渲染。工具栏负责组织轮次，讨论记录保存在本机。
 
-本机已打好的 0.4.0（构建 5）位于 `desktop/build/releases/0.4.0/AI Arena.app`，压缩包在同一目录。这个目录属于本机构建产物；新检出的仓库可按下方命令构建。 [开场界面](../docs/evidence/native-0.3/composer.png) · [讨论界面](../docs/evidence/native-0.3/discussion.png)
+从源码构建后，默认应用包位于 `desktop/build/AI Arena.app`。构建版本以 [Info.plist](Info.plist) 为准。 [开场界面](../docs/evidence/native-0.3/composer.png) · [讨论界面](../docs/evidence/native-0.3/discussion.png)
 
 ## 第一次使用
 
@@ -11,7 +11,7 @@
 3. 每席顶部显示状态。「查看当前提示」可核对材料。「暂停」用于暂停后续派发；已经发送给原站的请求仍可能生成。某席遇到登录、限流或页面变化，可以在该席菜单中接管、补录或跳过。核对原页后可选择「恢复本站自动」。发送结果不确定时，工作台回到同一会话核对本轮提问和随后出现的原始回答。Gemini 正文停止变化却缺少完成标记时，工作台会在确认没有生成控件和未发送草稿后尝试重新读取原页。
 4. 讨论结束会打开报告。也可从「详情」查看发言、出处和报告，用「导出」保存 Markdown。「历史」打开已有记录。应用重启会恢复上次讨论；未完成席先进入人工核对，避免重复发送。记录默认存放在 `~/Library/Application Support/AI Arena/`。
 
-首次登录需要站点本人验证。Google 可能限制嵌入式 WebView 登录。已在本机登录态核对三站的原页收发；具体轮次与验收覆盖见迭代记录。Chrome 扩展的历史、权限和账号属于它自己的浏览器环境。 [Google 授权说明](https://developers.google.com/identity/protocols/oauth2/native-app#disallowed_useragent)
+首次登录需要站点本人验证。Google 可能限制嵌入式 WebView 登录。已在本机登录态核对三站的原页收发；具体轮次与覆盖见[站点验证](../docs/provider-validation.md)。 [Google 授权说明](https://developers.google.com/identity/protocols/oauth2/native-app#disallowed_useragent)
 
 ## 最终报告怎么来
 
@@ -29,7 +29,7 @@
 
 ## 构建和验收
 
-在仓库根目录执行：
+需要 macOS 13 或更新版本、Xcode 或 Command Line Tools 提供的 Apple Swift 工具链，以及 Node.js。在仓库根目录执行：
 
 ```sh
 ./desktop/build.sh
@@ -38,14 +38,17 @@ open "desktop/build/AI Arena.app"
 
 构建使用 Apple Swift 工具链、系统框架和 Node.js，生成本机架构的本地签名应用。构建脚本把已有讨论引擎、网页驱动和站点配置装入应用资源目录。运行时只需要 macOS；目前实测机器为 Apple Silicon。
 
-用已安装仓库测试依赖的 Python 运行隔离验收。输出目录请使用新路径。
+共享讨论引擎测试可直接运行 `node --test tests/core.test.mjs`。
+
+隔离验收需要 Python 3 和 Playwright Python 包。脚本复用浏览器测试中的站点夹具，实际运行用 macOS WebKit。输出目录请使用新路径。
 
 ```sh
 python3 tests/native_desktop_acceptance.py --app "desktop/build/AI Arena.app" --out /tmp/arena-native-full
 python3 tests/native_desktop_acceptance.py --app "desktop/build/AI Arena.app" --out /tmp/arena-native-takeover --takeover
+python3 tests/native_resume_acceptance.py --app "desktop/build/AI Arena.app" --out /tmp/arena-native-resume
 ```
 
-两条命令都会从指定的应用包复制出 AI Arena QA，使用独立的应用标识、WebKit 资料和临时讨论目录访问回环测试页。测试会核对同版投票、重启后的 Cookie 和 Markdown 导出，第二条还覆盖人工接管。如需专门核对中途重启，运行 `python3 tests/native_resume_acceptance.py --app "desktop/build/AI Arena.app" --out /tmp/arena-native-resume`。该用例从两席已答、第三席待发的记录继续，核对已有回答没有重复发送。真实账号验收使用定稿的同一份正式构建。
+这些命令会从指定的应用包复制出 AI Arena QA，使用独立的应用标识、WebKit 资料和临时讨论目录访问回环测试页。三条命令依次覆盖完整讨论与导出、单席接管、中途重启。重启用例从两席已答、第三席待发的记录继续，核对已答席位的重复发送次数。
 
 ## 运行时和钥匙串
 

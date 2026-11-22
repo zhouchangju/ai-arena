@@ -1,31 +1,48 @@
 # AI Arena
 
-一个给自己用的多 AI 辩论工作台。输入一次问题，选择已经在用的网页版 AI，由它们独立作答、交换材料、互相质疑、起草和修订候选结论，再分别确认同一版本。工作台提供中文界面、编排轮次、传递原文，并按实际表态生成带出处的报告。问题的实质判断由参与讨论的模型形成。
+AI Arena 是一个 **macOS 原生多模型讨论工作台**。输入一次问题，让 ChatGPT、Gemini 和 DeepSeek 在同一个窗口里独立作答、互相质询，再对同一版候选结论逐席表态。
 
-**macOS 原生版**使用 SwiftUI 和系统 WebKit，在一个窗口内显示各站真实网页，可直接运行本机构建的应用。 [桌面版使用与构建](desktop/README.md)
+![报告窗口展示候选建议、发言出处和三席表态](docs/evidence/native-0.4/report.png)
 
-## Chrome 扩展包含什么
+## 主要功能
 
-- `extension/` 是可加载的 Manifest V3 扩展，不需要安装、构建或打包：Chrome 开发者模式直接加载这个目录（含 `manifest.json` 的那一层）。
-- 首页先写问题、再选两席或三席、点「开始讨论」；会记住上一次实际开场的组合。闭环为独立作答 → 交叉质询 → 候选结论（须带 `[S#]` 出处）→ 逐席确认 → 本地报告。
-- ChatGPT、Gemini、DeepSeek 在获得所选站点权限后，点「开始讨论」直接打开各席原页并发送。工作台逐席显示发送、生成中的网页正文与完成状态，可打开原页或手动接管。
-- Claude、豆包、Kimi、通义千问、腾讯元宝、Grok 使用手动中转。手动席可一键「复制提示并打开原页」，在原站发送，再回工作台「粘贴回答」并提交。
-- 本机 A / B 两席在「连接设置」打开的「网页连接」页保存回环地址与选择器后，可在场次页点「开始自动化」。用本地确定性夹具验证了全程七次提交，包含两席各自独立作答与质询、一方起草候选以及两席分别表态。
-- 记录保存在扩展本机 IndexedDB：可暂停/继续、关闭后从「我的讨论」重开（窄屏收进「历史」抽屉）、导出 Markdown、删除单场；暂停时可补充判断条件并保存（只用于之后新建的任务），不依赖云服务。
-- 权限说明：工作台按自身扩展页地址查找已开的工作台，并用绑定标签的目标地址判断某席原页是否可复用。读取受控网页内容还需用户单独授予回环站点访问权限。
+- **两席或三席讨论**。各席使用独立的原站网页。工作台安排独立作答、互评、候选起草和逐席确认。
+- **支持单席接管**。遇到登录、限流或网页变动，可以核对本轮提示、补录已有回答，或跳过这一席。
+- **结论可追溯**。报告先显示候选与各席态度，再提供反例、未决分歧和发言出处。全体一致需要各席明确接受同一版本。
+- **本机历史和导出**。可恢复已有讨论，复制报告或导出 Markdown。
 
-目标与分工见 [AGENTS.md](AGENTS.md)；双席和三席都对应 G1–G4。
+[查看讨论界面（本地测试样例）](docs/evidence/native-0.3/discussion.png)
 
-## 先看
+## 从源码运行
 
-试用指引包含扩展加载、三站自动收发、手动中转、逐席确认、引用跳转和导出。 [试用指引](docs/try-it.md)
+需要 macOS 13 或更新版本、Apple Swift 工具链（Xcode 或 Command Line Tools）和 Node.js。现有实测使用 Apple Silicon。
 
-## 项目文档
+```sh
+git clone https://github.com/zhouchangju/ai-arena.git
+cd ai-arena
+./desktop/build.sh
+open "desktop/build/AI Arena.app"
+```
 
-- **先看自用版**　[产品需求与验收](docs/product-design.md) · [技术方案与开发顺序](docs/technical-design.md)。验收关注材料流转准确、发言和分歧容易查阅、中断后能恢复，以及报告忠实呈现候选版本和逐席表态。
-- **核对参照版**　[两库源码分析](docs/reference-review.md) · [Arena 的 33 项功能](docs/arena-features.md) · [Panelize 的 23 项功能](docs/panelize-features.md)。逐项列出原有行为、参照版复核、自用版取舍和验证方法。
-- **检查遗漏与兼容性**　[源码覆盖对账](docs/source-coverage.md) · [两库 14 个站点入口的验证表](docs/provider-validation.md)。可从源码入口反查需求，再按站点登记真实浏览器结果。
+首次打开后，在应用内按站点提示登录。选两席或三席，输入问题，点「开始讨论」。完成后从「详情」查看原文和报告，或用「导出」保存为 Markdown。 [试用指引](docs/try-it.md)
 
-## 边界
+各站点自行渲染网页，登录和自动收发受账号状态、站点页面及使用条款影响。参与席会收到题面，互评和确认时还会收到相关席位的发言和候选正文。讨论记录默认保存在 `~/Library/Application Support/AI Arena/`，网页账号由应用的 WebKit 数据存储维护。 [站点验证](docs/provider-validation.md)
 
-各站的自动收发、完成识别和接管结果见迭代记录。已有六题对比样本可供自愿回看，试用验收以工作台表现为准。 [迭代与验证记录](docs/iterations.md)
+## 文档
+
+| 内容 | 入口 |
+| --- | --- |
+| 构建、签名、故障处理和验收命令 | [桌面版开发与排障](desktop/README.md) |
+| 产品范围与工程实现 | [产品设计](docs/product-design.md) · [技术设计](docs/technical-design.md) |
+| 真实站点与本地回归记录 | [迭代记录](docs/iterations.md) |
+| Arena 与 Panelize 的早期调研 | [参考项目分析](docs/reference-review.md) |
+
+## 开发与反馈
+
+`desktop/` 包含 SwiftUI、WebKit 和构建入口。`extension/` 保留早期 Chrome 扩展，桌面构建从这里打包共享的讨论引擎和站点驱动。`tests/` 包含引擎测试及桌面版隔离验收。 [开发约定](AGENTS.md)
+
+反馈站点问题时，请附上应用版本、macOS 版本、站点、界面语言和复现步骤。使用合成题面，移除账号信息、私有对话和登录凭据。 [GitHub Issues](https://github.com/zhouchangju/ai-arena/issues)
+
+## 许可
+
+本仓库目前尚未声明项目级许可证。 [扩展内第三方品牌素材说明](extension/assets/providers/NOTICE.md)
