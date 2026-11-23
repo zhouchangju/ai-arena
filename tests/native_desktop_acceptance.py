@@ -52,6 +52,11 @@ def main():
             page = markup(PROVIDERS.index(seat)).decode()
             page = page.replace("row.text+=tail;", "if(stage==='vote')row.text+=' 上轮示例：立场：反对。';row.text+=tail;")
             if args.evaluation:
+                if seat == "chatgpt":
+                    page = page.replace(
+                        "</script>",
+                        "editor.remove();send.remove();setTimeout(()=>document.body.append(editor,send),2400);</script>",
+                    )
                 page = page.replace(
                     "const seq=window.turns.length;",
                     r"""const seq=window.turns.length;

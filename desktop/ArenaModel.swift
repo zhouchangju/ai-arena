@@ -369,6 +369,13 @@ final class ArenaModel: ObservableObject {
     @Published private(set) var isRecovering: Bool = false
     @Published private(set) var recoveryNotice: String = ""
     @Published private(set) var evaluatingSessionID: String?
+    @Published private(set) var evaluationPage: EvaluationPage?
+
+    struct EvaluationPage: Identifiable {
+        let id = UUID()
+        let sessionID: String
+        let pane: SitePane
+    }
 
     /// True only when this launch used `--continue-saved-discussion <id>` and
     /// the saved discussion passed every safety check, so the dispatcher was
@@ -3322,10 +3329,15 @@ final class ArenaModel: ObservableObject {
         let pane = makePane(for: "chatgpt")
         pane.webView.frame = CGRect(x: 0, y: 0, width: 1040, height: 740)
         pane.isAutomaticWorkActive = { true }
-        defer { pane.webView.stopLoading() }
+        evaluationPage = EvaluationPage(sessionID: sessionID, pane: pane)
+        defer { pane.isAutomaticWorkActive = nil }
         pane.openHome()
 
         let taskID = "evaluation-\(draft.id.uuidString):r1:independent:chatgpt"
+        var probe = engine.driverMessage(kind: "probe", taskID: taskID, prompt: nil, config: config)
+        if !names.isEmpty { probe["imageNames"] = names }
+        try await waitForEvaluationComposer(pane, probe: probe, sessionID: sessionID)
+
         var send = engine.driverMessage(kind: "submit", taskID: taskID, prompt: prompt, config: config)
         send["freshConversationOnly"] = true
         var read = engine.driverMessage(kind: "read", taskID: taskID, prompt: nil,
@@ -3386,6 +3398,7 @@ final class ArenaModel: ObservableObject {
                 }
                 guard let saved else { throw EvaluationInputError("裁判没有返回可保存的对阵") }
                 try saveEvaluation(saved, sessionID: sessionID)
+                evaluationPage = nil
                 return saved
             }
             if response.arenaString("status") == "error", let error = response.arenaString("error") {
@@ -3394,6 +3407,41 @@ final class ArenaModel: ObservableObject {
             try await Task.sleep(nanoseconds: 1_000_000_000)
         }
         throw EvaluationInputError("等待裁判回复超时。本次未重发，你可以在 ChatGPT 网页核对原会话。")
+    }
+
+    /// A navigation can finish before ChatGPT mounts its editor and upload picker.
+    /// Only the read-only probe is repeated. Dispatch still has one submit attempt.
+    private func waitForEvaluationComposer(_ pane: SitePane, probe: [String: Any], sessionID: String) async throws {
+        let timeout = engine.fixtureBase == nil ? Self.realProbeWindowSeconds : Self.fixtureProbeWindowSeconds
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            try Task.checkCancellation()
+            guard session?.arenaString("id") == sessionID else { throw EvaluationInputError("场次已切换") }
+            let code: String
+            let control: String?
+            do {
+                let result = try await pane.command(probe)
+                if result.arenaString("status") == "ready" { return }
+                code = result.arenaString("error") ?? "unknown"
+                control = (result["detail"] as? [String: Any])?.arenaString("which")
+            } catch let error as SitePaneError {
+                code = error.code
+                control = nil
+            }
+            if let url = pane.currentURL, SitePane.isAuthenticationPath(url) {
+                throw EvaluationInputError("ChatGPT 裁判页需要登录。请打开裁判原页完成登录后重试。")
+            }
+            let transient = Self.isTransientProbeFailure(code) || code == "selector-hidden"
+            if transient, Date() < deadline {
+                try await Task.sleep(nanoseconds: 600_000_000)
+                continue
+            }
+            if control == "input" || control == "attachment-picker" {
+                let name = control == "input" ? "输入框" : "图片上传控件"
+                throw EvaluationInputError("ChatGPT 裁判页没有就绪的\(name)。评估未发送，请查看裁判原页。")
+            }
+            throw EvaluationInputError("评估未发送：\(Self.friendly(errorCode: code))。请查看裁判原页。")
+        }
     }
 
     func reviewMaterials() -> [String: [[String: String]]] {

@@ -9,6 +9,7 @@ struct ArenaEvaluationSection: View {
     @State private var saved: ArenaEvaluation?
     @State private var error: String?
     @State private var loaded = false
+    @State private var inspectedPage: ArenaModel.EvaluationPage?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
@@ -39,6 +40,10 @@ struct ArenaEvaluationSection: View {
             if let error {
                 Text(verbatim: error).foregroundStyle(.red)
             }
+            if let page = model.evaluationPage, page.sessionID == sessionID {
+                Button("查看裁判原页") { inspectedPage = page }
+                    .buttonStyle(.link)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .task(id: sessionID) {
@@ -53,6 +58,18 @@ struct ArenaEvaluationSection: View {
             if active == nil, let latest = try? model.evaluation(sessionID: sessionID) {
                 saved = latest
             }
+        }
+        .sheet(item: $inspectedPage) { page in
+            VStack(alignment: .leading, spacing: 0) {
+                HStack {
+                    Text("ChatGPT 裁判原页").font(.headline)
+                    Spacer()
+                    Button("关闭") { inspectedPage = nil }.keyboardShortcut(.cancelAction)
+                }
+                .padding(12)
+                SitePaneView(pane: page.pane)
+            }
+            .frame(minWidth: 580, idealWidth: 780, minHeight: 430, idealHeight: 560)
         }
     }
 
