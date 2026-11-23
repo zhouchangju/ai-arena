@@ -252,6 +252,10 @@ struct ArenaHistorySummary: Identifiable {
     let stopReason: String?
     let hasReport: Bool
     let paused: Bool
+    /// Seats actually saved in the session document, in participant order.
+    /// Derived locally so history search can match a seat without opening a
+    /// page or building an index.
+    let providers: [String]
 
     var isFinished: Bool { stage == "done" }
 }
@@ -388,8 +392,15 @@ final class ArenaSessionStore {
 
     /// Atomic save; returns a human-readable error instead of throwing so the
     /// model can pause dispatch without losing the in-memory session.
+    ///
+    /// `updateCurrent` is false for an incremental write to the session that is
+    /// already the pinned current one (a user condition added mid-discussion).
+    /// Then the scene file is replaced in one atomic write and `current.json`
+    /// is left untouched, so a pointer-only failure can never make a committed
+    /// note look unsaved (or vice versa). Every other caller keeps the default
+    /// and still writes both files.
     @discardableResult
-    func save(_ file: ArenaSessionFile) -> String? {
+    func save(_ file: ArenaSessionFile, updateCurrent: Bool = true) -> String? {
         guard let url = fileURL(for: file.id) else {
             return "场次编号无效，无法保存"
         }
@@ -399,6 +410,7 @@ final class ArenaSessionStore {
         } catch {
             return "本地保存失败：\(error.localizedDescription)"
         }
+        guard updateCurrent else { return nil }
         do {
             let data = try encoder.encode(CurrentPointer(id: file.id))
             try data.write(to: currentURL, options: .atomic)
@@ -477,7 +489,8 @@ final class ArenaSessionStore {
                     round: session?.arenaInt("round") ?? 1,
                     stopReason: session?.arenaString("stopReason"),
                     hasReport: session?.arenaString("report")?.isEmpty == false,
-                    paused: session?.arenaBool("paused") ?? false
+                    paused: session?.arenaBool("paused") ?? false,
+                    providers: session?.arenaStringArray("providers") ?? []
                 )
             )
         }

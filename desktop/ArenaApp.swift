@@ -349,8 +349,16 @@ struct ArenaRootView: View {
     @State private var questionFocused = false
     @State private var questionFocusRequest = 0
     @State private var previewAttachment: ArenaDraftAttachment?
+    @State private var guidanceTarget: ArenaGuidanceTarget?
+    @State private var showsHistorySearch = false
+    @State private var pendingHistoryAction: HistoryAction?
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private enum HistoryAction {
+        case view(String)
+        case resume(String)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -419,9 +427,27 @@ struct ArenaRootView: View {
                 )
             }
         }
+        .sheet(isPresented: $showsHistorySearch, onDismiss: runPendingHistoryAction) {
+            ArenaHistorySearchView(
+                model: model,
+                isRunning: isRunning,
+                onView: { id in
+                    pendingHistoryAction = .view(id)
+                    showsHistorySearch = false
+                },
+                onResume: { id in
+                    pendingHistoryAction = .resume(id)
+                    showsHistorySearch = false
+                },
+                onClose: { showsHistorySearch = false }
+            )
+        }
+        .sheet(item: $guidanceTarget) { target in
+            ArenaGuidanceComposer(model: model, target: target) {
+                guidanceTarget = nil
+            }
+        }
     }
-
-    // MARK: 顶部工作台（系统玻璃质感；开始前大输入框，开始后只读题面）
 
     private var header: some View {
         VStack(alignment: .leading, spacing: hasStarted ? 9 : 11) {
@@ -542,6 +568,14 @@ struct ArenaRootView: View {
 
     private func historyMenu(compact: Bool) -> some View {
         Menu {
+            Button {
+                showsHistorySearch = true
+            } label: {
+                Label("搜索历史…", systemImage: "magnifyingglass")
+            }
+            .keyboardShortcut("f", modifiers: [.command, .shift])
+            .help("按题面、席位或结果搜索本机保存的场次")
+            Divider()
             if model.historyList.isEmpty {
                 Button("暂无历史") {}.disabled(true)
             } else {
@@ -603,22 +637,7 @@ struct ArenaRootView: View {
     }
 
     private func historyOutcome(_ item: ArenaHistorySummary) -> String {
-        if !item.isFinished {
-            return item.paused ? "未完成 · 已暂停" : "未完成 · 可继续"
-        }
-        switch item.stopReason {
-        case "consensus": return "全体一致"
-        case "conditional-agreement": return "有条件一致"
-        case "unresolved-opposition": return "仍有反对"
-        case "partial-votes": return "部分表态"
-        case "partial-participation": return "参与不足"
-        case "no-cross-review": return "互评缺失"
-        case "proposal-skipped": return "未形成候选"
-        case "draft": return "候选草稿"
-        case "user-finished": return "提前结束"
-        case "no-answers": return "无有效回答"
-        default: return "已结束"
-        }
+        ArenaHistoryOutcome.label(for: item)
     }
 
     private static let historyDateFormatter: DateFormatter = {
@@ -937,6 +956,12 @@ struct ArenaRootView: View {
             )
             .disabled(!isRunning)
             .help(isPaused ? "继续派发后续轮次" : "暂停后续派发，保留当前进度")
+            if guidanceAvailable {
+                toolButton("补充条件", icon: "text.badge.plus", large: true) {
+                    openGuidanceComposer()
+                }
+                .help("先暂停讨论，再把条件写入之后新建的提示；不会改写或重发已发出的任务")
+            }
             toolButton("结束", icon: "stop.fill", large: true) {
                 confirmation = .finish
             }
@@ -986,6 +1011,9 @@ struct ArenaRootView: View {
                 }
                 if stagePausedSuffix {
                     Text(" · 已暂停")
+                }
+                if model.guidanceCount > 0 {
+                    Text(" · 条件 \(model.guidanceCount)")
                 }
             }
             .font(.system(size: 12, weight: .medium))
@@ -1285,6 +1313,33 @@ struct ArenaRootView: View {
 
     private var isPaused: Bool {
         (model.session?["paused"] as? Bool) ?? false
+    }
+
+    private var guidanceAvailable: Bool {
+        if case .available = model.guidanceAvailability { return true }
+        return false
+    }
+
+    /// Pause first through the model's single pause path, then open the editor
+    /// for the pinned live phase. Nothing is resumed automatically, here or on
+    /// save; the user must press 「继续」.
+    private func openGuidanceComposer() {
+        guard let target = model.beginGuidance() else { return }
+        guidanceTarget = target
+    }
+
+    /// Run the history action only after the search sheet finished dismissing,
+    /// so a confirmation alert is never presented on top of a live sheet.
+    private func runPendingHistoryAction() {
+        guard let action = pendingHistoryAction else { return }
+        pendingHistoryAction = nil
+        switch action {
+        case .view(let id):
+            if isRunning { confirmation = .openHistory(id) }
+            else { openHistory(id) }
+        case .resume(let id):
+            confirmation = .continueHistory(id)
+        }
     }
 
     private var canStart: Bool {
@@ -2493,6 +2548,9 @@ struct ArenaDetailsWindowView: View {
                     copyLabel: "复制问题"
                 )
                 ArenaSavedMaterials(model: model)
+                if !model.savedGuidance.isEmpty {
+                    ArenaSavedConditionsCard(notes: model.savedGuidance)
+                }
 
                 VStack(alignment: .leading, spacing: 10) {
                     providerPickerRow

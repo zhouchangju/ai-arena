@@ -633,18 +633,28 @@ final class ArenaModel: ObservableObject {
             errorMessage = "历史回看为只读；新建讨论后才能继续"
             return
         }
-        let nextPaused = !isPaused
+        _ = setPaused(!isPaused)
+    }
+
+    /// The one pause/resume path. Both the toolbar button and the guidance
+    /// affordance go through it, so pausing for a condition has exactly the
+    /// same effect as pausing manually and never resumes by itself.
+    @discardableResult
+    private func setPaused(_ paused: Bool) -> Bool {
+        guard let session else { return false }
+        guard session.arenaString("stage") != "done" else { return false }
+        guard !isReadOnly else { return false }
         do {
             self.session = try engine.apply(
                 session: session,
-                action: nextPaused ? "pause" : "resume",
+                action: paused ? "pause" : "resume",
                 payload: [:]
             )
         } catch {
-            errorMessage = "无法\(nextPaused ? "暂停" : "继续")：\(error.localizedDescription)"
-            return
+            errorMessage = "无法\(paused ? "暂停" : "继续")：\(error.localizedDescription)"
+            return false
         }
-        isPaused = self.session?.arenaBool("paused") ?? nextPaused
+        isPaused = self.session?.arenaBool("paused") ?? paused
         if isPaused {
             // A paused discussion must never start a receipt animation. Clearing
             // only the transient receipt token is enough; the seat state itself
@@ -671,6 +681,144 @@ final class ArenaModel: ObservableObject {
                 setState(provider, .sending, "继续…")
             }
         }
+        return true
+    }
+
+    // MARK: - User conditions during a discussion
+
+    /// Only a live, eligible independent/critique phase exposes the affordance.
+    var guidanceAvailability: ArenaGuidanceAvailability {
+        ArenaGuidanceRules.availability(
+            stage: stageKey,
+            sessionID: session?.arenaString("id"),
+            readOnly: isReadOnly,
+            paused: isPaused
+        )
+    }
+
+    /// Conditions already recorded in the current (possibly historical)
+    /// session. Read-only history shows them without offering an editor.
+    var savedGuidance: [ArenaGuidanceNote] {
+        ArenaGuidanceRules.notes(from: session)
+    }
+
+    var guidanceCount: Int { savedGuidance.count }
+
+    /// The live phase a condition may attach to, pinned at the moment the
+    /// composer opens. `nil` when no live eligible discussion exists.
+    func guidanceTarget() -> ArenaGuidanceTarget? {
+        if case .hidden = guidanceAvailability { return nil }
+        guard let id = session?.arenaString("id"), !id.isEmpty else { return nil }
+        return ArenaGuidanceTarget(sessionID: id, stage: stageKey, round: currentRound)
+    }
+
+    /// The guidance entry point: pause first (through the normal pause path),
+    /// then hand back the pinned phase. Saving a condition never resumes the
+    /// discussion and never dispatches an already-issued task.
+    func beginGuidance() -> ArenaGuidanceTarget? {
+        guard let target = guidanceTarget() else {
+            errorMessage = readOnlyGuidanceMessage
+            return nil
+        }
+        guard !isPaused else { return target }
+        guard setPaused(true) else { return nil }
+        // The pause action cannot move the stage, but re-pin from the live
+        // session so the composer can never save into a stale phase.
+        guard let pinned = guidanceTarget(), pinned == target else {
+            errorMessage = "讨论阶段已变化，请重新打开补充条件"
+            return nil
+        }
+        return pinned
+    }
+
+    /// `true` when the pinned phase is still the live, paused, same session /
+    /// stage / round. The composer disables saving the moment this goes false.
+    func guidancePhaseMatches(_ target: ArenaGuidanceTarget) -> Bool {
+        ArenaGuidanceRules.accepts(
+            target: target,
+            sessionID: session?.arenaString("id"),
+            stage: stageKey,
+            round: currentRound,
+            paused: isPaused,
+            readOnly: isReadOnly
+        )
+    }
+
+    /// Record one condition. Refuses unless the discussion is still the pinned
+    /// live session, the same stage/round and paused. The session is written
+    /// atomically; a durable-save failure rolls the in-memory session back so
+    /// the composer can keep the draft and retry.
+    func saveGuidance(_ text: String, target: ArenaGuidanceTarget) -> ArenaGuidanceSaveOutcome {
+        guard let previous = session else {
+            return .rejected("没有正在进行的讨论")
+        }
+        guard ArenaGuidanceRules.accepts(
+            target: target,
+            sessionID: previous.arenaString("id"),
+            stage: stageKey,
+            round: currentRound,
+            paused: isPaused,
+            readOnly: isReadOnly
+        ) else {
+            return .rejected("讨论阶段或暂停状态已变化，条件未保存；草稿已保留。")
+        }
+        // Guidance writes only the pinned live scene file; require the pointer
+        // to already be this exact session so no partial-write risk remains.
+        guard previous.arenaString("id") == currentID else {
+            return .rejected("本地当前场次尚未同步，条件未保存；请稍后重试，草稿已保留。")
+        }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return .rejected("请先写一条条件")
+        }
+        guard trimmed.utf16.count <= ArenaGuidanceRules.maxTextLength else {
+            return .rejected("条件最多 \(ArenaGuidanceRules.maxTextLength) 个字符（与网页计数一致）；草稿已保留。")
+        }
+        let previousNotes = ArenaGuidanceRules.notes(from: previous)
+        let lastSeq = previousNotes.map(\.seq).max() ?? 0
+        let next: [String: Any]
+        do {
+            next = try engine.apply(
+                session: previous,
+                action: "guide",
+                payload: ["text": trimmed]
+            )
+        } catch {
+            return .rejected("条件未保存：\(error.localizedDescription)")
+        }
+        // Validate the recorded note before touching the live session or the
+        // disk, so a committed write can never be reported as a rejection.
+        let notes = ArenaGuidanceRules.notes(from: next)
+        guard notes.count == previousNotes.count + 1,
+              let note = notes.last,
+              note.seq > lastSeq,
+              note.text == trimmed else {
+            return .rejected("条件没有写入本次讨论，未保存；草稿已保留。")
+        }
+        self.session = next
+        isPaused = next.arenaBool("paused") ?? true
+        refreshStage()
+        // The composer only saves into the pinned live session, so the scene
+        // file alone is written and the existing current pointer is untouched.
+        guard persist(updateCurrent: false) else {
+            // Durable save failed: restore the previous session so the UI and
+            // the next dispatch decision both see the last really-saved state.
+            self.session = previous
+            isPaused = previous.arenaBool("paused") ?? true
+            refreshStage()
+            return .rejected("条件未写入本地记录，已撤销；草稿已保留。")
+        }
+        return .saved(note)
+    }
+
+    private var readOnlyGuidanceMessage: String {
+        if isReadOnly {
+            return "历史回看为只读；新建讨论后才能补充条件"
+        }
+        if stageKey == "done" {
+            return "讨论已经结束，不能再补充条件"
+        }
+        return "只有独立作答或互评阶段可以补充条件"
     }
 
     /// Stop the discussion, keep every saved answer and produce the report.
@@ -3341,7 +3489,10 @@ final class ArenaModel: ObservableObject {
     /// storage failure). Callers that are about to send must treat `false` as
     /// "stop": an intent that is not durable cannot guard a later restart.
     @discardableResult
-    private func persist() -> Bool {
+    /// `updateCurrent` defaults to true; an incremental write to the already
+    /// pinned live session (a user condition) passes false so the scene file is
+    /// the only write and a pointer-only failure cannot produce a false failure.
+    private func persist(updateCurrent: Bool = true) -> Bool {
         guard !isReadOnly, let session else { return false }
         guard let id = session.arenaString("id"), !id.isEmpty else { return false }
         let sessionJSON: String
@@ -3382,7 +3533,7 @@ final class ArenaModel: ObservableObject {
             stopReason: session.arenaString("stopReason")
         )
 
-        if let failure = engine.store.save(file) {
+        if let failure = engine.store.save(file, updateCurrent: updateCurrent) {
             if !storageFailed {
                 storageFailed = true
                 errorMessage = failure + "；已暂停后续发送"
@@ -3596,13 +3747,23 @@ final class ArenaModel: ObservableObject {
         guard let history = session?["history"] as? [[String: Any]] else { return nil }
         // The per-turn prompts can contain the entire debate. Only ballot
         // metadata and candidate text are needed by the shared core filter.
-        let keys: Set<String> = ["id", "provider", "stage", "status", "version", "round", "proposalDigest", "stance"]
-        let materials = history.compactMap { row -> [String: Any]? in
-            let stage = row["stage"] as? String
-            guard stage == "proposal" || stage == "vote" else { return nil }
-            return row.filter { keys.contains($0.key) || (stage == "proposal" && $0.key == "answer") }
+        return try? engine.reportBallot(
+            history: ArenaBallotProjection.materials(history: history)
+        )
+    }
+
+    /// Same projection and return shape as `reportBallot()`, scoped to one
+    /// candidate version. `version`, the candidate text, its digest and only
+    /// the strictly verified votes for that exact text come from the shared
+    /// engine; prompts and other rounds never cross into JavaScript.
+    func reportBallot(forVersion version: Int) -> [String: Any]? {
+        guard let history = session?["history"] as? [[String: Any]] else { return nil }
+        guard ArenaBallotProjection.containsProposal(version: version, in: history) else {
+            return nil
         }
-        return try? engine.reportBallot(history: materials)
+        return try? engine.reportBallot(
+            history: ArenaBallotProjection.materials(history: history, version: version)
+        )
     }
 
     // MARK: - Restore
@@ -3803,6 +3964,12 @@ final class ArenaModel: ObservableObject {
 
     private func refreshHistoryList() {
         historyList = engine.store.summaries()
+    }
+
+    /// Re-read the saved summaries for the search sheet. Read-only: nothing is
+    /// opened, resumed or sent.
+    func reloadHistorySummaries() {
+        refreshHistoryList()
     }
 
     // MARK: Static helpers
