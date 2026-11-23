@@ -239,19 +239,9 @@ struct ArenaReportReader: View {
     }
 
     private func sourceReader(_ row: ArenaTaskRow) -> some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                Button { selectedSource = nil } label: { Label("返回报告", systemImage: "chevron.left") }
-                .buttonStyle(.link)
-                Text("\(ArenaSeatCatalog.name(row.provider)) · \(ArenaStageNames.label(row.stage))").font(.title.weight(.semibold))
-                Text([ArenaStageNames.taskLabel(row.stage, round: row.round, session: session), row.sourceId].joined(separator: " · ")).foregroundStyle(.secondary)
-                Divider()
-                ArenaMarkdownView(text: row.answer ?? "")
-            }
-            .frame(maxWidth: 720, alignment: .leading)
-            .padding(24)
-            .frame(maxWidth: .infinity)
-        }.id(row.id)
+        ArenaSourceReader(row: row, session: session, returnLabel: "返回报告") {
+            selectedSource = nil
+        }
     }
 
     private func markdown(_ text: String) -> some View {
@@ -265,6 +255,37 @@ struct ArenaReportReader: View {
     }
     private static func color(_ value: String?) -> Color {
         switch value { case "agree": return .green; case "conditional": return .orange; case "oppose": return .red; default: return .secondary }
+    }
+}
+
+/// The existing source-navigation surface, reused by the report and by the
+/// history tab's review-material rows. `returnLabel` names the real way back.
+struct ArenaSourceReader: View {
+    let row: ArenaTaskRow
+    let session: [String: Any]?
+    let returnLabel: String
+    let onReturn: () -> Void
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                Button(action: onReturn) {
+                    Label(returnLabel, systemImage: "chevron.left")
+                }
+                .buttonStyle(.link)
+                Text("\(ArenaSeatCatalog.name(row.provider)) · \(ArenaStageNames.label(row.stage))")
+                    .font(.title.weight(.semibold))
+                Text([ArenaStageNames.taskLabel(row.stage, round: row.round, session: session), row.sourceId]
+                    .joined(separator: " · "))
+                    .foregroundStyle(.secondary)
+                Divider()
+                ArenaMarkdownView(text: row.answer ?? "")
+            }
+            .frame(maxWidth: 720, alignment: .leading)
+            .padding(24)
+            .frame(maxWidth: .infinity)
+        }
+        .id(row.id)
     }
 }
 /// Extracts the actual opening answer for the compact reading view. Subsequent

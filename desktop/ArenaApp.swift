@@ -969,15 +969,34 @@ struct ArenaRootView: View {
                     .frame(width: 8, height: 8)
                     .shadow(color: isRunning ? Color.green.opacity(0.6) : .clear, radius: 3)
             }
-            Text(stageText)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(isPaused && isRunning ? Color.orange : Color.secondary)
-                .lineLimit(1)
+            HStack(spacing: 0) {
+                Text(stageHeadline)
+                if let progress = stageAnswerProgress {
+                    Text(" · ")
+                    ArenaStageAnswerCount(
+                        answered: progress.answered,
+                        total: progress.total,
+                        liveRevision: model.liveAnswerRevision,
+                        reduceMotion: reduceMotion
+                    )
+                    .id(stageProgressIdentity)
+                }
+                if let seat = stageWaitingSeat {
+                    Text(" · 等待 \(seat)")
+                }
+                if stagePausedSuffix {
+                    Text(" · 已暂停")
+                }
+            }
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(isPaused && isRunning ? Color.orange : Color.secondary)
+            .lineLimit(1)
         }
         .padding(.horizontal, 10)
         .frame(minHeight: 26)
         .background(Capsule().fill(Color.primary.opacity(0.055)))
         .fixedSize()
+        .accessibilityElement(children: .combine)
     }
 
     private func errorBanner(_ message: String) -> some View {
@@ -1119,6 +1138,8 @@ struct ArenaRootView: View {
                 isParticipant: isParticipant(provider),
                 hasStarted: hasStarted,
                 controls: model.controls(for: provider),
+                receiptSignal: model.seatReceiptSignals[provider],
+                savedAnswerSignal: liveSavedAnswerSignal(for: provider),
                 onPrompt: { presentDetails(provider: provider, tab: .prompts) },
                 onTakeOver: { model.takeOver(provider) },
                 onResume: { model.resumeSeat(provider) },
@@ -1255,23 +1276,45 @@ struct ArenaRootView: View {
             && !isRunning
     }
 
-    private var stageText: String {
+    private var stageHeadline: String {
         guard let session = model.session else {
             return hasStarted ? "准备中" : "未开始"
         }
-        let stage = (session["stage"] as? String) ?? ""
-        let paused = (session["paused"] as? Bool) ?? false
-        var text = ArenaStageNames.discussionLabel(session)
-        if let tasks = session["tasks"] as? [[String: Any]], !tasks.isEmpty, stage != "done" {
-            let answered = tasks.filter { ($0["status"] as? String) == "answered" }.count
-            text += " · 已收到 " + String(answered) + "/" + String(tasks.count)
-            let pending = tasks.filter { ($0["status"] as? String) == "pending" }
-            if pending.count == 1, let seat = pending[0]["provider"] as? String {
-                text += " · 等待 " + ArenaSeatCatalog.name(seat)
-            }
-        }
-        if paused { text += " · 已暂停" }
-        return text
+        return ArenaStageNames.discussionLabel(session)
+    }
+
+    /// The real per-stage count from the saved/current task list. It is shown
+    /// as its own text so only this number changes, in place, when a live answer
+    /// is saved.
+    private var stageAnswerProgress: (answered: Int, total: Int)? {
+        guard let session = model.session,
+              let tasks = session["tasks"] as? [[String: Any]], !tasks.isEmpty,
+              (session["stage"] as? String) != "done" else { return nil }
+        let answered = tasks.filter { ($0["status"] as? String) == "answered" }.count
+        return (answered, tasks.count)
+    }
+
+    private var stageWaitingSeat: String? {
+        guard let session = model.session,
+              (session["stage"] as? String) != "done",
+              let tasks = session["tasks"] as? [[String: Any]] else { return nil }
+        let pending = tasks.filter { ($0["status"] as? String) == "pending" }
+        guard pending.count == 1, let seat = pending[0]["provider"] as? String else { return nil }
+        return ArenaSeatCatalog.name(seat)
+    }
+
+    private var stagePausedSuffix: Bool {
+        (model.session?["paused"] as? Bool) ?? false
+    }
+
+    /// A new session, stage or round is a new count surface. Giving the number
+    /// view that identity prevents the last answer of one stage from rolling
+    /// the next stage's restored 0.
+    private var stageProgressIdentity: String {
+        let sessionID = ArenaSessionDigest.id(model.session) ?? ""
+        let stage = (model.session?["stage"] as? String) ?? ""
+        let round = ArenaValue.int(model.session?["round"]) ?? 0
+        return "\(sessionID)|\(stage)|\(round)"
     }
 
     private var gridProviders: [String] {
@@ -1284,6 +1327,22 @@ struct ArenaRootView: View {
     private func isParticipant(_ provider: String) -> Bool {
         guard let providers = model.session?["providers"] as? [String] else { return true }
         return providers.contains(provider)
+    }
+
+    /// A live saved-answer token only describes the current answered task. When
+    /// the stage or round moves on, the token is no longer shown, while history
+    /// (whose tokens are cleared) keeps its static appearance.
+    private func liveSavedAnswerSignal(for provider: String) -> ArenaSeatLiveSignal? {
+        guard let signal = model.seatAnswerSignals[provider],
+              signal.kind == .answerSaved,
+              let tasks = model.session?["tasks"] as? [[String: Any]] else { return nil }
+        let matchesCurrentTask = tasks.contains { task in
+            task.arenaString("id") == signal.taskID
+                && task.arenaString("provider") == provider
+                && task.arenaString("status") == "answered"
+                && task.arenaString("answer")?.trimmedNonEmpty != nil
+        }
+        return matchesCurrentTask ? signal : nil
     }
 
     /// The badge always comes from a structured seat state: the live model
@@ -1309,6 +1368,8 @@ struct ArenaSeatCard: View {
     let isParticipant: Bool
     let hasStarted: Bool
     let controls: ArenaSeatControls
+    let receiptSignal: ArenaSeatLiveSignal?
+    let savedAnswerSignal: ArenaSeatLiveSignal?
 
     let onPrompt: () -> Void
     let onTakeOver: () -> Void
@@ -1318,16 +1379,29 @@ struct ArenaSeatCard: View {
     let skipTarget: ArenaManualTarget?
     let onSkip: (ArenaManualTarget) -> Void
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var confirmingSkip = false
     @State private var confirmedSkipTarget: ArenaManualTarget?
     @State private var confirmingReturn = false
     @State private var resumeAfterReturn = false
+    @State private var receiptPlaneVisible = false
+    @State private var receiptPlaneLaunched = false
+    @State private var receiptTask: Task<Void, Never>?
+    @State private var savedCheckScale: CGFloat = 1
+    @State private var savedCheckSettleTask: Task<Void, Never>?
 
     private var openError: String? {
         pane.lastError ?? pane.lastNavigationError
     }
 
     private var statusColor: Color { ArenaSeatStatus.color(status.kind) }
+
+    /// Persistent static saved mark for the current answered task. The parent
+    /// only forwards a token while its task is still the current answered one;
+    /// history clears tokens, so its static appearance is unchanged.
+    private var showsSavedCheck: Bool {
+        status.kind == .answered && savedAnswerSignal != nil
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1348,6 +1422,22 @@ struct ArenaSeatCard: View {
                         .padding(.vertical, 2)
                         .background(Capsule().fill(statusColor.opacity(0.12)))
                         .help(status.detail)
+                    Image(systemName: "paperplane.fill")
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundStyle(statusColor)
+                        .offset(x: receiptPlaneLaunched ? 0 : -4)
+                        .opacity(receiptPlaneVisible && status.kind == .generating && receiptPlaneLaunched ? 1 : 0)
+                        .frame(width: 14, height: 14)
+                        .accessibilityHidden(!(receiptPlaneVisible && status.kind == .generating && receiptPlaneLaunched))
+                        .accessibilityLabel("原页已核验本轮提问，等待回答")
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Color.green)
+                        .opacity(showsSavedCheck ? 1 : 0)
+                        .scaleEffect(savedCheckScale)
+                        .frame(width: 14, height: 14)
+                        .accessibilityHidden(!showsSavedCheck)
+                        .accessibilityLabel("回答已保存")
                     if !isParticipant && hasStarted {
                         Text("未参与")
                             .font(.system(size: 10.5))
@@ -1441,6 +1531,89 @@ struct ArenaSeatCard: View {
             Button("取消", role: .cancel) {}
         } message: {
             Text("跳过本席后，本轮该席计为缺席；晚到的回答也不会进入本轮。")
+        }
+        .onChange(of: receiptSignal?.id) { _ in
+            if receiptSignal == nil {
+                receiptTask?.cancel()
+                receiptTask = nil
+                receiptPlaneVisible = false
+                receiptPlaneLaunched = false
+            } else {
+                playReceiptPlane()
+            }
+        }
+        .onChange(of: savedAnswerSignal?.id) { _ in
+            if savedAnswerSignal != nil && status.kind == .answered {
+                settleSavedCheck()
+            } else {
+                savedCheckSettleTask?.cancel()
+                savedCheckSettleTask = nil
+                savedCheckScale = 1
+            }
+        }
+        .onChange(of: status.kind) { kind in
+            if kind != .generating {
+                receiptTask?.cancel()
+                receiptTask = nil
+                receiptPlaneVisible = false
+                receiptPlaneLaunched = false
+            }
+            if kind != .answered {
+                savedCheckSettleTask?.cancel()
+                savedCheckSettleTask = nil
+                savedCheckScale = 1
+            }
+        }
+        .onDisappear {
+            receiptTask?.cancel()
+            savedCheckSettleTask?.cancel()
+        }
+    }
+
+    /// One-shot paper-plane motion for this seat header only. It is triggered
+    /// exclusively by a live verified receipt signal, never by a click or a
+    /// restored task. Reduce Motion keeps the same readable icon without motion.
+    private func playReceiptPlane() {
+        receiptTask?.cancel()
+        receiptPlaneLaunched = false
+        receiptPlaneVisible = true
+        if !reduceMotion {
+            withAnimation(.easeOut(duration: 0.18)) { receiptPlaneLaunched = true }
+        } else {
+            receiptPlaneLaunched = true
+        }
+        receiptTask = Task { @MainActor in
+            let dwell: UInt64 = reduceMotion ? 900_000_000 : 700_000_000
+            try? await Task.sleep(nanoseconds: dwell)
+            guard !Task.isCancelled else { return }
+            if reduceMotion {
+                receiptPlaneVisible = false
+                receiptPlaneLaunched = false
+            } else {
+                withAnimation(.easeOut(duration: 0.18)) { receiptPlaneLaunched = false }
+                try? await Task.sleep(nanoseconds: 120_000_000)
+                guard !Task.isCancelled else { return }
+                receiptPlaneVisible = false
+            }
+        }
+    }
+
+    /// One brief settle for the persistent saved mark. The mark itself stays
+    /// statically visible while the answered badge refers to the same live task;
+    /// there is no disappear timer.
+    private func settleSavedCheck() {
+        savedCheckSettleTask?.cancel()
+        guard !reduceMotion else {
+            savedCheckScale = 1
+            return
+        }
+        savedCheckScale = 0.68
+        savedCheckSettleTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 20_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.2)) {
+                savedCheckScale = 1
+            }
         }
     }
 
@@ -1601,6 +1774,70 @@ fileprivate func arenaShorten(_ text: String, limit: Int) -> String {
     let flat = text.replacingOccurrences(of: "\n", with: " ")
     if flat.count <= limit { return flat }
     return String(flat.prefix(max(limit - 1, 1))) + "…"
+}
+
+// MARK: - 顶部阶段计数
+
+/// Shows the actual saved task count and rolls the digits only for a live saved
+/// answer. Stage restoration, history and pause update it without animation,
+/// and the monospaced digits keep the pill from shifting its neighbours.
+struct ArenaStageAnswerCount: View {
+    let answered: Int
+    let total: Int
+    let liveRevision: Int
+    let reduceMotion: Bool
+
+    @State private var displayedAnswered: Int
+    @State private var displayedTotal: Int
+    @State private var seenRevision: Int
+
+    init(answered: Int, total: Int, liveRevision: Int, reduceMotion: Bool) {
+        self.answered = answered
+        self.total = total
+        self.liveRevision = liveRevision
+        self.reduceMotion = reduceMotion
+        _displayedAnswered = State(initialValue: answered)
+        _displayedTotal = State(initialValue: total)
+        _seenRevision = State(initialValue: liveRevision)
+    }
+
+    private struct Snapshot: Equatable {
+        let answered: Int
+        let total: Int
+        let revision: Int
+    }
+
+    private var snapshot: Snapshot {
+        Snapshot(answered: answered, total: total, revision: liveRevision)
+    }
+
+    var body: some View {
+        Text("已收到 \(displayedAnswered)/\(displayedTotal)")
+            .monospacedDigit()
+            .contentTransition(.numericText())
+            .onChange(of: snapshot) { next in
+                let live = next.revision != seenRevision
+                seenRevision = next.revision
+
+                // A new round or stage changes the denominator. That is a
+                // restoration of the next stage's real count, not a live answer
+                // for the number already on screen, so it never rolls.
+                if next.total != displayedTotal {
+                    displayedTotal = next.total
+                    displayedAnswered = next.answered
+                    return
+                }
+                guard next.answered != displayedAnswered else { return }
+                if live && !reduceMotion {
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        displayedAnswered = next.answered
+                    }
+                } else {
+                    displayedAnswered = next.answered
+                }
+            }
+            .accessibilityLabel("本阶段已收到 \(displayedAnswered) / \(displayedTotal) 席回答")
+    }
 }
 
 // MARK: - 会话读取
@@ -2050,6 +2287,7 @@ struct ArenaDetailsWindowView: View {
     @ObservedObject var state: ArenaDetailsWindowState
     @ObservedObject var feedback: ArenaFeedbackPresenter
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @State private var selectedAnswerSource: ArenaTaskRow?
 
     private var session: [String: Any]? { model.session }
     private var report: String? { ArenaSessionDigest.report(session) }
@@ -2081,7 +2319,10 @@ struct ArenaDetailsWindowView: View {
                 .padding(.bottom, 18)
         }
         .onAppear { state.normalize(session: session) }
-        .onChange(of: sessionIdentity) { _ in state.normalize(session: session) }
+        .onChange(of: sessionIdentity) { _ in
+            selectedAnswerSource = nil
+            state.normalize(session: session)
+        }
     }
 
     // MARK: 顶部
@@ -2130,6 +2371,7 @@ struct ArenaDetailsWindowView: View {
             set: { value in
                 state.tab = value
                 state.showsRawRecord = false
+                selectedAnswerSource = nil
             }
         )
     }
@@ -2143,9 +2385,31 @@ struct ArenaDetailsWindowView: View {
         } else {
             switch state.tab {
             case .prompts: promptsView
-            case .answers: answersView
+            case .answers: answersContent
             case .report: reportView
             case .json: jsonView
+            }
+        }
+    }
+
+    /// The answers list stays mounted behind the source reader so returning
+    /// keeps its scroll position and each disclosure's expansion state. The
+    /// hidden list is removed from hit testing and accessibility.
+    private var answersContent: some View {
+        ZStack {
+            answersView
+                .opacity(selectedAnswerSource == nil ? 1 : 0)
+                .allowsHitTesting(selectedAnswerSource == nil)
+                .accessibilityHidden(selectedAnswerSource != nil)
+            if let source = selectedAnswerSource {
+                ArenaSourceReader(
+                    row: source,
+                    session: session,
+                    returnLabel: "返回历史原文"
+                ) {
+                    selectedAnswerSource = nil
+                }
+                .background(Color(nsColor: .textBackgroundColor))
             }
         }
     }
@@ -2317,7 +2581,8 @@ struct ArenaDetailsWindowView: View {
                             row: row,
                             session: model.session,
                             reviewMaterials: reviewMaterials[row.id],
-                            feedback: feedback
+                            feedback: feedback,
+                            onOpenSource: { selectedAnswerSource = $0 }
                         )
                     }
                 }
@@ -2392,25 +2657,35 @@ struct ArenaAnswerDisclosure: View {
     let session: [String: Any]?
     let reviewMaterials: [[String: String]]?
     let feedback: ArenaFeedbackPresenter
+    let onOpenSource: (ArenaTaskRow) -> Void
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isExpanded = false
+    @State private var highlightedMaterials: Set<Int> = []
+    @State private var highlightTask: Task<Void, Never>?
 
     private var reviewSummary: String {
         guard let reviewMaterials else { return "评审材料无法核对" }
         if reviewMaterials.isEmpty { return "无其他席位作答 · 自我反驳" }
         return reviewMaterials.compactMap { material -> String? in
-            guard let provider = material["provider"], let source = material["sourceId"] else { return nil }
-            let name = ArenaSeatCatalog.name(provider)
-            switch material["stage"] {
-            case "independent": return "\(name) 的作答（\(source)）"
-            case "proposal": return "\(name) 起草的候选（\(source)）"
-            case "vote": return "\(name) 的异议或条件（\(source)）"
-            default: return nil
-            }
+            guard let source = material["sourceId"] else { return nil }
+            return "\(materialTitle(material))（\(source)）"
         }.joined(separator: "、")
     }
 
     var body: some View {
-        DisclosureGroup {
+        DisclosureGroup(isExpanded: $isExpanded) {
             VStack(alignment: .leading, spacing: 10) {
+                if let materials = reviewMaterials, !materials.isEmpty {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("本席收到的材料 · 点一处打开原文")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                        ForEach(materials.indices, id: \.self) { index in
+                            materialRow(index: index, material: materials[index])
+                        }
+                    }
+                }
                 labeled("提示", text: row.prompt, dim: true)
                 labeled("原文", text: row.answer ?? "", dim: false)
             }
@@ -2455,6 +2730,115 @@ struct ArenaAnswerDisclosure: View {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .strokeBorder(Color.primary.opacity(0.09))
         )
+        .onChange(of: isExpanded) { expanded in
+            if expanded {
+                startMaterialHighlight()
+            } else {
+                highlightTask?.cancel()
+                highlightTask = nil
+                highlightedMaterials.removeAll()
+            }
+        }
+        .onDisappear {
+            highlightTask?.cancel()
+            highlightTask = nil
+            highlightedMaterials.removeAll()
+        }
+    }
+
+    private func materialTitle(_ material: [String: String]) -> String {
+        let name = material["provider"].map(ArenaSeatCatalog.name) ?? "其他席位"
+        switch material["stage"] {
+        case "independent": return "\(name) 的首轮作答"
+        case "proposal": return "\(name) 起草的候选"
+        case "vote": return "\(name) 的异议或条件"
+        default: return "\(name) 的材料"
+        }
+    }
+
+    private func materialSource(_ material: [String: String]) -> ArenaTaskRow? {
+        guard let sourceID = material["sourceId"], !sourceID.isEmpty,
+              let provider = material["provider"], !provider.isEmpty,
+              let stage = material["stage"], !stage.isEmpty else { return nil }
+        return ArenaSessionDigest.rows(session).first { candidate in
+            candidate.sourceId == sourceID
+                && candidate.provider == provider
+                && candidate.stage == stage
+                && candidate.status == "answered"
+                && candidate.answer?.trimmedNonEmpty != nil
+        }
+    }
+
+    private func materialRow(index: Int, material: [String: String]) -> some View {
+        let source = materialSource(material)
+        let highlighted = highlightedMaterials.contains(index)
+        let sourceID = material["sourceId"] ?? "出处未知"
+        return Button {
+            if let source { onOpenSource(source) }
+        } label: {
+            HStack(spacing: 7) {
+                Image(systemName: source == nil ? "doc.questionmark" : "arrow.up.forward.square")
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(source == nil ? Color.secondary : Color.accentColor)
+                Text(materialTitle(material))
+                    .font(.system(size: 12))
+                Text(sourceID)
+                    .font(.system(size: 10.5, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                Spacer(minLength: 6)
+                if source == nil {
+                    Text("原文不可用")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                } else {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9.5, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(highlighted ? Color.accentColor.opacity(0.16) : Color.primary.opacity(0.03))
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(source == nil)
+        .help(source == nil ? "这条材料的原文不在本场已保存记录中" : "打开这条材料的已保存原文")
+        .accessibilityLabel(
+            "\(materialTitle(material)) \(sourceID)"
+                + (source == nil ? "，原文不可用" : "，打开原文")
+        )
+    }
+
+    /// A one-shot domino highlight over the exact recipient's real input rows.
+    /// Reduce Motion lists the same rows immediately and skips the highlight
+    /// task and its delays entirely.
+    private func startMaterialHighlight() {
+        highlightTask?.cancel()
+        highlightTask = nil
+        highlightedMaterials.removeAll()
+        guard !reduceMotion else { return }
+        guard let count = reviewMaterials?.count, count > 0 else { return }
+        highlightTask = Task { @MainActor in
+            for index in 0..<count {
+                guard !Task.isCancelled else { return }
+                withAnimation(.easeOut(duration: 0.16)) {
+                    _ = highlightedMaterials.insert(index)
+                }
+                try? await Task.sleep(nanoseconds: 55_000_000)
+            }
+            guard !Task.isCancelled else { return }
+            try? await Task.sleep(nanoseconds: 420_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.22)) {
+                highlightedMaterials.removeAll()
+            }
+        }
     }
 
     private func labeled(_ title: String, text: String, dim: Bool) -> some View {

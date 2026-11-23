@@ -66,6 +66,27 @@ struct ArenaSeatState: Equatable {
     }
 }
 
+/// A one-shot, live-only UI signal for one seat and one task. It is deliberately
+/// in-memory: restoring a session, opening history or reconciling a task that
+/// may already have been sent never creates one. The UUID only gives SwiftUI a
+/// stable change token, so the same task cannot replay a microinteraction twice.
+struct ArenaSeatLiveSignal: Equatable {
+    enum Kind: String {
+        case receiptVerified
+        case answerSaved
+    }
+
+    let id: UUID
+    let taskID: String
+    let kind: Kind
+
+    init(taskID: String, kind: Kind) {
+        self.id = UUID()
+        self.taskID = taskID
+        self.kind = kind
+    }
+}
+
 /// Which per-seat actions the current state really allows.
 struct ArenaSeatControls: Equatable {
     var canTakeOver = false
@@ -339,6 +360,15 @@ final class ArenaModel: ObservableObject {
     /// from `kind` + `detail`; nothing is inferred from the wording.
     @Published private(set) var seatStates: [String: ArenaSeatState] = [:]
 
+    /// Live-only, one-shot signals for the seat header microinteractions.
+    /// Receipt only exists after WebKit verified this send's matching user turn;
+    /// answer only exists after the accepted answer was written to disk.
+    @Published private(set) var seatReceiptSignals: [String: ArenaSeatLiveSignal] = [:]
+    @Published private(set) var seatAnswerSignals: [String: ArenaSeatLiveSignal] = [:]
+    /// Monotonic counter for the top stage answer count. It advances only on a
+    /// live accepted-and-saved answer, so restoration never animates the count.
+    @Published private(set) var liveAnswerRevision = 0
+
     /// Compatibility text view of `seatStates` for the smoke diagnostics and
     /// existing fixtures. Always the exact `detail`, never a guessed label.
     var statuses: [String: String] {
@@ -594,6 +624,12 @@ final class ArenaModel: ObservableObject {
             return
         }
         isPaused = self.session?.arenaBool("paused") ?? nextPaused
+        if isPaused {
+            // A paused discussion must never start a receipt animation. Clearing
+            // only the transient receipt token is enough; the seat state itself
+            // still carries the truthful waiting/answered wording.
+            seatReceiptSignals.removeAll()
+        }
         refreshStage()
         persist()
 
@@ -886,13 +922,14 @@ final class ArenaModel: ObservableObject {
         previews[provider] = nil
         errorMessage = ""
         refreshStage()
-        persist()
+        let saved = persist()
         markIdleSeats()
         if let label = stanceLabelText {
             setState(provider, .answered, "已表态：\(label)")
         } else {
             setState(provider, .answered, "已提交回答")
         }
+        emitSavedAnswerSignal(provider: provider, taskID: taskID, saved: saved)
         return true
     }
 
@@ -1449,15 +1486,19 @@ final class ArenaModel: ObservableObject {
                 intent.submittedAt = Self.nowMillis()
                 intent.pageURL = pane.boundConversationURL?.absoluteString ?? intent.pageURL
                 intents[taskID] = intent
-                persist()
+                let receiptSaved = persist()
                 blockedTasks.remove(taskID)
+                if receiptSaved {
+                    emitReceiptSignal(provider: provider, taskID: taskID, turnVerified: turnVerified)
+                }
                 if status == "done",
                    let text = response.arenaString("text"),
                    !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     deliver(provider: provider, task: task, text: text)
                     return false
                 }
-                setState(provider, .generating, "已发送，等待回答…")
+                setState(provider, .generating,
+                         turnVerified ? "原页已核验本轮提问，等待回答…" : "已发送，等待回答…")
                 return true
             }
 
@@ -2726,7 +2767,8 @@ final class ArenaModel: ObservableObject {
             setState(provider, .answered, "已收到回答")
         }
         refreshStage()
-        persist()
+        let saved = persist()
+        emitSavedAnswerSignal(provider: provider, taskID: taskID, saved: saved)
         markIdleSeats()
     }
 
@@ -2740,6 +2782,7 @@ final class ArenaModel: ObservableObject {
         workers.removeAll()
         preClickStalls.removeAll()
         preClickReloadedTasks.removeAll()
+        clearLiveSignals()
     }
 
     private func waitWhilePaused(_ token: UUID) async -> Bool {
@@ -3130,6 +3173,29 @@ final class ArenaModel: ObservableObject {
               let current = pane.boundConversationURL, current != prior else { return }
         intents[taskID]?.pageURL = current.absoluteString
         persist()
+    }
+
+    private func emitReceiptSignal(provider: String, taskID: String, turnVerified: Bool) {
+        guard ArenaSeatMotionPolicy.shouldAnimateVerifiedReceipt(
+            turnVerified: turnVerified,
+            paused: isPaused,
+            readOnly: isReadOnly,
+            takenOver: manualProviders.contains(provider)
+        ) else { return }
+        seatReceiptSignals[provider] = ArenaSeatLiveSignal(taskID: taskID, kind: .receiptVerified)
+    }
+
+    private func emitSavedAnswerSignal(provider: String, taskID: String, saved: Bool) {
+        guard ArenaSeatMotionPolicy.shouldAnimateSavedAnswer(saved: saved, readOnly: isReadOnly) else {
+            return
+        }
+        seatAnswerSignals[provider] = ArenaSeatLiveSignal(taskID: taskID, kind: .answerSaved)
+        liveAnswerRevision &+= 1
+    }
+
+    private func clearLiveSignals() {
+        seatReceiptSignals.removeAll()
+        seatAnswerSignals.removeAll()
     }
 
     private func setState(
@@ -3549,6 +3615,7 @@ final class ArenaModel: ObservableObject {
         blockedTasks.removeAll()
         previews.removeAll()
         seatStates.removeAll()
+        clearLiveSignals()
         isReadOnly = readOnly
         isRecovering = true
         isPaused = saved.isPaused
