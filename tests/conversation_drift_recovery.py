@@ -134,11 +134,15 @@ def main() -> int:
         server.server_close()
 
     assert clicks == [], f"send was clicked during drift recovery: {clicks}"
-    assert requests.count("/ok-b") == 1, requests
+    # The pure-pane check now changes /ok and /draft with history.pushState, so
+    # those second routes never reach HTTP. /busy, /unknown and /pause still
+    # load real pages for the cases that must not be recovered.
+    assert requests.count("/ok-b") == 0, requests
     assert requests.count("/ok") >= 2, requests
-    assert "/draft-b" in requests and "/busy-b" in requests
-    assert "/unknown-b" in requests and "/pause-b" in requests
-    print("loopback checks: exactly one safe return; no click or wrong-page send")
+    assert requests.count("/draft-b") == 0, requests
+    assert "/busy-b" in requests and "/unknown-b" in requests
+    assert "/pause-b" in requests
+    print("loopback checks: same-document safe return; no click or wrong-page send")
     return 0
 
 

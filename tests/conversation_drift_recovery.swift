@@ -112,14 +112,31 @@ struct ConversationDriftRecoveryCheck {
             return pane.documentReady
         }
 
-        // 1. A blank same-origin conversation can be left and the saved one is
-        //    reopened. No send control is ever clicked.
+        /// A same-document route change (history.pushState) never reaches the
+        /// navigation delegate. This is the path the earlier bounded fallback
+        /// still has to cover for already-drifted pages.
+        @MainActor
+        func driftSameDocument(_ pane: SitePane, to path: String,
+                               timeout: TimeInterval = 5) async -> Bool {
+            _ = try? await pane.webView.evaluateJavaScript("history.pushState({}, '', '\(path)')")
+            let deadline = Date().addingTimeInterval(timeout)
+            while Date() < deadline {
+                if pane.currentURL?.path == path { return true }
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+            return pane.currentURL?.path == path
+        }
+
+        // 1. A blank same-origin conversation changed by same-document routing
+        //    can be left and the saved one is reopened. No send control is ever
+        //    clicked.
         do {
             let home = page("ok")
             let pane = newPane(home)
             check("the saved conversation loads", await load(pane, home))
             check("the saved conversation binds", pane.restoreConversationBinding(home))
-            check("a same-origin second conversation loads", await load(pane, page("ok-b")))
+            check("a same-document second conversation appears",
+                  await driftSameDocument(pane, to: "/ok-b"))
             check("the drift is visible before recovery", pane.conversationMismatch() != nil)
             let outcome = await pane.returnToBoundConversationIfSafe(
                 taskID: "drift-check:reading:gemini",
@@ -131,12 +148,15 @@ struct ConversationDriftRecoveryCheck {
                   pane.currentURL?.path == home.path)
         }
 
-        // 2. A human draft on the page being left is preserved.
+        // 2. A human draft typed in the same document is preserved.
         do {
             let home = page("draft")
             let pane = newPane(home)
             check("a draft scenario binds", await load(pane, home) && pane.restoreConversationBinding(home))
-            check("a draft drift page loads", await load(pane, page("draft-b")))
+            _ = try? await pane.webView.evaluateJavaScript(
+                "document.querySelector('#editor').value = '留给用户的手写草稿'"
+            )
+            check("a draft drift appears", await driftSameDocument(pane, to: "/draft-b"))
             let outcome = await pane.returnToBoundConversationIfSafe(
                 taskID: "drift-check:prepared:gemini",
                 canContinue: { true }
@@ -187,6 +207,220 @@ struct ConversationDriftRecoveryCheck {
             )
             check("a stale task or pause cancels the return", outcome == .cancelled)
             check("a cancelled return leaves the page alone", pane.currentURL?.path == page("pause-b").path)
+        }
+
+        // 6. Pure lock/policy rules: another recognized conversation and the
+        //    generic home are blocked; A, auth, subframes and authorized opens
+        //    are not.
+        let geminiOrigin = "https://gemini.google.com"
+        let geminiA = URL(string: "https://gemini.google.com/app/abc123")!
+        func blocked(_ target: String, bound: URL? = geminiA, main: Bool = true,
+                     authorized: Bool = false, provider: String = "gemini",
+                     homePath: String = "/app", origin: String = geminiOrigin) -> Bool {
+            SitePane.shouldCancelAutomaticNavigation(
+                target: URL(string: target)!, bound: bound, current: bound,
+                isMainFrame: main, isAuthorized: authorized, provider: provider,
+                siteOrigin: origin, homePath: homePath, isTest: false
+            )
+        }
+        check("another Gemini conversation is blocked", blocked("https://gemini.google.com/app/zzz999"))
+        check("Gemini's new-chat home is blocked", blocked("https://gemini.google.com/app"))
+        check("a ChatGPT conversation is blocked",
+              blocked("https://chatgpt.com/c/00000000-0000-4000-8000-000000000002",
+                      bound: URL(string: "https://chatgpt.com/c/00000000-0000-4000-8000-000000000001")!,
+                      provider: "chatgpt", homePath: "/", origin: "https://chatgpt.com"))
+        check("ChatGPT home is blocked",
+              blocked("https://chatgpt.com/",
+                      bound: URL(string: "https://chatgpt.com/c/00000000-0000-4000-8000-000000000001")!,
+                      provider: "chatgpt", homePath: "/", origin: "https://chatgpt.com"))
+        check("a DeepSeek conversation is blocked",
+              blocked("https://chat.deepseek.com/a/chat/s/zzz999",
+                      bound: URL(string: "https://chat.deepseek.com/a/chat/s/abc123")!,
+                      provider: "deepseek", homePath: "/", origin: "https://chat.deepseek.com"))
+        check("the same conversation with a query is allowed",
+              !blocked("https://gemini.google.com/app/abc123?model=fast"))
+        check("the first A assignment is allowed", !blocked("https://gemini.google.com/app", bound: nil))
+        check("an auth host is allowed", !blocked("https://accounts.google.com/o/oauth2/auth"))
+        check("a same-site login path is allowed", !blocked("https://gemini.google.com/login"))
+        check("a subframe is allowed", !blocked("https://gemini.google.com/app/zzz999", main: false))
+        check("an authorized open is allowed",
+              !blocked("https://gemini.google.com/app", authorized: true))
+        check("a fixture sibling conversation is blocked",
+              SitePane.shouldCancelAutomaticNavigation(
+                target: URL(string: "http://127.0.0.1:9/gemini-b")!,
+                bound: URL(string: "http://127.0.0.1:9/gemini")!,
+                current: URL(string: "http://127.0.0.1:9/gemini")!,
+                isMainFrame: true, isAuthorized: false, provider: "gemini",
+                siteOrigin: "http://127.0.0.1:9", homePath: "/gemini", isTest: true
+              ))
+        check("the same fixture conversation is allowed",
+              !SitePane.shouldCancelAutomaticNavigation(
+                target: URL(string: "http://127.0.0.1:9/gemini")!,
+                bound: URL(string: "http://127.0.0.1:9/gemini")!,
+                current: URL(string: "http://127.0.0.1:9/gemini")!,
+                isMainFrame: true, isAuthorized: false, provider: "gemini",
+                siteOrigin: "http://127.0.0.1:9", homePath: "/gemini", isTest: true
+              ))
+
+        // 7. Receipt provenance: a post-click receipt from another conversation,
+        //    or a success receipt with no verifiable href, is never adopted.
+        func receipt(_ status: String, href: String?, verified: Bool = false,
+                     ok: Bool = true) -> [String: Any] {
+            var detail: [String: Any] = ["userTurnVerified": verified]
+            if let href { detail["href"] = href }
+            return ["ok": ok, "status": status, "detail": detail]
+        }
+        check("a stable receipt matches",
+              SitePane.receiptConversationMismatch(
+                receipt("submitted", href: geminiA.absoluteString, verified: true),
+                bound: geminiA, origin: geminiOrigin) == nil)
+        check("a submitted receipt from B is rejected",
+              SitePane.receiptConversationMismatch(
+                receipt("submitted", href: "https://gemini.google.com/app/zzz999", verified: true),
+                bound: geminiA, origin: geminiOrigin) != nil)
+        check("a done receipt from B is rejected",
+              SitePane.receiptConversationMismatch(
+                receipt("done", href: "https://gemini.google.com/app/zzz999"),
+                bound: geminiA, origin: geminiOrigin) != nil)
+        check("a submitted receipt without provenance is rejected",
+              SitePane.receiptConversationMismatch(
+                receipt("submitted", href: nil, verified: true),
+                bound: geminiA, origin: geminiOrigin) != nil)
+        check("an unparseable verified href is rejected",
+              SitePane.receiptConversationMismatch(
+                receipt("submitted", href: "javascript:alert(1)", verified: true),
+                bound: geminiA, origin: geminiOrigin) != nil)
+        check("a cross-origin done href is rejected",
+              SitePane.receiptConversationMismatch(
+                receipt("done", href: "https://example.test/app/abc123"),
+                bound: geminiA, origin: geminiOrigin) != nil)
+        check("a failed receipt is not a provenance mismatch",
+              SitePane.receiptConversationMismatch(
+                receipt("unknown", href: "https://gemini.google.com/app/zzz999", ok: false),
+                bound: geminiA, origin: geminiOrigin) == nil)
+        check("a pending receipt without href is tolerated",
+              SitePane.receiptConversationMismatch(
+                receipt("pending", href: nil), bound: geminiA, origin: geminiOrigin) == nil)
+        check("an unconfirmed submit never looks like a pre-click change",
+              !SitePaneError.submitUnconfirmed(expected: "a", actual: "b").isConversationChanged)
+        check("an unconfirmed submit records that a click may have happened",
+              SitePaneError.submitUnconfirmed(expected: "a", actual: "b").possiblySubmitted
+              && SitePaneError.submitUnconfirmed(expected: "a", actual: "b").clickAttempted)
+
+        // 8. The preventive lock in a real WKWebView: a verified A bound through
+        //    the same receipt path polls use stays put on an unsolicited full
+        //    navigation, keeps its ready state, and records no error.
+        do {
+            let home = page("ok")
+            let pane = newPane(home)
+            check("a lock scenario loads", await load(pane, home))
+            let verified: [String: Any] = [
+                "ok": true, "status": "submitted",
+                "detail": ["userTurnVerified": true, "href": home.absoluteString],
+            ]
+            check("a receipt binds verified A", pane.bindVerifiedConversation(from: verified))
+            pane.isAutomaticWorkActive = { true }
+            check("a repeated receipt keeps the same binding",
+                  pane.bindVerifiedConversation(from: verified))
+            _ = try? await pane.webView.evaluateJavaScript("location.assign('/ok-b')")
+            try? await Task.sleep(nanoseconds: 900_000_000)
+            check("an unsolicited navigation to B is cancelled",
+                  pane.currentURL?.path == home.path)
+            check("A stays ready after the cancelled navigation",
+                  pane.documentReady && !pane.isLoading)
+            check("the cancelled navigation leaves no error",
+                  pane.lastNavigationErrorCode == nil && pane.lastErrorCode == nil)
+            check("A still has no conversation mismatch", pane.conversationMismatch() == nil)
+        }
+
+        // 9. A same-document A→B change is returned immediately (twice), and
+        //    repeated receipts for the same A do not refill the throttle.
+        do {
+            let home = page("ok")
+            let pane = newPane(home)
+            check("a proactive scenario loads", await load(pane, home))
+            let verified: [String: Any] = [
+                "ok": true, "status": "submitted",
+                "detail": ["userTurnVerified": true, "href": home.absoluteString],
+            ]
+            check("a proactive scenario binds", pane.bindVerifiedConversation(from: verified))
+            pane.isAutomaticWorkActive = { true }
+
+            @MainActor
+            func driftAndWait() async -> Bool {
+                _ = try? await pane.webView.evaluateJavaScript("history.pushState({}, '', '/ok-b')")
+                let deadline = Date().addingTimeInterval(8)
+                while Date() < deadline {
+                    if !pane.isLoading, pane.documentReady,
+                       pane.currentURL?.path == home.path,
+                       pane.conversationMismatch() == nil { return true }
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+                return false
+            }
+            check("a same-document drift returns to A", await driftAndWait())
+            check("a second independent drift is returned too", await driftAndWait())
+            check("a repeated receipt after recovery is still the same binding",
+                  pane.bindVerifiedConversation(from: verified))
+            _ = try? await pane.webView.evaluateJavaScript("history.pushState({}, '', '/ok-b')")
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            check("a third rapid drift is left to the task fallback",
+                  pane.currentURL?.path == page("ok-b").path)
+        }
+
+        // 10. Without automatic work (manual takeover) the page is free again.
+        do {
+            let home = page("ok")
+            let pane = newPane(home)
+            check("a manual scenario loads", await load(pane, home))
+            _ = pane.restoreConversationBinding(home)
+            pane.isAutomaticWorkActive = { false }
+            _ = try? await pane.webView.evaluateJavaScript("location.assign('/pause-b')")
+            let deadline = Date().addingTimeInterval(8)
+            var moved = false
+            while Date() < deadline {
+                if pane.currentURL?.path == page("pause-b").path { moved = true; break }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            check("a manually taken-over seat may change page", moved)
+        }
+
+        // 11. An active remote reply alone does not trap a same-document drift,
+        //     but a locally typed draft still does.
+        do {
+            let home = page("busy")
+            let pane = newPane(home)
+            check("a generating scenario loads", await load(pane, home))
+            _ = pane.restoreConversationBinding(home)
+            pane.isAutomaticWorkActive = { true }
+            _ = try? await pane.webView.evaluateJavaScript(
+                "document.body.insertAdjacentHTML('beforeend', '<button id=\"stop\" style=\"display:block\">stop</button>')"
+            )
+            _ = try? await pane.webView.evaluateJavaScript("history.pushState({}, '', '/busy-b')")
+            let deadline = Date().addingTimeInterval(8)
+            var returned = false
+            while Date() < deadline {
+                if !pane.isLoading, pane.currentURL?.path == home.path { returned = true; break }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            check("remote generation does not block the proactive return", returned)
+        }
+        do {
+            let home = page("draft")
+            let pane = newPane(home)
+            check("a draft scenario loads for the lock", await load(pane, home))
+            _ = pane.restoreConversationBinding(home)
+            pane.isAutomaticWorkActive = { true }
+            _ = try? await pane.webView.evaluateJavaScript(
+                "document.querySelector('#editor').value = '本地手写草稿'; history.pushState({}, '', '/draft-b')"
+            )
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            check("a locally typed draft still prevents the proactive return",
+                  pane.currentURL?.path == page("draft-b").path)
+            let kept = (try? await pane.webView.evaluateJavaScript(
+                "document.querySelector('#editor').value"
+            )) as? String
+            check("the local draft is left untouched", kept == "本地手写草稿")
         }
 
         if failures == 0 {

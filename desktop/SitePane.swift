@@ -69,6 +69,9 @@ enum SitePaneError: Error, LocalizedError {
     case invalidDraftDigest(String)
     case navigationBlocked(String)
     case conversationChanged(expected: String, actual: String)
+    /// 提交命令已经发出后，回执或页面地址无法证明它仍在本场对话上。
+    /// 点击可能已经发生：调用方只能只读核对，绝不能再点一次。
+    case submitUnconfirmed(expected: String, actual: String)
     case javaScriptFailed(String)
     case invalidDriverResponse(String)
 
@@ -93,6 +96,7 @@ enum SitePaneError: Error, LocalizedError {
         case .invalidDraftDigest: return "invalid-draft-digest"
         case .navigationBlocked: return "navigation-blocked"
         case .conversationChanged: return "conversation-changed"
+        case .submitUnconfirmed: return "submit-unconfirmed"
         case .javaScriptFailed: return "javascript-failed"
         case .invalidDriverResponse: return "invalid-driver-response"
         }
@@ -136,6 +140,8 @@ enum SitePaneError: Error, LocalizedError {
             return "测试模式拒绝离开回环 origin：\(value)"
         case .conversationChanged(let expected, let actual):
             return "本席已固定到核验过的对话 \(expected)，当前原页是 \(actual)。为免把本轮提示发到别的窗口，已转人工核对。"
+        case .submitUnconfirmed(let expected, let actual):
+            return "本轮提交可能已经发出，但回执里的对话地址（\(actual)）无法证明仍是本场对话 \(expected)。不会再点发送，只做只读核对。"
         case .javaScriptFailed(let detail):
             return "页面脚本执行失败：\(detail)"
         case .invalidDriverResponse(let detail):
@@ -148,6 +154,18 @@ enum SitePaneError: Error, LocalizedError {
         if case .conversationChanged = self { return true }
         return false
     }
+
+    /// 提交已发出、但结果无法归属本场对话：只读核对，绝不再点发送。
+    var isSubmitUnconfirmed: Bool {
+        if case .submitUnconfirmed = self { return true }
+        return false
+    }
+
+    var possiblySubmitted: Bool { isSubmitUnconfirmed }
+
+    /// 提交命令已经执行过，页面可能已经收到一次点击；调用方不得把它当作
+    /// “点击前失败”再点一次。
+    var clickAttempted: Bool { isSubmitUnconfirmed }
 }
 
 /// 同一 origin 下原页被换到别的对话时，当前页面是否允许自动离开。
@@ -232,12 +250,31 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
     /// 转人工，绝不把提示发进别的窗口。新建场次时由调用方显式重置。
     @Published private(set) var boundConversationURL: URL?
 
+    /// 自动派发是否仍为这个席位工作。由模型注入：自动回合中返回 true，
+    /// 人工接管、暂停、结束、历史回看和新场次返回 false。nil/false 时不加
+    /// 任何导航锁，也不做主动返回。
+    var isAutomaticWorkActive: (() -> Bool)?
+
     // MARK: Private state
 
     private let site: SiteDescriptor?
     private let configurationError: SitePaneError?
     private let contentWorld: WKContentWorld
     private let commandGate = CommandGate()
+
+    /// 只由本席 `open()` 发起的导航；自动导航锁只放行它。
+    private var authorizedNavigationURL: URL?
+    /// 最近一次观察到的页面地址，用来只对“A→B”的新变化做主动返回。
+    private var lastObservedPageURL: URL?
+    /// 最近一次真正就绪的文档地址。被策略取消的跳转不会换掉它。
+    private var lastSettledDocumentURL: URL?
+    /// 最近一次主动返回本场对话的时刻；调用方据此避免把已恢复的任务当漂移。
+    private(set) var lastProactiveReturnAt: Date?
+    /// 主动返回的冷却窗口：连续快速换页最多两次，避免与站点互相拉扯。
+    private var proactiveRestores: [Date] = []
+    private var proactiveReturnInFlight = false
+    private static let proactiveRestoreWindow: TimeInterval = 60
+    private static let proactiveRestoreLimit = 2
 
     private var cachedDriverSource: String?
     private var didInstallDriverUserScript = false
@@ -341,7 +378,40 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
         clearLastError()
         prepareDriverUserScript()
         documentReady = false
+        authorizedNavigationURL = url
         webView.load(URLRequest(url: url))
+    }
+
+    /// 自动回合中的导航锁是否生效：必须已固定本场对话，且该席仍在自动流程。
+    private var automaticNavigationLockEngaged: Bool {
+        boundConversationURL != nil && (isAutomaticWorkActive?() ?? false)
+    }
+
+    /// 只放行本席 `open()` 刚发起的那一次导航；别人的换页不继承这份许可。
+    private func consumeAuthorizedNavigation(_ url: URL) -> Bool {
+        guard let pending = authorizedNavigationURL,
+              pending == url || Self.documentLocationsMatch(pending, url) else { return false }
+        authorizedNavigationURL = nil
+        return true
+    }
+
+    /// 被取消的跳转不留下假的“加载中/未就绪”。只有当前文档仍是上次真正
+    /// 加载完成的那一个时才恢复就绪；换页后如实保持未就绪。
+    private func restoreSettledDocumentIfCurrent() {
+        isLoading = webView.isLoading
+        guard let settled = lastSettledDocumentURL,
+              let now = webView.url,
+              !isLoading,
+              Self.documentLocationsMatch(settled, now) else { return }
+        documentReady = true
+        currentURL = now
+    }
+
+    /// 最近是否由本席主动返回了本场对话。用于让仍在等待的只读任务继续，
+    /// 而不是把已经回到 A 的页面再判定为漂移。
+    func didJustProactivelyReturn(within seconds: TimeInterval = 10) -> Bool {
+        guard let at = lastProactiveReturnAt else { return false }
+        return Date().timeIntervalSince(at) <= seconds
     }
 
     // MARK: Conversation binding
@@ -363,8 +433,27 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
         else { return false }
         guard isConversation(canonical, site: site),
               boundConversationURL == nil || boundConversationURL == canonical else { return false }
-        boundConversationURL = canonical
+        adoptConversationBinding(canonical)
         return true
+    }
+
+    /// 首次固定或换到本场对话时，上一轮/上一场的主动返回计数与观察地址
+    /// 都不再适用，必须从零开始；同一地址的重复回执什么都不重置。
+    private func adoptConversationBinding(_ canonical: URL) {
+        guard boundConversationURL != canonical else { return }
+        boundConversationURL = canonical
+        proactiveRestores.removeAll()
+        lastProactiveReturnAt = nil
+        // 只为“确实是这个会话”的当前页播种，让之后真正的 A→B 同文档换页
+        // 仍表现为“从 A 出发”；否则先记 A 本身。
+        if let site,
+           let now = webView.url,
+           let current = Self.canonicalConversationURL(now, origin: site.origin),
+           current.absoluteString == canonical.absoluteString {
+            lastObservedPageURL = now
+        } else {
+            lastObservedPageURL = canonical
+        }
     }
 
     /// 恢复上次场次时固定当时保存的会话地址。传入的地址必须仍与登记站点同源，
@@ -376,7 +465,7 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
         else { return false }
         guard isConversation(canonical, site: site),
               boundConversationURL == nil || boundConversationURL == canonical else { return false }
-        boundConversationURL = canonical
+        adoptConversationBinding(canonical)
         return true
     }
 
@@ -413,6 +502,81 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
         }
     }
 
+    /// 自动锁的判定：只拦“同站、主框架、网页自发、目标是另一段可识别对话或
+    /// 新会话首页”的换页。首个 A 绑定、显式接管、登录流程、子框架和本席
+    /// `open()` 已授权的导航都不在这里。
+    nonisolated static func shouldCancelAutomaticNavigation(
+        target: URL,
+        bound: URL?,
+        current: URL?,
+        isMainFrame: Bool,
+        isAuthorized: Bool,
+        provider: String,
+        siteOrigin: String?,
+        homePath: String?,
+        isTest: Bool
+    ) -> Bool {
+        guard !isAuthorized, isMainFrame, let bound, let siteOrigin, let homePath else { return false }
+        guard let canonicalBound = canonicalConversationURL(bound, origin: siteOrigin),
+              let canonicalTarget = canonicalConversationURL(target, origin: siteOrigin)
+        else { return false }
+        if canonicalTarget.absoluteString == canonicalBound.absoluteString { return false }
+        // 只改查询串/片段仍算同一个文档，不当作换对话。
+        if let current, documentLocationsMatch(current, target) { return false }
+        return isRecognizedConversationOrHome(
+            canonicalTarget,
+            provider: provider,
+            homePath: homePath,
+            siteOrigin: siteOrigin,
+            isTest: isTest
+        )
+    }
+
+    /// 同站的另一段已知对话，或该站的新会话/首页。夹具只认 `/{home}-*` 这种
+    /// 窄规则，方便回环页面复现，不扩大到任意子路径。
+    nonisolated static func isRecognizedConversationOrHome(
+        _ url: URL,
+        provider: String,
+        homePath: String,
+        siteOrigin: String,
+        isTest: Bool
+    ) -> Bool {
+        guard originString(url) == siteOrigin else { return false }
+        if isConversationURL(url, provider: provider, homePath: homePath, isTest: isTest) {
+            return true
+        }
+        let path = normalizedPath(url.path)
+        if isTest { return path.hasPrefix(normalizedPath(homePath) + "-") }
+        if path == normalizedPath(homePath) { return true }
+        return provider == "deepseek" && path == "/a/chat"
+    }
+
+    /// 驱动回执声明的会话地址是否仍是已固定的 A。返回 nil 表示可以接受。
+    ///
+    /// * 完成、已发送或“本轮用户消息已核验”的成功回执必须有来源：地址缺失、
+    ///   无法解析或跨站都按“不可归属”处理（actual 用可读标记），失败关闭。
+    /// * 其它状态只在确实给出可解析地址时才比较，避免误伤既有只读流程。
+    nonisolated static func receiptConversationMismatch(
+        _ result: [String: Any],
+        bound: URL?,
+        origin: String
+    ) -> (expected: String, actual: String)? {
+        guard let bound, (result["ok"] as? Bool) != false else { return nil }
+        let status = (result["status"] as? String) ?? ""
+        let detail = result["detail"] as? [String: Any]
+        let verified = (detail?["userTurnVerified"] as? Bool) == true
+        let needsProvenance = verified || status == "done" || status == "submitted"
+        guard let raw = (detail?["href"] as? String) ?? (detail?["url"] as? String) else {
+            return needsProvenance ? (bound.absoluteString, "缺少来源地址") : nil
+        }
+        guard let url = URL(string: raw),
+              let canonical = canonicalConversationURL(url, origin: origin) else {
+            return needsProvenance ? (bound.absoluteString, "来源地址无法核对") : nil
+        }
+        guard canonical.absoluteString != bound.absoluteString else { return nil }
+        return (bound.absoluteString, canonical.absoluteString)
+    }
+
     /// 稳定的 ChatGPT 会话 ID。除了解码后的路径不能含 `local-chatgpt`，
     /// 还要求形如 `/c/<id>` 的单段 ID；临时路由里的冒号、编码片段都不合格。
     nonisolated static func isStableChatGPTConversationID(_ raw: String) -> Bool {
@@ -431,6 +595,10 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
     /// 新建场次（或换一场讨论）时才允许解除固定。手工接管与恢复不重置。
     func resetConversationBinding() {
         boundConversationURL = nil
+        proactiveRestores.removeAll()
+        lastObservedPageURL = nil
+        lastProactiveReturnAt = nil
+        authorizedNavigationURL = nil
     }
 
     /// 一次受控只读恢复的地址条件：本席已固定会话、当前地址正是该会话、页面
@@ -493,7 +661,8 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
     /// `inspectedURL` 必须是调用方刚看到的当前页；probe 的 scope 会钉在它上面。
     func inspectConversationDriftSafety(
         taskID: String,
-        inspectedURL: URL? = nil
+        inspectedURL: URL? = nil,
+        allowActiveGeneration: Bool = false
     ) async -> SitePaneConversationDriftSafety {
         guard let site else { return .unavailable("站点配置不可用") }
         let current = inspectedURL ?? webView.url
@@ -524,9 +693,17 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
             let detail = response["detail"] as? [String: Any]
             let composer = detail?["composer"] as? [String: Any]
             let stop = detail?["stop"] as? [String: Any]
+            let draftEmpty = composer?["draftEmpty"] as? Bool == true
+            let hasAttachments = composer?["hasAttachments"] as? Bool == true
+            if allowActiveGeneration {
+                return Self.proactiveReturnSafety(
+                    draftEmpty: draftEmpty,
+                    hasAttachments: hasAttachments
+                )
+            }
             return Self.conversationDriftSafety(
-                draftEmpty: composer?["draftEmpty"] as? Bool == true,
-                hasAttachments: composer?["hasAttachments"] as? Bool == true,
+                draftEmpty: draftEmpty,
+                hasAttachments: hasAttachments,
                 stopConfigured: stop?["configured"] as? Bool == true,
                 stopActive: stop?["active"] as? Bool == true
             )
@@ -576,6 +753,16 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
         return .safe
     }
 
+    /// 主动返回本场对话只保护“人已经写下的草稿或附件”。远程仍在生成不算
+    /// 阻碍：重新打开 A 不会丢掉服务端的回答，而停在 B 会真的走错对话。
+    nonisolated static func proactiveReturnSafety(
+        draftEmpty: Bool,
+        hasAttachments: Bool
+    ) -> SitePaneConversationDriftSafety {
+        if !draftEmpty || hasAttachments { return .draft }
+        return .safe
+    }
+
     /// 同源漂移时为该席做一次有界返回：只读核对当前页，安全才导航回已固定、
     /// 已核验的原对话。不会填写、点击、提交或改变绑定。`canContinue` 在每次
     /// await 前后都会复查，暂停/接管/换场/任务失效时立即停手。
@@ -591,6 +778,16 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
             return .unreachable("本场对话地址无法核对")
         }
         guard conversationMismatch() != nil else { return .notDrifted }
+        // 同文档换页可能已由本席主动返回处理：等它结束后再判断，避免两次导航。
+        // 已回到 A 时按“已返回”处理，让等待中的只读任务继续而不是静默停下。
+        if proactiveReturnInFlight {
+            let deadline = Date().addingTimeInterval(10)
+            while proactiveReturnInFlight, Date() < deadline {
+                if !canContinue() { return .cancelled }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            if conversationMismatch() == nil { return .returned }
+        }
         guard canContinue() else { return .cancelled }
         if isWebContentTerminated { return .unreachable("原页内容进程已终止") }
         guard let inspected = webView.url else { return .unreachable("原页没有地址") }
@@ -963,6 +1160,24 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
         }
 
         try Self.requireDriverPreconditions(result)
+
+        // 已固定本场对话后，回执里的地址也必须是同一个会话。完成/已发送的
+        // 回执同样核对，避免把另一段对话里的回答当成 A 的答案收下。
+        // 提交已经发出时绝不能回落成“点击前失败”（那会再点一次），而是明确的
+        // submit-unconfirmed，只走既有的只读核对路径。
+        if driftInspectionHref == nil,
+           let mismatch = Self.receiptConversationMismatch(
+                result, bound: boundConversationURL, origin: site.origin
+           ) {
+            if (message["type"] as? String) == "arena.web.submit" {
+                throw SitePaneError.submitUnconfirmed(
+                    expected: mismatch.expected, actual: mismatch.actual
+                )
+            }
+            throw SitePaneError.conversationChanged(
+                expected: mismatch.expected, actual: mismatch.actual
+            )
+        }
 
         let status = (result["status"] as? String) ?? "unknown"
         lastCommandStatus = status
@@ -1414,6 +1629,24 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
             return
         }
 
+        if automaticNavigationLockEngaged,
+           Self.shouldCancelAutomaticNavigation(
+                target: url,
+                bound: boundConversationURL,
+                current: webView.url,
+                isMainFrame: navigationAction.targetFrame?.isMainFrame == true,
+                isAuthorized: consumeAuthorizedNavigation(url),
+                provider: provider,
+                siteOrigin: site?.origin,
+                homePath: site?.homeURL.path,
+                isTest: site?.isTest == true
+           ) {
+            // 只取消这一次网页自发的换页，不记录导航故障：原对话仍在原页，
+            // WebKit 也不会为此触发 didFail；生成和就绪状态都保持不变。
+            decisionHandler(.cancel)
+            return
+        }
+
         if let site, site.isTest {
             guard let targetOrigin = Self.originString(url), targetOrigin == site.origin else {
                 decisionHandler(.cancel)
@@ -1439,6 +1672,29 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
                  decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+        // 最终回答触发的整页跳转也在这里拦：此时 WK 的 provisional 地址可能
+        // 已经是 B，所以绝不能用“当前地址 == 目标”当豁免。子框架与登录流程
+        // 不拦；地址无法核对时交给请求阶段和既有恢复处理。
+        if automaticNavigationLockEngaged, navigationResponse.isForMainFrame,
+           let url = navigationResponse.response.url,
+           Self.shouldCancelAutomaticNavigation(
+                target: url,
+                bound: boundConversationURL,
+                current: nil,
+                isMainFrame: true,
+                isAuthorized: false,
+                provider: provider,
+                siteOrigin: site?.origin,
+                homePath: site?.homeURL.path,
+                isTest: site?.isTest == true
+           ) {
+            decisionHandler(.cancel)
+            Task { @MainActor [weak self] in
+                await Task.yield()
+                self?.restoreSettledDocumentIfCurrent()
+            }
+            return
+        }
         decisionHandler(.allow)
     }
 
@@ -1466,6 +1722,8 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         isLoading = false
         documentReady = true
+        authorizedNavigationURL = nil
+        lastSettledDocumentURL = webView.url
         currentURL = webView.url
         pageTitle = webView.title
         canGoBack = webView.canGoBack
@@ -1759,12 +2017,19 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
     private func handleNavigationFailure(_ error: Error) {
         let nsError = error as NSError
         if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled {
+            // 自动锁主动取消的换页不是故障，不写错误、不改就绪状态。
+            authorizedNavigationURL = nil
+            restoreSettledDocumentIfCurrent()
             return
         }
         if nsError.domain == "WebKitErrorDomain" && nsError.code == 102 {
-            // 被策略改道（例如同站弹窗转到本席位）不是导航故障。
+            // 被策略改道（同站弹窗）或自动锁取消响应都不算导航故障。原文档
+            // 仍在时恢复“就绪”；否则如实停在未就绪，避免下一轮误判可用。
+            authorizedNavigationURL = nil
+            restoreSettledDocumentIfCurrent()
             return
         }
+        authorizedNavigationURL = nil
         isLoading = false
         documentReady = false
         canGoBack = webView.canGoBack
@@ -1844,12 +2109,83 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
         )
         keyValueObservations.append(
             webView.observe(\.url, options: [.new]) { [weak self] webView, _ in
-                let value = webView.url
                 Task { @MainActor [weak self] in
-                    self?.currentURL = value
+                    guard let self else { return }
+                    // 任务执行时再取一次地址：迟到的观察不能覆盖更新的地址。
+                    let value = webView.url
+                    self.currentURL = value
+                    self.pageURLObserved(value)
                 }
             }
         )
+    }
+
+    /// 自动回合中，网页可能用同文档路由（history.pushState）换到另一段对话，
+    /// 这种情况不会经过导航代理。这里只在“刚才还是已核验的 A”这一新变化上，
+    /// 对仍在自动流程、已固定的席位做一次只读核对，然后重新打开它自己的 A；
+    /// 草稿、附件、生成中、无法核对或人工接管时一律不动。
+    private func pageURLObserved(_ url: URL?) {
+        guard webView.url == url else { return }
+        let previous = lastObservedPageURL
+        lastObservedPageURL = url
+        guard let url, automaticNavigationLockEngaged, let site,
+              let bound = boundConversationURL,
+              let canonicalBound = Self.canonicalConversationURL(bound, origin: site.origin),
+              let canonicalNow = Self.canonicalConversationURL(url, origin: site.origin),
+              canonicalNow.absoluteString != canonicalBound.absoluteString,
+              let previous,
+              let canonicalPrevious = Self.canonicalConversationURL(previous, origin: site.origin),
+              canonicalPrevious.absoluteString == canonicalBound.absoluteString,
+              Self.isRecognizedConversationOrHome(
+                canonicalNow,
+                provider: provider,
+                homePath: site.homeURL.path,
+                siteOrigin: site.origin,
+                isTest: site.isTest
+              ),
+              !webView.isLoading, documentReady else { return }
+        proactivelyReturnFromSameDocumentDrift(
+            current: url, bound: canonicalBound, canonicalCurrent: canonicalNow
+        )
+    }
+
+    private func proactivelyReturnFromSameDocumentDrift(
+        current: URL,
+        bound: URL,
+        canonicalCurrent: URL
+    ) {
+        guard !proactiveReturnInFlight else { return }
+        let now = Date()
+        proactiveRestores = proactiveRestores.filter {
+            now.timeIntervalSince($0) < Self.proactiveRestoreWindow
+        }
+        guard proactiveRestores.count < Self.proactiveRestoreLimit else { return }
+        proactiveReturnInFlight = true
+        let taskID = "arena.proactive:\(provider)"
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.proactiveReturnInFlight = false }
+            guard let site = self.site,
+                  self.automaticNavigationLockEngaged,
+                  self.boundConversationURL == bound else { return }
+            // 页面可能已经又变了：只对刚才观察到的同一地址继续。
+            guard self.webView.url.flatMap({ Self.canonicalConversationURL($0, origin: site.origin) })
+                    == canonicalCurrent,
+                  !self.webView.isLoading, self.documentReady else { return }
+            let safety = await self.inspectConversationDriftSafety(
+                taskID: taskID, inspectedURL: current, allowActiveGeneration: true
+            )
+            guard case .safe = safety,
+                  self.automaticNavigationLockEngaged,
+                  self.boundConversationURL == bound,
+                  !self.webView.isLoading,
+                  self.webView.url.flatMap({ Self.canonicalConversationURL($0, origin: site.origin) })
+                    == canonicalCurrent else { return }
+            self.proactiveRestores.append(Date())
+            self.lastProactiveReturnAt = Date()
+            self.isWebContentTerminated = false
+            self.open(bound)
+        }
     }
 
     // MARK: Static support

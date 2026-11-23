@@ -2067,6 +2067,16 @@ final class ArenaModel: ObservableObject {
         phase: ConversationDriftPhase
     ) async -> ConversationDriftRecovery {
         guard token == runToken, !isReadOnly else { return .stopped }
+        // 同文档换页可能已由本席主动返回 A；这时页面又是本场对话，不要把它
+        // 当成无法恢复的漂移，也不要再导航一次。
+        if pane.conversationMismatch() == nil, pane.didJustProactivelyReturn() {
+            setState(
+                provider,
+                phase == .beforeSend ? .sending : .generating,
+                Self.conversationDriftRecoveredMessage(phase)
+            )
+            return .recovered
+        }
         let decision = Self.conversationDriftReturnDecision(
             bound: pane.boundConversationURL != nil,
             drifted: pane.conversationMismatch() != nil,
@@ -3001,17 +3011,40 @@ final class ArenaModel: ObservableObject {
     /// the loopback URL, so neither navigation nor driver authorisation can
     /// reach a real consumer site.
     private func makePane(for provider: String) -> SitePane {
+        let pane: SitePane
         if engine.fixtureBase != nil,
            let config = try? engine.config(for: provider) {
-            return SitePane.testPane(
+            pane = SitePane.testPane(
                 provider: provider,
                 loopbackURL: config.url,
                 selectors: Self.stringSelectors(config.selectors),
                 options: config.options,
                 allowNavigation: config.allowNavigation
             )
+        } else {
+            pane = SitePane(provider: provider)
         }
-        return SitePane(provider: provider)
+        // 自动回合中把本席钉在已核验的本场对话上。判断随场次状态实时计算：
+        // 人工接管、暂停、结束、历史回看或新场次都会立即解除，不再加锁。
+        pane.isAutomaticWorkActive = { [weak self] in
+            self?.isAutomaticSeatWork(provider) ?? false
+        }
+        return pane
+    }
+
+    /// 这一席此刻是否仍由自动派发负责。只有这种席位才允许加导航锁和主动
+    /// 返回；人工接管、已交回用户处理的任务与只读回看都必须保持原页自由。
+    private func isAutomaticSeatWork(_ provider: String) -> Bool {
+        guard session != nil, !isReadOnly, !isPaused, stageKey != "done" else { return false }
+        guard currentProviders.contains(provider), !manualProviders.contains(provider) else {
+            return false
+        }
+        if let pending = pendingTask(for: provider),
+           let taskID = pending.arenaString("id"),
+           blockedTasks.contains(taskID) {
+            return false
+        }
+        return true
     }
 
     /// Mount the three seat pages with their entry pages so the workbench is

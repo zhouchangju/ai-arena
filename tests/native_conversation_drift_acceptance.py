@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
-"""Exercise an actual same-origin conversation drift in the native app.
+"""Exercise an actual same-origin, same-document conversation drift in the app.
 
-Gemini's loopback page leaves its saved conversation for a stable second route
-while its first answer is being read. The app must return to the saved
-conversation automatically, restore the answer read-only, finish the
-discussion, and never send this round (or any later round) into the second
-route.
+Gemini's loopback page finishes its first answer, then changes only its address
+to a stable second route with a genuine ``history.pushState``.  That is the SPA
+case a site produces without a navigation request; the app must notice the
+address change, return to the saved conversation, restore the answer read-only,
+finish the discussion, and never send this round (or any later round) into the
+second route.
+
+The route change is deliberately made when the first answer has completed and
+the page is idle.  A route change while A is still streaming must leave the
+live generation alone; the separate pure-pane check covers that busy case, and
+the full-navigation lock is covered by
+``native_independent_conversation_acceptance.py``.
 
 The QA bundle copy gets one scoped fixture-only patch in its packaged
 ``web-driver.js``: the driver's production read-recovery allowlist requires a
@@ -91,14 +98,20 @@ def main() -> None:
 
     events = []
     gets = []
+    drift_events = []
     turns = {seat: [] for seat in PROVIDERS}
+    lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             path = urlparse(self.path).path
             seat = path.strip("/").split("-")[0]
             if path == "/gemini-b":
-                gets.append(path)
+                # A full navigation here would mean the lock was bypassed. Serve
+                # a page so a failure is diagnosable, but the assertions expect
+                # this route to stay unvisited.
+                with lock:
+                    gets.append(path)
                 page = markup(PROVIDERS.index("gemini")).decode().replace(
                     "window.turns.push(row);",
                     "window.turns.push(row);"
@@ -110,7 +123,9 @@ def main() -> None:
             if seat not in PROVIDERS:
                 self.send_error(404)
                 return
-            gets.append(path)
+            with lock:
+                gets.append(path)
+                saved_turns = list(turns[seat])
             page = markup(PROVIDERS.index(seat)).decode()
             # Report every send-control click, including the second route.
             seat_literal = json.dumps(seat)
@@ -120,19 +135,28 @@ def main() -> None:
                 "fetch('/observed',{method:'POST',body:JSON.stringify("
                 "{kind:'prompt',seat:" + seat_literal + ",path:location.pathname,prompt})});",
             )
-            # Only Gemini's first saved page hands itself to the second route.
-            if seat == "gemini" and not turns[seat]:
+            # Gemini's first saved page changes only its address once its first
+            # answer is complete. A real ``history.pushState`` keeps the same
+            # document and does not ask WebKit for B; the app must notice the
+            # URL change and return to the saved conversation. Do not arm the
+            # reload after recovery: its restored first turn is not re-sent.
+            if seat == "gemini" and not saved_turns:
                 page = page.replace(
-                    "window.turns.push(row);",
-                    "window.turns.push(row);"
-                    "setTimeout(()=>location.assign('/gemini-b'),2500);",
+                    "row.complete=true;stop.remove();",
+                    "row.complete=true;stop.remove();"
+                    "if(seq===1&&window.__arenaDriftArmed){"
+                    "window.__arenaDriftArmed=false;"
+                    "history.pushState({},'','/gemini-b');"
+                    "fetch('/observed',{method:'POST',body:JSON.stringify("
+                    "{kind:'drift',path:location.pathname})})}",
                     1,
                 )
+                page += "<script>window.__arenaDriftArmed=true;</script>"
             # Restore server-known turns with literals only: fixtures.markup
             # already expanded its own placeholders.
             content, user_html, answer_html, body_selector, done_html = HTML[PROVIDERS.index(seat)]
             page += f"""<script>
-const SAVED={json.dumps(turns[seat], ensure_ascii=False)};
+const SAVED={json.dumps(saved_turns, ensure_ascii=False)};
 const USER_HTML={json.dumps(user_html)};
 const ANSWER_HTML={json.dumps(answer_html)};
 const BODY_SELECTOR={json.dumps(body_selector)};
@@ -161,14 +185,18 @@ for (const turn of SAVED) {{
             if self.path != "/observed":
                 self.send_error(404)
                 return
-            event = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            events.append(event)
-            if event.get("kind") == "prompt":
-                seat = event["seat"]
-                turns[seat].append({
-                    "prompt": event["prompt"],
-                    "answer": canned_answer(event["prompt"]),
-                })
+            length = int(self.headers.get("Content-Length", "0"))
+            event = json.loads(self.rfile.read(length))
+            with lock:
+                events.append(event)
+                if event.get("kind") == "prompt":
+                    seat = event["seat"]
+                    turns[seat].append({
+                        "prompt": event["prompt"],
+                        "answer": canned_answer(event["prompt"]),
+                    })
+                elif event.get("kind") == "drift":
+                    drift_events.append(event["path"])
             self.send_response(204)
             self.end_headers()
 
@@ -204,6 +232,7 @@ for (const turn of SAVED) {{
         server.shutdown()
         server.server_close()
         (out / "requests.json").write_text(json.dumps(gets, indent=2))
+        (out / "drift-events.json").write_text(json.dumps(drift_events, indent=2))
         (out / "events.json").write_text(json.dumps(events, ensure_ascii=False, indent=2))
 
     payload = json.loads(result.read_text())
@@ -220,7 +249,9 @@ for (const turn of SAVED) {{
     gemini_prompts = [event for event in prompts if event.get("seat") == "gemini"]
     assert len(gemini_prompts) == len(gemini_rows), (gemini_prompts, len(gemini_rows))
     assert all(event["path"] != "/gemini-b" for event in prompts), prompts
-    assert gets.count("/gemini-b") == 1, gets
+    assert drift_events == ["/gemini-b"], drift_events
+    # The address change must stay same-document: no GET of the second route.
+    assert gets.count("/gemini-b") == 0, gets
     assert gets.count("/gemini") >= 2, gets
 
     first_prompt = gemini_prompts[0]["prompt"]
