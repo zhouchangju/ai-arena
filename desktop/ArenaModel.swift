@@ -375,6 +375,10 @@ final class ArenaModel: ObservableObject {
     /// restarted for the existing session. A normal launch stays manual.
     @Published private(set) var didContinueSavedDiscussion: Bool = false
 
+    /// App-level reaction to a durable completion. Kept separate from view
+    /// state so the window chooses between opening the report and notifying.
+    var onDiscussionCompleted: ((ArenaCompletionEvent) -> Void)?
+
     /// A discussion exists and has not reached the final stage. Used by the app
     /// delegate to confirm quitting/closing and by the destructive UI actions.
     var hasRunningDiscussion: Bool {
@@ -423,6 +427,7 @@ final class ArenaModel: ObservableObject {
     private var currentID: String?
     private var createdAt: Double = 0
     private var storageFailed = false
+    private var completionTracker = ArenaCompletionTracker()
 
     /// How long a normal start keeps probing a real site whose composer has not
     /// mounted yet. The bound is deliberately inside the agreed 30–38 s window,
@@ -537,6 +542,7 @@ final class ArenaModel: ObservableObject {
         currentID = created.arenaString("id")
         createdAt = Self.nowMillis()
         errorMessage = ""
+        completionTracker.reset()
 
         refreshStage()
         persist()
@@ -1018,6 +1024,7 @@ final class ArenaModel: ObservableObject {
         historyResumeID = nil
         stageKey = ""
         stageLabel = "尚未开始"
+        completionTracker.reset()
         engine.store.setCurrent(nil)
         refreshHistoryList()
     }
@@ -3240,6 +3247,13 @@ final class ArenaModel: ObservableObject {
         }
         currentID = id
         refreshHistoryList()
+        if let event = completionTracker.recordPersisted(
+            sessionID: id,
+            stage: session.arenaString("stage") ?? "",
+            explicitFinish: session.arenaString("stopReason") == "user-finished"
+        ) {
+            onDiscussionCompleted?(event)
+        }
         return true
     }
 
@@ -3482,6 +3496,7 @@ final class ArenaModel: ObservableObject {
         question = saved.file.question
         draftAttachments.removeAll()
         createdAt = saved.file.createdAt
+        completionTracker.adopt(sessionID: saved.file.id, stage: saved.stage)
         intents = Dictionary(uniqueKeysWithValues: saved.file.intents.map { ($0.taskId, $0) })
         blockedTasks.removeAll()
         previews.removeAll()

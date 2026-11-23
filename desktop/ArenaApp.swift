@@ -184,6 +184,13 @@ final class ArenaAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate 
         window.setFrameAutosaveName("arena-main")
         mainWindow = window
         NSApp.setActivationPolicy(ArenaBuildIsolation.isQABuild ? .accessory : .regular)
+        ArenaCompletionNotifier.shared.activate()
+        ArenaCompletionNotifier.shared.onOpenSession = { [weak self] id in
+            self?.openCompletedSession(id)
+        }
+        model.onDiscussionCompleted = { [weak self] event in
+            self?.handleCompletion(event)
+        }
         arenaPresentWindow(window)
     }
 
@@ -238,6 +245,83 @@ final class ArenaAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate 
         return true
     }
 
+    // MARK: 完成后的落点
+
+    /// A completion may arrive while the workbench is in the background. The
+    /// policy keeps the old foreground behaviour (open the report), sends one
+    /// local notification when backgrounded, and stays silent for an explicit
+    /// 「结束」 that the user just triggered.
+    @MainActor
+    private func handleCompletion(_ event: ArenaCompletionEvent) {
+        guard let model else { return }
+        switch ArenaCompletionPolicy.delivery(
+            isForeground: isCompletionForeground,
+            explicitFinish: event.explicitFinish
+        ) {
+        case .presentReport:
+            ArenaDetailsWindowController.shared.present(
+                model: model,
+                request: ArenaDetailRequest(provider: nil, tab: .report)
+            )
+        case .notification:
+            ArenaCompletionNotifier.shared.notifyCompletion(event)
+        case .silent:
+            break
+        }
+    }
+
+    /// A click on the completion notification returns to that session's report.
+    /// A different running discussion is never stopped, switched or resent; the
+    /// user can reach the finished session through the existing history menu.
+    @MainActor
+    private func openCompletedSession(_ id: String) {
+        guard let model else { return }
+        let currentID = ArenaSessionDigest.id(model.session)
+        if currentID == id {
+            ArenaDetailsWindowController.shared.present(
+                model: model,
+                request: ArenaDetailRequest(provider: nil, tab: .report)
+            )
+            return
+        }
+        guard !model.hasRunningDiscussion else {
+            bringMainWindowForward()
+            return
+        }
+        model.openHistory(id)
+        guard ArenaSessionDigest.id(model.session) == id else {
+            bringMainWindowForward()
+            return
+        }
+        ArenaDetailsWindowController.shared.present(
+            model: model,
+            request: ArenaDetailRequest(provider: nil, tab: .report)
+        )
+    }
+
+    /// Foreground means the app is active and at least one of its real windows
+    /// is visible, so opening the report cannot pull focus from another app or
+    /// from a minimised workbench.
+    @MainActor
+    private var isCompletionForeground: Bool {
+        guard NSApp.isActive else { return false }
+        if let mainWindow, mainWindow.isVisible, !mainWindow.isMiniaturized { return true }
+        if let details = ArenaDetailsWindowController.shared.window,
+           details.isVisible, !details.isMiniaturized { return true }
+        return false
+    }
+
+    @MainActor
+    private func bringMainWindowForward() {
+        if let mainWindow {
+            if mainWindow.isMiniaturized { mainWindow.deminiaturize(nil) }
+            mainWindow.makeKeyAndOrderFront(nil)
+        } else {
+            _ = ArenaDetailsWindowController.shared.focusIfVisible()
+        }
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
 }
 
 // MARK: - 主界面
@@ -260,6 +344,7 @@ struct ArenaRootView: View {
     @State private var confirmation: ArenaConfirmation?
     @State private var seatHint: String?
     @State private var hintTask: Task<Void, Never>?
+    @StateObject private var feedback = ArenaFeedbackPresenter()
 
     @State private var questionFocused = false
     @State private var questionFocusRequest = 0
@@ -285,17 +370,17 @@ struct ArenaRootView: View {
             seatArea
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .overlay(alignment: .bottom) {
+            ArenaFeedbackOverlay(presenter: feedback)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 18)
+        }
         .task {
             model.prepareHome()
             if model.isRecovering && model.stageKey == "done" && !SmokeRunner.isEnabled {
                 presentDetails(provider: nil, tab: .report)
             }
             SmokeRunner.shared.begin(model: model)
-        }
-        .onChange(of: model.stageKey) { stage in
-            if stage == "done", !model.isReadOnly {
-                presentDetails(provider: nil, tab: .report)
-            }
         }
         .alert(item: $confirmation) { item in
             switch item {
@@ -397,7 +482,7 @@ struct ArenaRootView: View {
                 }
                 .disabled(model.session == nil)
                 iconToolButton("以 Markdown 保存本场记录", icon: "square.and.arrow.up") {
-                    ArenaExporter.export(model: model)
+                    ArenaExporter.export(model: model, feedback: feedback)
                 }
                 .disabled(model.session == nil)
             } else {
@@ -407,7 +492,7 @@ struct ArenaRootView: View {
                 .disabled(model.session == nil)
                 .help("查看当前提示、历史原文、报告与原始记录")
                 toolButton("导出", icon: "square.and.arrow.up") {
-                    ArenaExporter.export(model: model)
+                    ArenaExporter.export(model: model, feedback: feedback)
                 }
                 .disabled(model.session == nil)
                 .help("以 Markdown 保存本场记录")
@@ -818,7 +903,7 @@ struct ArenaRootView: View {
             }
 
             Button {
-                arenaCopyToPasteboard(lockedQuestion)
+                feedback.copyToPasteboard(lockedQuestion)
             } label: {
                 Image(systemName: "doc.on.doc")
                     .font(.system(size: 12))
@@ -1083,6 +1168,9 @@ struct ArenaRootView: View {
         ArenaDetailsWindowController.shared.close()
         ArenaBackfillWindowController.shared.close()
         model.start(providers, maxRounds: roundLimit)
+        if model.session != nil {
+            ArenaCompletionNotifier.shared.prepareForCompletionAlerts()
+        }
     }
 
     private func pauseOrResume() {
@@ -1105,6 +1193,7 @@ struct ArenaRootView: View {
         ArenaDetailsWindowController.shared.close()
         ArenaBackfillWindowController.shared.close()
         guard model.continueSavedDiscussion(id) else { return }
+        ArenaCompletionNotifier.shared.prepareForCompletionAlerts()
     }
 
     private func openHistory(_ id: String) {
@@ -1755,6 +1844,7 @@ final class ArenaDetailsWindowController: NSObject, NSWindowDelegate, NSToolbarD
     private var hostingController: NSHostingController<ArenaDetailsWindowView>?
     private var hostedModel: ArenaModel?
     private let state = ArenaDetailsWindowState()
+    private let feedback = ArenaFeedbackPresenter()
     private var copyReportItem: NSToolbarItem?
 
     private enum Item {
@@ -1801,7 +1891,7 @@ final class ArenaDetailsWindowController: NSObject, NSWindowDelegate, NSToolbarD
             existing.close()
         }
 
-        let root = ArenaDetailsWindowView(model: model, state: state)
+        let root = ArenaDetailsWindowView(model: model, state: state, feedback: feedback)
         let hosting = NSHostingController(rootView: root)
         let visible = NSScreen.main?.visibleFrame.size ?? NSSize(width: 1100, height: 800)
         let initial = NSRect(x: 0, y: 0, width: min(1060, visible.width - 32),
@@ -1923,12 +2013,12 @@ final class ArenaDetailsWindowController: NSObject, NSWindowDelegate, NSToolbarD
 
     @objc private func copyReport(_ sender: Any?) {
         guard let report = ArenaSessionDigest.report(hostedModel?.session) else { return }
-        arenaCopyToPasteboard(report)
+        feedback.copyToPasteboard(report)
     }
 
     @objc private func exportMarkdown(_ sender: Any?) {
         guard let model = hostedModel else { return }
-        ArenaExporter.export(model: model)
+        ArenaExporter.export(model: model, feedback: feedback)
     }
 
     // The system green button, ⌃⌘F and the title-bar double-click own zoom and
@@ -1958,6 +2048,7 @@ final class ArenaDetailsWindowController: NSObject, NSWindowDelegate, NSToolbarD
 struct ArenaDetailsWindowView: View {
     @ObservedObject var model: ArenaModel
     @ObservedObject var state: ArenaDetailsWindowState
+    @ObservedObject var feedback: ArenaFeedbackPresenter
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     private var session: [String: Any]? { model.session }
@@ -1984,6 +2075,11 @@ struct ArenaDetailsWindowView: View {
         }
         .frame(minWidth: 520, minHeight: 420)
         .background(ArenaGlassSurface(material: .underWindowBackground, cornerRadius: 0))
+        .overlay(alignment: .bottom) {
+            ArenaFeedbackOverlay(presenter: feedback)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 18)
+        }
         .onAppear { state.normalize(session: session) }
         .onChange(of: sessionIdentity) { _ in state.normalize(session: session) }
     }
@@ -2006,7 +2102,7 @@ struct ArenaDetailsWindowView: View {
             Menu {
                 Button("原始记录（JSON）") { state.showsRawRecord = true }
                 Button("复制 JSON") {
-                    arenaCopyToPasteboard(ArenaJSON.string(session))
+                    feedback.copyToPasteboard(ArenaJSON.string(session))
                 }
                 .disabled(session == nil)
             } label: {
@@ -2162,7 +2258,7 @@ struct ArenaDetailsWindowView: View {
                 }
                 Spacer(minLength: 8)
                 Button(copyLabel) {
-                    if let value { arenaCopyToPasteboard(value) }
+                    if let value { feedback.copyToPasteboard(value) }
                 }
                 .controlSize(.large)
                 .disabled(value == nil)
@@ -2220,7 +2316,8 @@ struct ArenaDetailsWindowView: View {
                         ArenaAnswerDisclosure(
                             row: row,
                             session: model.session,
-                            reviewMaterials: reviewMaterials[row.id]
+                            reviewMaterials: reviewMaterials[row.id],
+                            feedback: feedback
                         )
                     }
                 }
@@ -2254,7 +2351,7 @@ struct ArenaDetailsWindowView: View {
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 8)
                 Button("复制 JSON") {
-                    arenaCopyToPasteboard(ArenaJSON.string(session))
+                    feedback.copyToPasteboard(ArenaJSON.string(session))
                 }
                 .controlSize(.large)
                 .disabled(session == nil)
@@ -2294,6 +2391,7 @@ struct ArenaAnswerDisclosure: View {
     let row: ArenaTaskRow
     let session: [String: Any]?
     let reviewMaterials: [[String: String]]?
+    let feedback: ArenaFeedbackPresenter
 
     private var reviewSummary: String {
         guard let reviewMaterials else { return "评审材料无法核对" }
@@ -2342,7 +2440,7 @@ struct ArenaAnswerDisclosure: View {
                 }
                 Spacer(minLength: 8)
                 Button("复制原文") {
-                    if let text = row.answer { arenaCopyToPasteboard(text) }
+                    if let text = row.answer { feedback.copyToPasteboard(text) }
                 }
                 .controlSize(.large)
                 .buttonStyle(.borderless)
@@ -2658,9 +2756,9 @@ struct ArenaSavedMaterials: View {
 enum ArenaExporter {
 
     @MainActor
-    static func export(model: ArenaModel) {
+    static func export(model: ArenaModel, feedback: ArenaFeedbackPresenter) {
         guard model.session != nil else {
-            model.errorMessage = "还没有可导出的场次"
+            feedback.show("还没有可导出的场次", tone: .failure)
             return
         }
         let markdown = makeMarkdown(model: model)
@@ -2679,8 +2777,10 @@ enum ArenaExporter {
             }
             try data.write(to: url, options: .atomic)
         } catch {
-            model.errorMessage = "导出失败：\(error.localizedDescription)"
+            feedback.show("导出失败：\(error.localizedDescription)", tone: .failure)
+            return
         }
+        feedback.show("已导出 Markdown")
     }
 
     @MainActor
@@ -2824,12 +2924,6 @@ enum ArenaExporter {
         }
         return "AI-Arena-\(stamp).md"
     }
-}
-
-fileprivate func arenaCopyToPasteboard(_ text: String) {
-    let pasteboard = NSPasteboard.general
-    pasteboard.clearContents()
-    pasteboard.setString(text, forType: .string)
 }
 
 // MARK: - 终端冒烟验收
