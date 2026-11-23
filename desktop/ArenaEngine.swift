@@ -222,6 +222,11 @@ struct ArenaDeliveryIntent: Codable, Equatable {
     /// not hand the same task a second reload it already used.
     var reloadAttempted: Bool? = nil
 
+    /// `true` once this task spent its one bounded automatic return to the
+    /// saved conversation after a same-origin drift. Never authorises a send or
+    /// a read-only claim by itself; it only stops repeated navigation.
+    var driftReturnAttempted: Bool? = nil
+
     /// The driver verified that it wrote this prompt before the send control
     /// became available. Older records can still prove ownership via a receipt.
     var composerFilled: Bool? = nil

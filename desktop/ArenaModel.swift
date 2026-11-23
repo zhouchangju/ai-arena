@@ -747,6 +747,30 @@ final class ArenaModel: ObservableObject {
         ensureDispatcher(token: runToken)
     }
 
+    /// Explicit user action from a drifted seat: reopen the saved conversation
+    /// and resume this one seat. It never sends anything by itself; the normal
+    /// `resumeSeat` phase rules decide whether this is a guarded pre-click
+    /// retry, a read-only check, or an immediate stop.
+    func returnToBoundConversationAndResume(_ provider: String) {
+        guard !isReadOnly else {
+            errorMessage = "历史回看为只读；新建讨论后才能操作原页"
+            return
+        }
+        guard let pane = panes[provider] else {
+            errorMessage = "「\(displayName(provider))」原页不可用"
+            return
+        }
+        guard pane.boundConversationURL != nil else {
+            errorMessage = "「\(displayName(provider))」尚未固定本场对话"
+            return
+        }
+        guard pane.openBoundConversation() else {
+            errorMessage = "「\(displayName(provider))」的本场对话地址未通过核对"
+            return
+        }
+        resumeSeat(provider)
+    }
+
     /// Accept a manually relayed answer for one seat.
     ///
     /// During the vote stage an explicit stance is mandatory. A `STANCE: …`
@@ -1347,13 +1371,26 @@ final class ArenaModel: ObservableObject {
                     return false
                 }
                 // 原页被换到同站别的对话：Swift 在发命令前就拒绝了，什么都没发出。
-                // 停在本轮转人工，不记“可能已发送”，也不做只读核对。
-                if stopOnConversationChange(error, provider: provider, taskID: taskID) {
-                    intent.phase = .prepared
-                    intent.pageURL = nil
-                    intents[taskID] = intent
+                // 这里是明确的点击前状态：先把意图退回 prepared（持久化），再
+                // 有界地自动回到已保存、已核验的对话；回不去就转人工。
+                if let paneError = error as? SitePaneError, paneError.isConversationChanged {
+                    var safe = intent
+                    safe.phase = .prepared
+                    safe.pageURL = nil
+                    intents[taskID] = safe
                     persist()
-                    return false
+                    switch await recoverConversationDrift(
+                        provider: provider,
+                        taskID: taskID,
+                        pane: pane,
+                        token: token,
+                        phase: .beforeSend
+                    ) {
+                    case .recovered:
+                        continue
+                    case .stopped, .blocked:
+                        return false
+                    }
                 }
                 // Outcome unknown: never retry.
                 intent.phase = .uncertain
@@ -1417,6 +1454,36 @@ final class ArenaModel: ObservableObject {
             // reply may already have clicked.
             let explicitlyPreClick = (detail?["clickAttempted"] as? Bool) == false
                 && (detail?["phase"] as? String) == "pre-click"
+            // The driver's address check can answer at `authorize`, `pre-fill`
+            // or `pre-click`. All three carry clickAttempted == false; only
+            // those may authorise an automatic return. A post-click
+            // conversation-changed (if one ever appears) stays uncertain.
+            let conversationDeniedBeforeSend = (detail?["clickAttempted"] as? Bool) == false
+                && ["authorize", "pre-fill", "pre-click"].contains(detail?["phase"] as? String ?? "")
+
+            // The driver's own conversation guard can answer at authorize,
+            // pre-fill or pre-click, always with clickAttempted == false. The
+            // page is on another conversation and nothing was filled or
+            // clicked: return to the saved conversation if it is safe.
+            if code == "conversation-changed", conversationDeniedBeforeSend {
+                var safe = intent
+                safe.phase = .prepared
+                safe.pageURL = nil
+                intents[taskID] = safe
+                persist()
+                switch await recoverConversationDrift(
+                    provider: provider,
+                    taskID: taskID,
+                    pane: pane,
+                    token: token,
+                    phase: .beforeSend
+                ) {
+                case .recovered:
+                    continue
+                case .stopped, .blocked:
+                    return false
+                }
+            }
 
             // A partial upload, a changed image draft or a missing receipt
             // cannot authorize another upload, reload or blind click.
@@ -1580,9 +1647,21 @@ final class ArenaModel: ObservableObject {
                 return nil
             } catch {
                 guard token == runToken, !isReadOnly else { return nil }
-                // 本轮会话被换走：立即转人工，不做 34 秒的瞬态重试。
-                if stopOnConversationChange(error, provider: provider, taskID: taskID) {
-                    return nil
+                // 本轮会话被换走：先尝试一次有界回到已保存对话，不发送。
+                if let paneError = error as? SitePaneError, paneError.isConversationChanged {
+                    switch await recoverConversationDrift(
+                        provider: provider,
+                        taskID: taskID,
+                        pane: pane,
+                        token: token,
+                        phase: .beforeSend
+                    ) {
+                    case .recovered:
+                        attempt += 1
+                        continue
+                    case .stopped, .blocked:
+                        return nil
+                    }
                 }
                 // 冷启动恢复后，WK 内容进程终止或一次瞬时网络导航失败会让
                 // 文档永远等不到 didFinish。此时允许一次回到本席原页的导航；
@@ -1645,7 +1724,7 @@ final class ArenaModel: ObservableObject {
         var showedSubmitted = false
         var consecutiveErrors = 0
 
-        while true {
+        poll: while true {
             if token != runToken || isReadOnly { return }
             if manualProviders.contains(provider) {
                 setState(provider, .takenOver, "已接管，等待你核对原页")
@@ -1692,6 +1771,22 @@ final class ArenaModel: ObservableObject {
                 consecutiveErrors = 0
                 let status = response.arenaString("status") ?? ""
                 let code = response.arenaString("error") ?? ""
+
+                if code == "conversation-changed" {
+                    switch await recoverConversationDrift(
+                        provider: provider,
+                        taskID: taskID,
+                        pane: pane,
+                        token: token,
+                        phase: .reading
+                    ) {
+                    case .recovered:
+                        consecutiveErrors = 0
+                        continue poll
+                    case .stopped, .blocked:
+                        return
+                    }
+                }
 
                 if code.hasPrefix("attachment-") {
                     blockedTasks.insert(taskID)
@@ -1747,7 +1842,13 @@ final class ArenaModel: ObservableObject {
                     }
                 case "unknown":
                     blockedTasks.insert(taskID)
-                    setState(provider, .needsAction, "需要你核对原页（\(Self.friendly(errorCode: code.isEmpty ? "unknown" : code))）")
+                    if intents[taskID]?.driftReturnAttempted == true,
+                       Self.isPostReturnPromptMismatch(code.isEmpty ? "unknown" : code) {
+                        setState(provider, .needsAction,
+                                 Self.conversationDriftReadFailureMessage(.reading))
+                    } else {
+                        setState(provider, .needsAction, "需要你核对原页（\(Self.friendly(errorCode: code.isEmpty ? "unknown" : code))）")
+                    }
                     return
                 default:
                     if code == "document-not-ready" || code == "not-authorized-page" {
@@ -1757,13 +1858,31 @@ final class ArenaModel: ObservableObject {
                         }
                     } else {
                         blockedTasks.insert(taskID)
-                        setState(provider, .needsAction, "需要你核对原页：\(Self.friendly(errorCode: code))")
+                        if intents[taskID]?.driftReturnAttempted == true,
+                           Self.isPostReturnPromptMismatch(code) {
+                            setState(provider, .needsAction,
+                                     Self.conversationDriftReadFailureMessage(.reading))
+                        } else {
+                            setState(provider, .needsAction, "需要你核对原页：\(Self.friendly(errorCode: code))")
+                        }
                         return
                     }
                 }
             } catch {
-                if stopOnConversationChange(error, provider: provider, taskID: taskID) {
-                    return
+                if let paneError = error as? SitePaneError, paneError.isConversationChanged {
+                    switch await recoverConversationDrift(
+                        provider: provider,
+                        taskID: taskID,
+                        pane: pane,
+                        token: token,
+                        phase: .reading
+                    ) {
+                    case .recovered:
+                        consecutiveErrors = 0
+                        continue poll
+                    case .stopped, .blocked:
+                        return
+                    }
                 }
                 consecutiveErrors += 1
                 if Date() >= deadline || consecutiveErrors >= 20 {
@@ -1780,6 +1899,276 @@ final class ArenaModel: ObservableObject {
                 return
             }
             try? await Task.sleep(nanoseconds: 1_200_000_000)
+        }
+    }
+
+    // MARK: Bounded conversation drift return
+
+    /// Why this worker may be away from its saved conversation.
+    enum ConversationDriftPhase: Equatable {
+        /// Before a submit: nothing has been sent for this task.
+        case beforeSend
+        /// Reading an already delivered answer.
+        case reading
+        /// Confirming a submit whose outcome is unknown.
+        case verifying
+    }
+
+    enum ConversationDriftDecision: Equatable {
+        case proceed
+        /// Pause, takeover, a replaced discussion or a finished task.
+        case stop
+        /// The page must not move; a human decides.
+        case blocked(String)
+    }
+
+    /// The single bounded automatic return policy. It only decides whether the
+    /// page may move back to the saved conversation; it never authorises a
+    /// click, submit or read-only delivery claim.
+    nonisolated static func conversationDriftReturnDecision(
+        bound: Bool,
+        drifted: Bool,
+        alreadyUsed: Bool,
+        phase: ArenaDeliveryIntent.Phase?,
+        openingImagesPrepared: Bool,
+        taskIsCurrent: Bool,
+        paused: Bool,
+        takenOver: Bool
+    ) -> ConversationDriftDecision {
+        guard taskIsCurrent, !paused, !takenOver else { return .stop }
+        guard bound else {
+            return .blocked("本席尚未固定本场对话，不能自动返回。请核对原页或「人工接管」后「文本补录…」。")
+        }
+        guard drifted else {
+            // This helper is only called after the page or the driver reported a
+            // conversation change. A nil WebKit mismatch at this point means
+            // WebKit and the page driver disagree; never let a worker loop.
+            return .blocked(
+                "原页地址与网页内容不一致，无法自动恢复。请核对原页，再点「回到本场对话并恢复」。"
+            )
+        }
+        if alreadyUsed {
+            return .blocked(
+                "已尝试自动恢复，本任务不再自动跳转。请核对原页，再点「回到本场对话并恢复」。"
+            )
+        }
+        if openingImagesPrepared, phase == .prepared || phase == nil {
+            return .blocked(
+                "首轮图片已放入原页，自动返回会丢失材料。请先核对附件，再点「回到本场对话并恢复」。"
+            )
+        }
+        return .proceed
+    }
+
+    nonisolated static func conversationDriftPrefix(_ phase: ConversationDriftPhase) -> String {
+        switch phase {
+        case .beforeSend: return "原页切到了另一段对话，本轮尚未发送。"
+        case .reading: return "本轮提问已发出，网页切到了另一段对话。"
+        case .verifying: return "本轮提问可能已发出，网页切到了另一段对话。只核对、不重发。"
+        }
+    }
+
+    nonisolated static func conversationDriftRecoveredMessage(_ phase: ConversationDriftPhase) -> String {
+        switch phase {
+        case .beforeSend:
+            return conversationDriftPrefix(phase)
+                + "已自动回到本场对话，继续发送前核对。"
+        case .reading:
+            return conversationDriftPrefix(phase)
+                + "已自动回到本场对话，继续只读读取。"
+        case .verifying:
+            return conversationDriftPrefix(phase)
+                + "已自动回到本场对话，继续只读核对。"
+        }
+    }
+
+    nonisolated static func conversationDriftBlockedMessage(
+        _ phase: ConversationDriftPhase,
+        reason: String
+    ) -> String {
+        conversationDriftPrefix(phase) + "未自动跳转。" + reason
+    }
+
+    nonisolated static func conversationDriftUnreachableMessage(
+        _ phase: ConversationDriftPhase,
+        reason: String
+    ) -> String {
+        conversationDriftPrefix(phase)
+            + "自动返回未成功（\(reason)）。请点「回到本场对话并恢复」。"
+    }
+
+    /// 自动返回后仍未核对到本轮完整提问。这里必须说清下一步，但不暗示重发。
+    nonisolated static func conversationDriftReadFailureMessage(
+        _ phase: ConversationDriftPhase
+    ) -> String {
+        switch phase {
+        case .beforeSend:
+            return "已回到本场对话，但未核对到本轮完整提示。请核对原页；仍不符时用 ⋯「人工接管」和「文本补录…」，不会自动发送。"
+        case .reading:
+            return "已回到本场对话，但未核对到本轮完整提问。请核对原页；仍不符时用 ⋯「人工接管」和「文本补录…」，不会自动重发。"
+        case .verifying:
+            return "已回到本场对话，但未核对到本轮完整提问。本轮可能已发出，只核对、不重发；仍不符时用 ⋯「人工接管」和「文本补录…」。"
+        }
+    }
+
+    nonisolated static func isPostReturnPromptMismatch(_ code: String) -> Bool {
+        switch code {
+        case "user-turn-mismatch", "history-changed", "task-prompt-mismatch",
+             "task-unknown", "page-changed", "recovery-timeout":
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Concise, actionable reasons for a protected drift page. No URL is ever
+    /// put into the seat header, so a narrow window cannot ellipsize it.
+    nonisolated static func conversationDriftSafetyReason(
+        _ safety: SitePaneConversationDriftSafety
+    ) -> String {
+        switch safety {
+        case .draft:
+            return "当前页有未发送的草稿或附件。请先保存，再点「回到本场对话并恢复」。"
+        case .generating:
+            return "当前页仍在生成。请等结束后，再点「回到本场对话并恢复」。"
+        case .loginBarrier:
+            return "当前页停在登录页。请先登录，再点「回到本场对话并恢复」。"
+        case .unavailable(let code):
+            return "无法核对当前页（\(conversationDriftUnavailableReason(code))）。请核对原页，再点「回到本场对话并恢复」。"
+        case .safe:
+            return ""
+        }
+    }
+
+    nonisolated static func conversationDriftUnavailableReason(_ code: String) -> String {
+        switch code {
+        case "selector-missing": return "原页缺少可核对控件"
+        case "document-not-ready": return "原页尚未就绪"
+        case "not-authorized-page", "out-of-scope": return "原页地址不可核对"
+        case "loginbarrier": return "需要登录"
+        default: return "原页状态无法确认"
+        }
+    }
+
+    private enum ConversationDriftRecovery {
+        case recovered
+        case stopped
+        case blocked
+    }
+
+    /// One bounded, read-only return to the saved conversation. Every await is
+    /// surrounded by the run token, task, pause and takeover checks; a human
+    /// draft, live generation, login barrier or unreadable page stops it.
+    private func recoverConversationDrift(
+        provider: String,
+        taskID: String,
+        pane: SitePane,
+        token: UUID,
+        phase: ConversationDriftPhase
+    ) async -> ConversationDriftRecovery {
+        guard token == runToken, !isReadOnly else { return .stopped }
+        let decision = Self.conversationDriftReturnDecision(
+            bound: pane.boundConversationURL != nil,
+            drifted: pane.conversationMismatch() != nil,
+            alreadyUsed: intents[taskID]?.driftReturnAttempted == true,
+            phase: intents[taskID]?.phase,
+            openingImagesPrepared: stageKey == "independent"
+                && !openingImages.isEmpty
+                && intents[taskID]?.imagePreparationStarted == true,
+            taskIsCurrent: isCurrentPending(taskID),
+            paused: isPaused,
+            takenOver: manualProviders.contains(provider)
+        )
+        switch decision {
+        case .stop:
+            return .stopped
+        case .blocked(let reason):
+            blockedTasks.insert(taskID)
+            setState(
+                provider,
+                .needsAction,
+                Self.conversationDriftBlockedMessage(phase, reason: reason)
+            )
+            return .blocked
+        case .proceed:
+            break
+        }
+
+        // Reserve the one automatic return durably *before* the page moves.
+        // Only the flag is added: an existing intent keeps every other field.
+        // A task with no intent yet (a drift caught before its first probe) gets
+        // a prepared intent, because no click can have happened.
+        let priorIntent = intents[taskID]
+        guard let prompt = priorIntent?.prompt ?? currentTask(taskID)?.arenaString("prompt"),
+              !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            blockedTasks.insert(taskID)
+            setState(provider, .needsAction,
+                     "无法取得本轮原文，未自动回到本场对话；请核对原页或「人工接管」后「文本补录…」。")
+            return .blocked
+        }
+        var reservation = priorIntent ?? newIntent(taskID: taskID, prompt: prompt)
+        reservation.driftReturnAttempted = true
+        intents[taskID] = reservation
+        guard persist() else {
+            if let priorIntent {
+                intents[taskID] = priorIntent
+            } else {
+                intents.removeValue(forKey: taskID)
+            }
+            blockedTasks.insert(taskID)
+            setState(provider, .needsAction,
+                     "本地保存失败，未自动回到本场对话；请先处理存储再重试。")
+            return .blocked
+        }
+
+        let outcome = await pane.returnToBoundConversationIfSafe(taskID: taskID) {
+            token == self.runToken
+                && !self.isReadOnly
+                && !self.isPaused
+                && !self.manualProviders.contains(provider)
+                && self.isCurrentPending(taskID)
+        }
+        guard callbackIsCurrent(token: token, taskID: taskID, provider: provider) else {
+            return .stopped
+        }
+
+        switch outcome {
+        case .returned:
+            // The page and WebKit must agree after the await. If they do not,
+            // keep the task blocked instead of silently looping on reads.
+            guard pane.conversationMismatch() == nil else {
+                blockedTasks.insert(taskID)
+                setState(provider, .needsAction,
+                         "已尝试回到本场对话，但原页地址仍不一致。请核对原页，再点「回到本场对话并恢复」。")
+                return .blocked
+            }
+            setState(
+                provider,
+                phase == .beforeSend ? .sending : .generating,
+                Self.conversationDriftRecoveredMessage(phase)
+            )
+            return .recovered
+        case .blocked(let safety):
+            blockedTasks.insert(taskID)
+            setState(
+                provider,
+                .needsAction,
+                Self.conversationDriftBlockedMessage(
+                    phase,
+                    reason: Self.conversationDriftSafetyReason(safety)
+                )
+            )
+            return .blocked
+        case .unreachable(let reason):
+            blockedTasks.insert(taskID)
+            setState(
+                provider,
+                .needsAction,
+                Self.conversationDriftUnreachableMessage(phase, reason: reason)
+            )
+            return .blocked
+        case .cancelled, .notDrifted:
+            return .stopped
         }
     }
 
@@ -2387,19 +2776,6 @@ final class ArenaModel: ObservableObject {
         }
     }
 
-    /// 原页被换到同站别的对话时，Swift 在发命令前就拒绝（web-driver 也会在
-    /// 最后一次填入/点击前再拒绝一次）。两种拒绝都停在本轮转人工核对：
-    /// 不发、不重试，也不把“没发出”记成可能已发送。
-    @discardableResult
-    private func stopOnConversationChange(_ error: Error, provider: String, taskID: String) -> Bool {
-        guard let paneError = error as? SitePaneError, paneError.isConversationChanged else {
-            return false
-        }
-        blockedTasks.insert(taskID)
-        setState(provider, .needsAction, "已转人工：\(paneError.localizedDescription)")
-        return true
-    }
-
     /// Explicit input conflicts the page rejected before any click. They are
     /// safe to keep at `.prepared`, but must go to a human instead of being
     /// retried automatically. Anything not listed here is treated as possibly
@@ -2432,7 +2808,7 @@ final class ArenaModel: ObservableObject {
             : Self.fixtureProbeWindowSeconds
         let deadline = Date().addingTimeInterval(window)
 
-        while true {
+        verify: while true {
             guard !Task.isCancelled else { return .stopped }
             guard await waitWhilePaused(token) else { return .stopped }
             guard callbackIsCurrent(token: token, taskID: taskID, provider: provider) else {
@@ -2469,6 +2845,20 @@ final class ArenaModel: ObservableObject {
                 persistVerifiedBinding(pane, from: response, taskID: taskID)
                 let status = response.arenaString("status") ?? ""
                 let code = response.arenaString("error") ?? ""
+                if code == "conversation-changed" {
+                    switch await recoverConversationDrift(
+                        provider: provider,
+                        taskID: taskID,
+                        pane: pane,
+                        token: token,
+                        phase: .verifying
+                    ) {
+                    case .recovered:
+                        continue verify
+                    case .stopped, .blocked:
+                        return .stopped
+                    }
+                }
                 if code.hasPrefix("attachment-") {
                     return .unconfirmed(attachmentProblem(response, fallback: code))
                 }
@@ -2485,6 +2875,13 @@ final class ArenaModel: ObservableObject {
                     try? await Task.sleep(nanoseconds: 1_200_000_000)
                     continue
                 case "unknown":
+                    if intents[taskID]?.driftReturnAttempted == true,
+                       Self.isPostReturnPromptMismatch(code.isEmpty ? "unknown" : code) {
+                        blockedTasks.insert(taskID)
+                        setState(provider, .needsAction,
+                                 Self.conversationDriftReadFailureMessage(.verifying))
+                        return .stopped
+                    }
                     return .unconfirmed(Self.friendly(errorCode: code.isEmpty ? "unknown" : code))
                 default:
                     if code == "document-not-ready" || code == "not-authorized-page",
@@ -2492,14 +2889,30 @@ final class ArenaModel: ObservableObject {
                         try? await Task.sleep(nanoseconds: 1_200_000_000)
                         continue
                     }
+                    if intents[taskID]?.driftReturnAttempted == true,
+                       Self.isPostReturnPromptMismatch(code) {
+                        blockedTasks.insert(taskID)
+                        setState(provider, .needsAction,
+                                 Self.conversationDriftReadFailureMessage(.verifying))
+                        return .stopped
+                    }
                     return .unconfirmed(Self.friendly(errorCode: code.isEmpty ? status : code))
                 }
             } catch {
                 guard token == runToken, !isReadOnly, !Task.isCancelled else { return .stopped }
                 if let paneError = error as? SitePaneError, paneError.isConversationChanged {
-                    blockedTasks.insert(taskID)
-                    setState(provider, .needsAction, "已转人工：\(paneError.localizedDescription)")
-                    return .unconfirmed("原页对话已更换")
+                    switch await recoverConversationDrift(
+                        provider: provider,
+                        taskID: taskID,
+                        pane: pane,
+                        token: token,
+                        phase: .verifying
+                    ) {
+                    case .recovered:
+                        continue verify
+                    case .stopped, .blocked:
+                        return .stopped
+                    }
                 }
                 if Date() < deadline {
                     try? await Task.sleep(nanoseconds: 1_200_000_000)
@@ -3033,7 +3446,7 @@ final class ArenaModel: ObservableObject {
         case "document-not-ready": return "原页尚未加载完成"
         case "not-authorized-page": return "原页尚未就绪"
         case "out-of-scope": return "原页地址与登记的站点不一致"
-        case "conversation-changed": return "原页已切换到别的对话，未发送；请切回本场对话或接管"
+        case "conversation-changed": return "原页已切到别的对话，未发送"
         case "selector-missing": return "原页缺少输入或发送控件（站点可能改版）"
         case "selector-ambiguous": return "原页控件不唯一"
         case "selector-overlap": return "消息选择器重叠"

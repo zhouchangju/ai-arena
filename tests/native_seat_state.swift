@@ -190,6 +190,115 @@ struct NativeSeatStateCheck {
         check("legacy finish counts distinct review rounds and defaults to two",
               ArenaStageNames.reviewRound(legacyFinish) == "互评第 1 轮 / 上限 2")
 
+        // --- 7. Bounded conversation-drift return -----------------------------
+        let allowedDrift = ArenaModel.conversationDriftReturnDecision(
+            bound: true, drifted: true, alreadyUsed: false, phase: .submitted,
+            openingImagesPrepared: false, taskIsCurrent: true, paused: false, takenOver: false
+        )
+        check("a submitted task may return to its saved conversation", allowedDrift == .proceed)
+
+        let preparedDrift = ArenaModel.conversationDriftReturnDecision(
+            bound: true, drifted: true, alreadyUsed: false, phase: .prepared,
+            openingImagesPrepared: false, taskIsCurrent: true, paused: false, takenOver: false
+        )
+        check("a prepared task may return before its guarded pre-click path", preparedDrift == .proceed)
+
+        func driftReason(_ decision: ArenaModel.ConversationDriftDecision) -> String? {
+            if case .blocked(let reason) = decision { return reason }
+            return nil
+        }
+        let usedReason = driftReason(ArenaModel.conversationDriftReturnDecision(
+            bound: true, drifted: true, alreadyUsed: true, phase: .submitted,
+            openingImagesPrepared: false, taskIsCurrent: true, paused: false, takenOver: false
+        ))
+        check("a second drift is not returned automatically",
+              usedReason?.contains("已尝试自动恢复") == true)
+        check("the repeat message never claims a successful return",
+              usedReason?.contains("已自动返回") == false)
+        check("the repeat message offers the real recovery button",
+              usedReason?.contains("回到本场对话并恢复") == true)
+
+        let mismatchReason = driftReason(ArenaModel.conversationDriftReturnDecision(
+            bound: true, drifted: false, alreadyUsed: false, phase: .submitted,
+            openingImagesPrepared: false, taskIsCurrent: true, paused: false, takenOver: false
+        ))
+        check("a WebKit/driver disagreement blocks instead of looping",
+              mismatchReason?.contains("原页地址与网页内容不一致") == true)
+        check("a WebKit/driver disagreement asks for page verification",
+              mismatchReason?.contains("核对原页") == true
+                  && mismatchReason?.contains("回到本场对话并恢复") == true)
+
+        let imageReason = driftReason(ArenaModel.conversationDriftReturnDecision(
+            bound: true, drifted: true, alreadyUsed: false, phase: .prepared,
+            openingImagesPrepared: true, taskIsCurrent: true, paused: false, takenOver: false
+        ))
+        check("prepared opening images block an automatic return", imageReason?.contains("首轮图片") == true)
+
+        let noBoundReason = driftReason(ArenaModel.conversationDriftReturnDecision(
+            bound: false, drifted: true, alreadyUsed: false, phase: .submitted,
+            openingImagesPrepared: false, taskIsCurrent: true, paused: false, takenOver: false
+        ))
+        check("an unbound seat is never returned", noBoundReason?.contains("尚未固定") == true)
+        check("an unbound seat is not offered a return action",
+              noBoundReason?.contains("回到本场对话") == false)
+
+        check("a paused or taken-over seat never returns", ArenaModel.conversationDriftReturnDecision(
+            bound: true, drifted: true, alreadyUsed: false, phase: .submitted,
+            openingImagesPrepared: false, taskIsCurrent: true, paused: true, takenOver: false
+        ) == .stop)
+        check("a replaced task never returns", ArenaModel.conversationDriftReturnDecision(
+            bound: true, drifted: true, alreadyUsed: false, phase: .submitted,
+            openingImagesPrepared: false, taskIsCurrent: false, paused: false, takenOver: false
+        ) == .stop)
+        check("a taken-over seat never returns", ArenaModel.conversationDriftReturnDecision(
+            bound: true, drifted: true, alreadyUsed: false, phase: .submitted,
+            openingImagesPrepared: false, taskIsCurrent: true, paused: false, takenOver: true
+        ) == .stop)
+
+        let recoveredReading = ArenaModel.conversationDriftRecoveredMessage(.reading)
+        check("a recovered read says the turn was sent and stays read-only",
+              recoveredReading.contains("本轮提问已发出")
+                  && recoveredReading.contains("已自动回到本场对话")
+                  && recoveredReading.contains("只读"))
+        let blockedDraft = ArenaModel.conversationDriftBlockedMessage(
+            .reading,
+            reason: ArenaModel.conversationDriftSafetyReason(.draft)
+        )
+        check("a draft blocks the return with concrete steps",
+              blockedDraft.contains("未发送的草稿或附件")
+                  && blockedDraft.contains("回到本场对话并恢复"))
+        check("a draft message does not repeat menu alternatives",
+              !blockedDraft.contains("文本补录") && !blockedDraft.contains("恢复本站自动"))
+        let unreachable = ArenaModel.conversationDriftUnreachableMessage(.verifying, reason: "离线")
+        check("an unreachable original keeps the send uncertain and read-only",
+              unreachable.contains("可能已发出")
+                  && unreachable.contains("只核对、不重发")
+                  && unreachable.contains("自动返回未成功"))
+        let postReturnMismatch = ArenaModel.conversationDriftReadFailureMessage(.reading)
+        check("a post-return prompt mismatch says what to do next",
+              postReturnMismatch.contains("未核对到本轮完整提问")
+                  && postReturnMismatch.contains("人工接管")
+                  && postReturnMismatch.contains("文本补录…")
+                  && postReturnMismatch.contains("不会自动重发"))
+        let postReturnUncertain = ArenaModel.conversationDriftReadFailureMessage(.verifying)
+        check("a post-return uncertain mismatch says it will not resend",
+              postReturnUncertain.contains("可能已发出")
+                  && postReturnUncertain.contains("只核对、不重发"))
+        check("post-return prompt mismatches are recognized",
+              ["user-turn-mismatch", "history-changed", "task-prompt-mismatch",
+               "task-unknown", "page-changed", "recovery-timeout"].allSatisfy(
+                  ArenaModel.isPostReturnPromptMismatch
+              ))
+        check("an unrelated error is not labelled a post-return prompt mismatch",
+              !ArenaModel.isPostReturnPromptMismatch("selector-missing"))
+        let unknownPage = ArenaModel.conversationDriftBlockedMessage(
+            .beforeSend,
+            reason: ArenaModel.conversationDriftSafetyReason(.unavailable("selector-missing"))
+        )
+        check("an uninspectable page fails closed", unknownPage.contains("无法核对"))
+        check("drift status text never embeds a URL",
+              ![recoveredReading, blockedDraft, unreachable, unknownPage].contains { $0.contains("http") })
+
         if failures == 0 {
             print("native seat state: all checks passed")
             exit(0)

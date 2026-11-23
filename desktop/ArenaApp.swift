@@ -1037,6 +1037,7 @@ struct ArenaRootView: View {
                 onPrompt: { presentDetails(provider: provider, tab: .prompts) },
                 onTakeOver: { model.takeOver(provider) },
                 onResume: { model.resumeSeat(provider) },
+                onReturnToBound: { model.returnToBoundConversationAndResume(provider) },
                 onBackfill: { presentBackfill(provider) },
                 skipTarget: model.manualTarget(for: provider),
                 onSkip: { target in
@@ -1223,12 +1224,15 @@ struct ArenaSeatCard: View {
     let onPrompt: () -> Void
     let onTakeOver: () -> Void
     let onResume: () -> Void
+    let onReturnToBound: () -> Void
     let onBackfill: () -> Void
     let skipTarget: ArenaManualTarget?
     let onSkip: (ArenaManualTarget) -> Void
 
     @State private var confirmingSkip = false
     @State private var confirmedSkipTarget: ArenaManualTarget?
+    @State private var confirmingReturn = false
+    @State private var resumeAfterReturn = false
 
     private var openError: String? {
         pane.lastError ?? pane.lastNavigationError
@@ -1275,17 +1279,40 @@ struct ArenaSeatCard: View {
                 Text(status.detail)
                     .font(.system(size: 10.5))
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                    .lineLimit(status.kind == .needsAction ? nil : 1)
+                    .truncationMode(.tail)
+                    .fixedSize(horizontal: false, vertical: true)
                     .help(status.detail)
                     .padding(.leading, 16)
                     .padding(.trailing, 4)
                     .accessibilityLabel("\(ArenaSeatCatalog.name(provider)) 状态：\(status.detail)")
             }
             .padding(.horizontal, 9)
-            .padding(.vertical, 3)
-            .frame(height: 50)
+            .padding(.vertical, 4)
+            .frame(minHeight: 50)
             .background(Color.primary.opacity(0.035))
+
+            if pane.boundConversationURL != nil, pane.conversationMismatch() != nil {
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.uturn.backward.circle.fill")
+                    Text("原页已切到其他对话")
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Button(controls.canResume ? "回到本场对话并恢复" : "回到本场对话") {
+                        resumeAfterReturn = controls.canResume
+                        confirmingReturn = true
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+                    .help("重新打开本席已核验的本场对话；当前页未发送的内容不会保留")
+                }
+                .font(.system(size: 10.5))
+                .foregroundStyle(Color.orange)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 3)
+                .background(Color.orange.opacity(0.10))
+            }
 
             Divider()
 
@@ -1294,6 +1321,19 @@ struct ArenaSeatCard: View {
                 if pane.webView.url == nil || pane.isWebContentTerminated {
                     placeholder
                 }
+            }
+            .alert(resumeAfterReturn ? "回到本场对话并恢复自动？" : "回到本场对话？",
+                   isPresented: $confirmingReturn) {
+                Button(resumeAfterReturn ? "回到并恢复" : "回到本场对话") {
+                    if resumeAfterReturn {
+                        onReturnToBound()
+                    } else {
+                        _ = pane.openBoundConversation()
+                    }
+                }
+                Button("取消", role: .cancel) {}
+            } message: {
+                Text("当前页未发送的内容（含草稿和附件）不会保留。若需要，请先复制或保存草稿。")
             }
         }
         .background(Color(nsColor: .textBackgroundColor))
@@ -1318,8 +1358,24 @@ struct ArenaSeatCard: View {
     private var menu: some View {
         Menu {
             Button("查看当前提示…", action: onPrompt)
+            if pane.boundConversationURL != nil {
+                Button("回到本场对话") {
+                    resumeAfterReturn = false
+                    confirmingReturn = true
+                }
+                .help("重新打开已核验的本场对话；当前页未发送的内容不会保留")
+                Button("回到本场对话并恢复自动") {
+                    resumeAfterReturn = true
+                    confirmingReturn = true
+                }
+                .disabled(!controls.canResume)
+                .help(controls.canResume
+                      ? "重新打开本场对话，并按已保存阶段恢复本席；可能已发送的只读核对，不会重发"
+                      : "本席当前没有可恢复的任务")
+            }
             Button("回原站首页") { pane.openHome() }
                 .disabled(!homeAllowed)
+                .help("会离开本场对话；当前页未发送的内容不会保留")
             Divider()
             Button("恢复本站自动", action: onResume)
                 .disabled(!controls.canResume)
@@ -2895,7 +2951,6 @@ final class SmokeRunner {
             Self.write(session, to: resultPath)
             exit(0)
         }
-
         loadFixtureAttachments(model: model, path: resultPath)
         let question = "【冒烟测试】如果只有两个周末，个人笔记工具应先做移动端采集，还是先补桌面检索？请给出判断和一个可验证的理由。"
         model.question = question

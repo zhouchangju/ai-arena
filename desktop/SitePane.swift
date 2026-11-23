@@ -150,6 +150,26 @@ enum SitePaneError: Error, LocalizedError {
     }
 }
 
+/// 同一 origin 下原页被换到别的对话时，当前页面是否允许自动离开。
+/// 只做只读核对：有草稿/附件时不离开，正在生成时不打断。
+enum SitePaneConversationDriftSafety: Equatable {
+    case safe
+    case draft
+    case generating
+    case loginBarrier
+    case unavailable(String)
+}
+
+/// 一次“有界返回本场对话”的结果。除 `.returned` 外都没有改变页面。
+enum SitePaneConversationReturnOutcome: Equatable {
+    case notDrifted
+    case returned
+    case blocked(SitePaneConversationDriftSafety)
+    case unreachable(String)
+    /// 暂停、接管、换场或任务失效：调用方必须停手。
+    case cancelled
+}
+
 // MARK: - SitePane
 
 @MainActor
@@ -453,6 +473,184 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
         return true
     }
 
+    /// 用户显式“回到本场对话”。只打开已固定并通过白名单的会话地址；不改绑定、
+    /// 不发送。当前页未发送的内容不会保留，因此调用方应在界面里说明这一点。
+    @discardableResult
+    func openBoundConversation() -> Bool {
+        guard let site, let bound = boundConversationURL,
+              let canonical = Self.canonicalConversationURL(bound, origin: site.origin),
+              canonical.absoluteString == bound.absoluteString,
+              isConversation(canonical, site: site) else { return false }
+        isWebContentTerminated = false
+        open(canonical)
+        return true
+    }
+
+    // MARK: Conversation drift
+
+    /// 当前页是否适合“离开并回到本场对话”。只读 probe 不填写、不点击；
+    /// 任何无法核对的情况都返回 `.unavailable`，由调用方按失败关闭处理。
+    /// `inspectedURL` 必须是调用方刚看到的当前页；probe 的 scope 会钉在它上面。
+    func inspectConversationDriftSafety(
+        taskID: String,
+        inspectedURL: URL? = nil
+    ) async -> SitePaneConversationDriftSafety {
+        guard let site else { return .unavailable("站点配置不可用") }
+        let current = inspectedURL ?? webView.url
+        if let locationIssue = Self.conversationDriftLocationSafety(
+            current: current,
+            siteOrigin: site.origin
+        ) {
+            return locationIssue
+        }
+        guard let current else { return .unavailable("原页没有地址") }
+        guard !webView.isLoading, documentReady else { return .unavailable("原页尚未就绪") }
+
+        do {
+            let response = try await performCommand(
+                [
+                    "type": "arena.web.probe",
+                    "taskId": taskID,
+                ],
+                driftInspectionHref: current
+            )
+            guard (response["status"] as? String) == "ready" else {
+                let code = (response["error"] as? String) ?? "unknown"
+                if code == "out-of-scope" || code == "not-authorized-page" {
+                    return .loginBarrier
+                }
+                return .unavailable(code)
+            }
+            let detail = response["detail"] as? [String: Any]
+            let composer = detail?["composer"] as? [String: Any]
+            let stop = detail?["stop"] as? [String: Any]
+            return Self.conversationDriftSafety(
+                draftEmpty: composer?["draftEmpty"] as? Bool == true,
+                hasAttachments: composer?["hasAttachments"] as? Bool == true,
+                stopConfigured: stop?["configured"] as? Bool == true,
+                stopActive: stop?["active"] as? Bool == true
+            )
+        } catch let paneError as SitePaneError {
+            if case .notAuthorizedPage = paneError { return .loginBarrier }
+            return .unavailable(paneError.code)
+        } catch {
+            return .unavailable("命令失败")
+        }
+    }
+
+    /// 只按精确 origin 和明确的登录路径判断登录页。不能把整个
+    /// `gemini.google.com`（或任意 `*.google.com` 子域）当作登录页。
+    /// 返回 nil 表示“地址本身不构成登录屏障，可以继续只读核对”。
+    nonisolated static func conversationDriftLocationSafety(
+        current: URL?,
+        siteOrigin: String
+    ) -> SitePaneConversationDriftSafety? {
+        guard let current else { return .unavailable("原页没有地址") }
+        guard originString(current) == siteOrigin else { return .loginBarrier }
+        if isAuthenticationPath(current) { return .loginBarrier }
+        return nil
+    }
+
+    nonisolated static func isAuthenticationPath(_ url: URL) -> Bool {
+        let segments = url.path.split(separator: "/", omittingEmptySubsequences: true).map {
+            $0.lowercased()
+        }
+        let authenticationSegments: Set<String> = [
+            "auth", "authorize", "callback", "login", "logout", "oauth",
+            "signin", "sign-in", "signout", "sign-out", "sso",
+        ]
+        return segments.contains(where: authenticationSegments.contains)
+    }
+
+    /// 纯分类，供界面/测试复用。先排除正在生成；没有可用的 stop 选择器时
+    /// 无法证明页面没有在生成，按失败关闭处理。
+    nonisolated static func conversationDriftSafety(
+        draftEmpty: Bool,
+        hasAttachments: Bool,
+        stopConfigured: Bool,
+        stopActive: Bool
+    ) -> SitePaneConversationDriftSafety {
+        if stopActive { return .generating }
+        guard stopConfigured else { return .unavailable("无法确认是否仍在生成") }
+        if !draftEmpty || hasAttachments { return .draft }
+        return .safe
+    }
+
+    /// 同源漂移时为该席做一次有界返回：只读核对当前页，安全才导航回已固定、
+    /// 已核验的原对话。不会填写、点击、提交或改变绑定。`canContinue` 在每次
+    /// await 前后都会复查，暂停/接管/换场/任务失效时立即停手。
+    func returnToBoundConversationIfSafe(
+        taskID: String,
+        timeout: TimeInterval = 15,
+        canContinue: () -> Bool
+    ) async -> SitePaneConversationReturnOutcome {
+        guard let site, let bound = boundConversationURL,
+              let canonicalBound = Self.canonicalConversationURL(bound, origin: site.origin),
+              canonicalBound.absoluteString == bound.absoluteString,
+              isConversation(canonicalBound, site: site) else {
+            return .unreachable("本场对话地址无法核对")
+        }
+        guard conversationMismatch() != nil else { return .notDrifted }
+        guard canContinue() else { return .cancelled }
+        if isWebContentTerminated { return .unreachable("原页内容进程已终止") }
+        guard let inspected = webView.url else { return .unreachable("原页没有地址") }
+        guard !webView.isLoading else { return .unreachable("原页正在加载") }
+
+        let safety = await inspectConversationDriftSafety(taskID: taskID, inspectedURL: inspected)
+        guard canContinue() else { return .cancelled }
+        guard boundConversationURL == bound else { return .cancelled }
+        if case .safe = safety {} else { return .blocked(safety) }
+
+        // 只读 probe 期间页面可能又被换走或开始新的导航：只允许离开仍是
+        // 刚才核对过的同一地址、且没有正在进行的导航。
+        guard let now = webView.url,
+              let canonicalNow = Self.canonicalConversationURL(now, origin: site.origin),
+              let canonicalInspected = Self.canonicalConversationURL(inspected, origin: site.origin),
+              canonicalNow.absoluteString == canonicalInspected.absoluteString,
+              !webView.isLoading,
+              conversationMismatch() != nil else { return .cancelled }
+
+        isWebContentTerminated = false
+        open(canonicalBound)
+
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if !canContinue() { return .cancelled }
+            if !isLoading, documentReady, conversationMismatch() == nil {
+                return .returned
+            }
+            if !isLoading, let code = lastNavigationErrorCode {
+                return .unreachable(Self.conversationDriftReason(code))
+            }
+            try? await Task.sleep(nanoseconds: 150_000_000)
+        }
+        return .unreachable("等待本场对话加载超时")
+    }
+
+    /// 把导航错误码翻成一句短原因；不在状态里拼接完整 URL。
+    nonisolated static func conversationDriftReason(_ raw: String?) -> String {
+        guard let raw, let hash = raw.lastIndex(of: "#"),
+              let code = Int(raw[raw.index(after: hash)...]) else {
+            return "打开本场对话失败"
+        }
+        switch code {
+        case NSURLErrorNotConnectedToInternet: return "当前离线"
+        case NSURLErrorTimedOut: return "打开超时"
+        case NSURLErrorCannotFindHost, NSURLErrorDNSLookupFailed: return "站点地址无法解析"
+        case NSURLErrorCannotConnectToHost, NSURLErrorNetworkConnectionLost: return "无法连接站点"
+        case NSURLErrorSecureConnectionFailed,
+             NSURLErrorServerCertificateHasBadDate,
+             NSURLErrorServerCertificateUntrusted,
+             NSURLErrorServerCertificateHasUnknownRoot,
+             NSURLErrorServerCertificateNotYetValid,
+             NSURLErrorClientCertificateRejected,
+             NSURLErrorClientCertificateRequired: return "证书校验未通过"
+        case NSURLErrorUserAuthenticationRequired,
+             NSURLErrorUserCancelledAuthentication: return "需要登录"
+        default: return "打开本场对话失败"
+        }
+    }
+
     // MARK: Probe-time document recovery
 
     /// probe 阶段“最多一次”的恢复结果。助手只核对文档并（必要时）导航，
@@ -644,9 +842,19 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
     /// 执行一条 web-driver 命令。命令串行化，避免同一页面上 probe/read/submit 交错。
     /// 返回 web-driver 原始回应；`ok == false` 时仍返回字典，由调用方按 status/error 处理。
     func command(_ command: [String: Any]) async throws -> [String: Any] {
+        try await performCommand(command, driftInspectionHref: nil)
+    }
+
+    /// 串行执行一条命令。`driftInspectionHref` 只给会话漂移的只读 probe 使用：
+    /// 它把 scope 钉在“刚核对过的当前页”上，而不是绑定对话；驱动仍只读核对。
+    /// 其它类型即使误传也会被拒绝。
+    private func performCommand(
+        _ command: [String: Any],
+        driftInspectionHref: URL?
+    ) async throws -> [String: Any] {
         await commandGate.acquire()
         do {
-            let result = try await runCommand(command)
+            let result = try await runCommand(command, driftInspectionHref: driftInspectionHref)
             await commandGate.release()
             return result
         } catch {
@@ -678,7 +886,10 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
         }
     }
 
-    private func runCommand(_ rawCommand: [String: Any]) async throws -> [String: Any] {
+    private func runCommand(
+        _ rawCommand: [String: Any],
+        driftInspectionHref: URL? = nil
+    ) async throws -> [String: Any] {
         guard configurationError == nil, let site else {
             throw configurationError ?? .unsupportedProvider(provider)
         }
@@ -704,16 +915,32 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
             throw SitePaneError.notAuthorizedPage(expected: site.origin, actual: actualOrigin)
         }
 
+        if let driftInspectionHref {
+            guard let pinned = Self.canonicalConversationURL(driftInspectionHref, origin: site.origin),
+                  let current = Self.canonicalConversationURL(pageURL, origin: site.origin),
+                  pinned.absoluteString == current.absoluteString else {
+                throw SitePaneError.invalidCommand("漂移核对页面已变化")
+            }
+        }
+
         // 本席已固定到核验过的对话：命令发出前先核对原页仍是同一个会话地址。
         // 用户手动切到同站别的对话时，这里立刻失败并转人工，绝不把提示发错窗口。
-        if let mismatch = conversationMismatch() {
+        // 漂移核对只能发只读 probe，并把 scope 钉在刚核对的当前页上。
+        if driftInspectionHref == nil, let mismatch = conversationMismatch() {
             throw SitePaneError.conversationChanged(
                 expected: mismatch.expected,
                 actual: mismatch.actual
             )
         }
 
-        let message = try buildDriverMessage(rawCommand, site: site)
+        let message = try buildDriverMessage(
+            rawCommand,
+            site: site,
+            driftInspectionHref: driftInspectionHref
+        )
+        if driftInspectionHref != nil, (message["type"] as? String) != "arena.web.probe" {
+            throw SitePaneError.invalidCommand("漂移核对只允许只读 probe")
+        }
         let taskID = message["taskId"] as? String
         lastTaskID = taskID
         lastCommandStatus = "running"
@@ -888,7 +1115,11 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
 
     // MARK: Command construction
 
-    private func buildDriverMessage(_ raw: [String: Any], site: SiteDescriptor) throws -> [String: Any] {
+    private func buildDriverMessage(
+        _ raw: [String: Any],
+        site: SiteDescriptor,
+        driftInspectionHref: URL? = nil
+    ) throws -> [String: Any] {
         let source = (raw["message"] as? [String: Any]) ?? raw
 
         guard let type = source["type"] as? String else {
@@ -923,8 +1154,14 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
             "allowNavigation": site.allowNavigation,
         ]
         // 可选、向后兼容的会话约束：driver 不认识时忽略，认识时在最后一次
-        // 填入/点击前再核对一次地址。
-        if let bound = boundConversationURL {
+        // 填入/点击前再核对一次地址。漂移核对只读时钉在刚核对过的当前页，
+        // 不采用绑定地址。
+        if let driftInspectionHref {
+            guard let pinned = Self.canonicalConversationURL(driftInspectionHref, origin: site.origin) else {
+                throw SitePaneError.invalidCommand("漂移核对地址无法规范化")
+            }
+            scope["href"] = pinned.absoluteString
+        } else if let bound = boundConversationURL {
             scope["href"] = bound.absoluteString
         } else if normalizedType == "arena.web.submit" {
             guard taskID.contains(":independent:"),
