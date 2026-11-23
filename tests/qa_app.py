@@ -38,7 +38,7 @@ def stage_qa_app(source: Path, staging_root: Path) -> QAApp:
         app = Path(directory.name) / "AI Arena QA.app"
         shutil.copytree(source, app, symlinks=True)
         info.update(CFBundleName="AI Arena QA", CFBundleDisplayName="AI Arena QA",
-                    CFBundleIdentifier=QA_BUNDLE_ID)
+                    CFBundleIdentifier=QA_BUNDLE_ID, LSUIElement=True)
         with (app / "Contents/Info.plist").open("wb") as handle:
             plistlib.dump(info, handle)
         subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", str(app)], check=True)

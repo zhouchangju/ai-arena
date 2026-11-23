@@ -22,6 +22,7 @@
 import SwiftUI
 import WebKit
 import AppKit
+import Security
 import UniformTypeIdentifiers
 
 // MARK: - 席位目录
@@ -182,9 +183,8 @@ final class ArenaAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate 
         window.center()
         window.setFrameAutosaveName("arena-main")
         mainWindow = window
-        NSApp.setActivationPolicy(.regular)
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        NSApp.setActivationPolicy(ArenaBuildIsolation.isQABuild ? .accessory : .regular)
+        arenaPresentWindow(window)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -241,6 +241,15 @@ final class ArenaAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate 
 }
 
 // MARK: - 主界面
+
+private func arenaPresentWindow(_ window: NSWindow) {
+    if ArenaBuildIsolation.isQABuild {
+        window.orderBack(nil)
+    } else {
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
 
 struct ArenaRootView: View {
     @ObservedObject var model: ArenaModel
@@ -1626,8 +1635,7 @@ final class ArenaDetailsWindowController: NSObject, NSWindowDelegate, NSToolbarD
         window.title = "本场详情"
         window.subtitle = Self.subtitle(for: model.session)
         if window.isMiniaturized { window.deminiaturize(nil) }
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        arenaPresentWindow(window)
         refreshToolbar()
     }
 
@@ -2585,6 +2593,12 @@ final class SmokeRunner {
     static func preflight() {
         let environment = ProcessInfo.processInfo.environment
         if ArenaBuildIsolation.isQABuild {
+            // WebKit can ask Security.framework for its WebCrypto key. A QA
+            // process must fail an interactive lookup before creating any pane.
+            guard SecKeychainSetUserInteractionAllowed(false) == errSecSuccess else {
+                Self.writeStderr("[qa] Could not disable keychain interaction.")
+                exit(2)
+            }
             guard isEnabled, environment["ARENA_DATA_DIR"]?.trimmedNonEmpty != nil else {
                 Self.writeStderr("[qa] Start this copy through the native acceptance harness.")
                 exit(2)

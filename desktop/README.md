@@ -55,6 +55,14 @@ SDKROOT="$(xcrun --sdk macosx --show-sdk-path)" ./desktop/build.sh
 
 共享讨论引擎测试可直接运行 `node --test tests/core.test.mjs`。
 
+日常调试需要 WebKit 时，在临时目录构建并由 QA 脚本启动。下面的命令可在后台运行，包含一次完整讨论、报告和重启检查。
+
+```sh
+qa_dir="$(mktemp -d)"
+ARENA_SIGN_IDENTITY=- ./desktop/build.sh "$qa_dir" &&
+  python3 tests/native_desktop_acceptance.py --app "$qa_dir/AI Arena.app" --out "$qa_dir/results"
+```
+
 原生隔离验收需要 Python 3。脚本用共用回环夹具在 macOS WebKit 中运行。单独的网页驱动测试还需要 Playwright Python 包和本机 Chromium。原生验收的输出目录请使用新路径。
 
 ```sh
