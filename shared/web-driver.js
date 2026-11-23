@@ -1404,7 +1404,7 @@
   /**
    * The only accepted non-empty draft is an exact old Arena prompt on a blank
    * new-conversation page. We compare a SHA-256 of the normalized draft with
-   * the background's precomputed digests, so the page never sees old text.
+   * the caller's precomputed digests, so the page never sees old text.
    */
   async function knownOldDraft(req, draftCollapsed, users, answers) {
     if (!req.knownDraftDigests || req.knownDraftDigests.length === 0) return null;
@@ -1464,7 +1464,15 @@
         users,
         answers,
       );
-      if (!draftDigest) {
+      // Web Crypto yields to the page. Recheck the editor and blank home
+      // before using a digest calculated from the earlier snapshot.
+      const currentInput = resolveUnique(req.selectors, 'input', null, { requireVisible: true });
+      if (!draftDigest || !newConversationHome(req.scope) ||
+          currentInput.value !== input || resolveContainer(req.selectors).value !== container ||
+          !elementEnabled(input) || input.readOnly === true ||
+          composerText(composerRoot(input)) !== draft ||
+          listNodes(req.selectors.user, container).length ||
+          listNodes(req.selectors.answer, container).length) {
         return fail('draft-conflict', { draftChars: cleanText(draft).length });
       }
       // Exact known old prompt on a blank new-conversation home page: replace
@@ -1499,14 +1507,15 @@
       filled = true;
       await sleep(60);
       if (!sameText(composerText(composerRoot(input)), req.prompt)) {
-        if (!draftCollapsed) setComposerValue(input, '');
-        else if (draftReplaced) setComposerValue(input, draft);
         return fail('fill-mismatch', { phase: 'after-fill' });
       }
     }
 
     const sendRes = await waitForSend(req.selectors, req.options);
-    if (sendRes.error) return sendRes.error;
+    if (sendRes.error) {
+      if (filled && sendRes.error.error === 'send-pending') sendRes.error.detail.composerFilled = true;
+      return sendRes.error;
+    }
     const send = sendRes.value;
 
     // Re-check the exact composer text immediately before the click. If a site

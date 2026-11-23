@@ -1095,6 +1095,12 @@ final class ArenaModel: ObservableObject {
             }
         }
 
+        let knownDraftDigests = stageKey == "independent" && pane.boundConversationURL == nil
+            ? engine.knownDraftDigests(
+                provider: provider,
+                previousSessionIDs: historyList.map(\.id).filter { $0 != currentID }
+            )
+            : []
         var attempt = 0
         while attempt < 8 {
             guard await waitWhilePaused(token) else { return false }
@@ -1138,6 +1144,7 @@ final class ArenaModel: ObservableObject {
                         kind: "submit",
                         taskID: taskID,
                         prompt: intent.prompt,
+                        knownDraftDigests: knownDraftDigests,
                         config: config
                     )
                 )
@@ -1212,6 +1219,7 @@ final class ArenaModel: ObservableObject {
 
             switch code {
             case "send-pending" where explicitlyPreClick:
+                if detail?["composerFilled"] as? Bool == true { intent.composerFilled = true }
                 intent.phase = .prepared
                 intents[taskID] = intent
                 persist()

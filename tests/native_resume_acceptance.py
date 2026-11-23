@@ -170,6 +170,7 @@ def main():
         intents_1 = {item["taskId"]: item for item in saved_1["intents"]}
         prepared_task = pending_1[0]["id"]
         assert intents_1[prepared_task]["phase"] == "prepared", intents_1[prepared_task]
+        assert intents_1[prepared_task]["composerFilled"] is True, intents_1[prepared_task]
 
         first_round = {row["provider"]: row for row in answers_1}
         assert set(first_round) == answered_seats, first_round

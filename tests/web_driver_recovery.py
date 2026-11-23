@@ -192,6 +192,22 @@ def main() -> int:
             results["human_draft_kept"] = True
             page.close()
 
+            # A manual edit during the async digest must win over the snapshot.
+            page = new_page(ctx, base, {"prefill": old})
+            page.evaluate("""(human) => {
+              const digest = crypto.subtle.digest.bind(crypto.subtle);
+              crypto.subtle.digest = (...args) => {
+                document.querySelector('#editor').innerText = human;
+                return digest(...args);
+              };
+            }""", human)
+            reply = submit(page, base, "t-edit-during-digest", new, [digest(old)])
+            assert reply["error"] == "draft-conflict", reply
+            assert page.evaluate("document.querySelector('#editor').innerText") == human
+            assert page.evaluate("window.clicks") == 0
+            results["edit_during_digest_kept"] = True
+            page.close()
+
             # 3) off the new-conversation home page the same digest is refused
             page = new_page(ctx, base, {"prefill": old})
             page.goto(base + "/chat")

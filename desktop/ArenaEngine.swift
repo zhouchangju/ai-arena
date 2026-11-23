@@ -15,6 +15,7 @@
 //  `ArenaModel.swift`.
 //
 
+import CryptoKit
 import Foundation
 import JavaScriptCore
 
@@ -97,6 +98,10 @@ struct ArenaDeliveryIntent: Codable, Equatable {
     /// means "not attempted yet". It lives on the intent because a restart must
     /// not hand the same task a second reload it already used.
     var reloadAttempted: Bool? = nil
+
+    /// The driver verified that it wrote this prompt before the send control
+    /// became available. Older records can still prove ownership via a receipt.
+    var composerFilled: Bool? = nil
 }
 
 // MARK: - Persisted session file
@@ -547,6 +552,41 @@ final class ArenaEngine {
         try loadedCore().apply(session: session, action: action, payload: payload)
     }
 
+    /// Historical text stays in the local store. The composer is most likely
+    /// to restore an independent prompt on the site entry page, so give those
+    /// priority when later rounds would otherwise fill all eight slots.
+    func knownDraftDigests(provider: String, previousSessionIDs: [String]) -> [String] {
+        var firstPrompts: [String] = []
+        var laterPrompts: [String] = []
+        for id in previousSessionIDs.prefix(8) {
+            guard let file = store.load(id: id), file.id == id else { continue }
+            for intent in file.intents.sorted(by: { $0.preparedAt > $1.preparedAt }) {
+                guard intent.taskId == "\(id):r\(intent.round):\(intent.stage):\(provider)",
+                      intent.phase == .submitted || intent.composerFilled == true else { continue }
+                if intent.stage == "independent" {
+                    firstPrompts.append(intent.prompt)
+                } else {
+                    laterPrompts.append(intent.prompt)
+                }
+            }
+        }
+        var digests: [String] = []
+        for prompt in firstPrompts + laterPrompts {
+            // Same normalization as collapse() in web-driver.js, including
+            // ECMAScript whitespace (which differs from Foundation's set).
+            let normalized = prompt
+                .replacingOccurrences(of: #"[\u200b-\u200d\ufeff]"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: #"[\u0009-\u000d\u0020\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+"#,
+                                      with: " ", options: .regularExpression)
+                .trimmingCharacters(in: CharacterSet(charactersIn: " "))
+            guard !normalized.isEmpty else { continue }
+            let digest = SHA256.hash(data: Data(normalized.utf8)).map { String(format: "%02x", $0) }.joined()
+            if !digests.contains(digest) { digests.append(digest) }
+            if digests.count == 8 { break }
+        }
+        return digests
+    }
+
     /// The exact message shape `web-driver.js` documents. `scope.origin`,
     /// `scope.homeHref` and `allowNavigation` are always explicit so a fixture
     /// page can never be accepted on a real-site origin and vice versa.
@@ -555,6 +595,7 @@ final class ArenaEngine {
         taskID: String,
         prompt: String?,
         verifiedReadPrompt: String? = nil,
+        knownDraftDigests: [String] = [],
         config: ArenaSiteConfig
     ) -> [String: Any] {
         var message: [String: Any] = [
@@ -570,6 +611,9 @@ final class ArenaEngine {
         ]
         if let prompt {
             message["prompt"] = prompt
+        }
+        if kind == "submit", !knownDraftDigests.isEmpty {
+            message["knownDraftDigests"] = knownDraftDigests
         }
         if kind == "read", let verifiedReadPrompt {
             message["verifiedReadPrompt"] = verifiedReadPrompt
