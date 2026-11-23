@@ -66,7 +66,7 @@
   <figure tabindex="0" aria-label="讨论流程图，窄屏可横向滚动">
     <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="discussion-flow-title discussion-flow-desc">
       <title id="discussion-flow-title">AI Arena 多 AI 讨论流程</title>
-      <desc id="discussion-flow-desc">选定席位后依次独立作答、交叉互评、起草候选并确认同一版本，工作台根据表态、参与和出处决定继续互评、报告全体一致或保留当前结果。</desc>
+      <desc id="discussion-flow-desc">独立作答后，三席各收到另外两席的回答原文：A 看 B 和 C，B 看 A 和 C，C 看 A 和 B；各席各交一份互评，随后起草候选并按同一版本表态，需要续评时各席围绕候选和未决争点回应。</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0 0 8 4 0 8Z" fill="#666"/></marker>
         <marker id="arrow-accent" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0 0 8 4 0 8Z" fill="#007aff"/></marker>
@@ -87,7 +87,7 @@
         <rect x="36" y="324" width="192" height="92" rx="4" fill="#fff"/>
         <text class="label" x="220" y="344" text-anchor="end">还有互评轮次</text>
         <text class="sub" x="220" y="368" text-anchor="end">有反对，或票齐且有条件</text>
-        <text class="sub" x="220" y="392" text-anchor="end">带着当前候选回到互评</text>
+        <text class="sub" x="220" y="392" text-anchor="end">带着候选和争点继续互评</text>
         <rect x="740" y="508" width="168" height="28" rx="4" fill="#fff"/>
         <text class="label" x="824" y="528" text-anchor="middle">满足全部一致条件</text>
         <rect x="548" y="588" width="148" height="20" rx="4" fill="#fff"/>
@@ -105,7 +105,7 @@
 
         <rect class="step" x="360" y="220" width="360" height="68" rx="8"/>
         <text class="name" x="540" y="248">交叉互评</text>
-        <text class="sub" x="540" y="272">交换已保存的原文 · 提出反例 · 回应与修正</text>
+        <text class="sub" x="540" y="272">首轮评各席原文 · 后续轮回应未决争点</text>
 
         <rect class="step" x="360" y="316" width="360" height="68" rx="8"/>
         <text class="name" x="540" y="344">一席起草或修订候选</text>
@@ -125,6 +125,31 @@
         <rect class="terminal" x="360" y="612" width="360" height="64" rx="20"/>
         <text class="name" x="540" y="640">按当前结果出报告</text>
         <text class="sub" x="540" y="664">有条件一致、未决分歧、部分完成或草稿</text>
+      </g>
+
+      <g>
+        <line x1="784" x2="784" y1="112" y2="464" stroke="#e5e5e5"/>
+        <text class="name" x="812" y="132">三席怎么互评？</text>
+        <text class="sub" x="812" y="160">独立作答阶段结束后，工作台用同一批已保存的回答</text>
+        <text class="sub" x="812" y="184">为每个已作答席位生成一份互评提示。</text>
+
+        <text class="label" x="812" y="220">收件席</text>
+        <text class="label" x="948" y="220">提示中的对方原文</text>
+        <line x1="812" x2="1244" y1="232" y2="232" stroke="#e5e5e5"/>
+        <text class="label" x="812" y="256">A</text>
+        <text class="sub" x="948" y="256">B 的回答 ＋ C 的回答</text>
+        <line x1="812" x2="1244" y1="268" y2="268" stroke="#e5e5e5"/>
+        <text class="label" x="812" y="292">B</text>
+        <text class="sub" x="948" y="292">A 的回答 ＋ C 的回答</text>
+        <line x1="812" x2="1244" y1="304" y2="304" stroke="#e5e5e5"/>
+        <text class="label" x="812" y="328">C</text>
+        <text class="sub" x="948" y="328">A 的回答 ＋ B 的回答</text>
+        <line x1="812" x2="1244" y1="340" y2="340" stroke="#e5e5e5"/>
+
+        <text class="sub" x="812" y="368">每份提示也附原题和本席原文。各席各交一份互评，</text>
+        <text class="sub" x="812" y="392">指出最强反例，并说明自己维持或修正了什么。</text>
+        <text class="label" x="812" y="428">续评改看候选和未决争点</text>
+        <text class="sub" x="812" y="452">各席收到当前候选及反对意见或附加条件原文，逐条回应。</text>
       </g>
 
       <line x1="36" x2="1244" y1="688" y2="688" stroke="#e5e5e5"/>
