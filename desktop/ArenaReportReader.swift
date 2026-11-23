@@ -54,41 +54,42 @@ struct ArenaReportReader: View {
                 sourceReader(row)
             } else {
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 23) {
-                        if currentSources.isEmpty, let original = ArenaSessionDigest.report(session) {
-                            ArenaMarkdownView(text: original)
-                            if let question { questionSection(question) }
-                        } else {
-                            Text("讨论报告")
-                                .font(.system(size: 24, weight: .semibold))
-                                .accessibilityAddTraits(.isHeader)
+                    VStack(alignment: .leading, spacing: 19) {
+                        Text("讨论报告")
+                            .font(.system(size: 24, weight: .semibold))
+                            .accessibilityAddTraits(.isHeader)
+                        if let question { questionSection(question) }
+                        if !currentSources.isEmpty {
                             decisionLine
                             if let proposal, let answer = proposal.answer {
-                                candidate(answer, author: proposal)
+                                candidateExcerpt(answer, author: proposal)
                             } else {
                                 Text("本场尚无可核对的候选结论。可在下方查看已保存的材料。")
                                     .foregroundStyle(.secondary)
                             }
                             if !participants.isEmpty { positions }
-                            if let question { questionSection(question) }
-                            Divider()
+                            if let answer = proposal?.answer {
+                                DisclosureGroup("候选全文", isExpanded: $showCandidate) {
+                                    if showCandidate { markdown(answer).padding(.top, 12) }
+                                }
+                            }
                             DisclosureGroup(isExpanded: $showSources) {
                                 if showSources { sourceList }
                             } label: {
                                 Label("发言与出处（\(currentSources.count)）", systemImage: "books.vertical")
                             }
-                            if let original = ArenaSessionDigest.report(session) {
-                                DisclosureGroup(isExpanded: $showArchive) {
-                                    if showArchive { markdown(original).padding(.top, 10) }
-                                } label: {
-                                    Label("完整报告", systemImage: "doc.richtext")
-                                }
+                        }
+                        if let original = ArenaSessionDigest.report(session) {
+                            DisclosureGroup(isExpanded: $showArchive) {
+                                if showArchive { markdown(original).padding(.top, 12) }
+                            } label: {
+                                Label("完整报告", systemImage: "doc.richtext")
                             }
                         }
                     }
-                    .padding(.horizontal, 30)
-                    .padding(.vertical, 26)
-                    .frame(maxWidth: 1080, alignment: .leading)
+                    .frame(maxWidth: 720, alignment: .leading)
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 22)
                     .frame(maxWidth: .infinity)
                 }
             }
@@ -111,32 +112,28 @@ struct ArenaReportReader: View {
         .foregroundStyle(.secondary)
     }
 
-    private func candidate(_ answer: String, author: ArenaTaskRow) -> some View {
-        let lead = ArenaCandidateLead(answer)
-        return VStack(alignment: .leading, spacing: 13) {
+    private func candidateExcerpt(_ answer: String, author: ArenaTaskRow) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text("建议回答").font(.title3.weight(.semibold))
+                Text("结论摘录")
+                    .font(.title3.weight(.semibold))
+                    .accessibilityAddTraits(.isHeader)
                 Spacer()
                 Button { selectedSource = author } label: {
                     Text("\(ArenaSeatCatalog.name(author.provider)) 起草 · \(author.sourceId)")
                 }
                 .buttonStyle(.link)
             }
-            markdown(showCandidate ? answer : lead.text)
-            if lead.hasMore {
-                Button { showCandidate.toggle() } label: {
-                    Label(showCandidate ? "收起候选全文" : "展开候选全文", systemImage: showCandidate ? "chevron.up" : "chevron.down")
-                }.buttonStyle(.link)
-            }
+            markdown(ArenaCandidateLead.excerpt(answer)).lineLimit(9)
         }
-        .padding(20)
-        .background(RoundedRectangle(cornerRadius: 14).fill(Color.accentColor.opacity(0.045)))
-        .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Color.accentColor.opacity(0.14)))
+        .padding(.vertical, 12)
+        .padding(.horizontal, 16)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.accentColor.opacity(0.045)))
     }
 
     @ViewBuilder private var positions: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("各席表态").font(.headline)
+            Text("各席表态").font(.headline).accessibilityAddTraits(.isHeader)
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 170, maximum: 400), spacing: 10)], alignment: .leading, spacing: 8) {
                 ForEach(participants, id: \.self) { provider in
                     let vote = votes.first { $0["provider"] == provider }
@@ -157,13 +154,9 @@ struct ArenaReportReader: View {
             }
             ForEach(votes.filter { $0["stance"] == "conditional" || $0["stance"] == "oppose" }, id: \.self) { vote in
                 if let row = rows.first(where: { $0.id == vote["id"] }), let answer = row.answer {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("\(ArenaSeatCatalog.name(row.provider)) · \(Self.stance(vote["stance"]))原文")
-                            .font(.subheadline.weight(.semibold))
-                        markdown(answer)
+                    DisclosureGroup("\(ArenaSeatCatalog.name(row.provider)) · \(Self.stance(vote["stance"]))原文") {
+                        markdown(answer).padding(.top, 8)
                     }
-                    .padding(.leading, 14)
-                    .overlay(alignment: .leading) { RoundedRectangle(cornerRadius: 2).fill(Self.color(vote["stance"])).frame(width: 3) }
                 }
             }
         }
@@ -187,18 +180,22 @@ struct ArenaReportReader: View {
     }
 
     private func questionSection(_ question: String) -> some View {
-        DisclosureGroup(isExpanded: $showQuestion) {
-            if showQuestion {
-                Text(verbatim: question)
-                    .font(.system(size: 16))
-                    .lineSpacing(4)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.top, 10)
+        VStack(alignment: .leading, spacing: 5) {
+            Button {
+                showQuestion.toggle()
+            } label: {
+                Label(showQuestion ? "收起原始问题" : "原始问题", systemImage: showQuestion ? "chevron.down" : "chevron.right")
+                    .font(.subheadline.weight(.semibold))
             }
-        } label: {
-            Label("原始问题", systemImage: "text.quote")
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+
+            Text(verbatim: question)
+                .font(.system(size: 16))
+                .lineSpacing(4)
+                .lineLimit(showQuestion ? nil : 1)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -212,7 +209,9 @@ struct ArenaReportReader: View {
                 Divider()
                 ArenaMarkdownView(text: row.answer ?? "")
             }
-            .padding(28).frame(maxWidth: 1080, alignment: .leading).frame(maxWidth: .infinity)
+            .frame(maxWidth: 720, alignment: .leading)
+            .padding(24)
+            .frame(maxWidth: .infinity)
         }.id(row.id)
     }
 
@@ -231,10 +230,8 @@ struct ArenaReportReader: View {
 }
 /// Extracts the actual opening answer for the compact reading view. Subsequent
 /// sections still belong to the full candidate, with the original wording.
-struct ArenaCandidateLead {
-    var text: String
-    var hasMore: Bool
-    init(_ original: String) {
+enum ArenaCandidateLead {
+    static func excerpt(_ original: String) -> String {
         let raw = original.trimmingCharacters(in: .whitespacesAndNewlines)
         let lines = raw.components(separatedBy: .newlines)
         func isPreface(_ line: String) -> Bool {
@@ -247,12 +244,10 @@ struct ArenaCandidateLead {
         // A missing paragraph break is common in plain text recovered from a
         // web page. Treat distinct headings as paragraph boundaries too.
         let cut = body.indices.dropFirst().first { i in
-            let t=body[i].trimmingCharacters(in: .whitespaces)
+            let t = body[i].trimmingCharacters(in: .whitespaces)
             return t.isEmpty || t.range(of: #"^(?:#{1,6}\s|[一二三四五六七八九十]+[、．])"#,options:.regularExpression) != nil
         } ?? body.count
-        let lead = body.prefix(cut).joined(separator:"\n").trimmingCharacters(in:.whitespacesAndNewlines)
-        let rest = body.dropFirst(cut).contains { !$0.trimmingCharacters(in:.whitespaces).isEmpty }
-        if lead.isEmpty || !rest {text = raw; hasMore = false}
-        else {text = lead; hasMore = true}
+        let lead = body.prefix(cut).joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return lead.isEmpty ? raw : lead
     }
 }
