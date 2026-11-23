@@ -25,6 +25,7 @@
 //
 
 import Foundation
+import AppKit
 import SwiftUI
 
 /// The exact round a manual answer form was opened for. Saving is refused when
@@ -37,6 +38,206 @@ struct ArenaManualTarget: Equatable {
     let stage: String
     let round: Int
     let version: Int?
+}
+
+/// What a seat is doing right now. The UI derives colour and a short badge from
+/// this value only; the free-text `detail` is the sentence shown in the tooltip
+/// and status line. No view ever guesses a state from detail wording.
+enum ArenaSeatStateKind: String, Codable, CaseIterable {
+    case idle
+    case sending
+    case generating
+    case answered
+    case needsAction
+    case takenOver
+    case skipped
+    case paused
+    case done
+}
+
+struct ArenaSeatState: Equatable {
+    var kind: ArenaSeatStateKind
+    var detail: String
+
+    /// Flat, JSON-safe form for the smoke diagnostics. Extra keys are additive;
+    /// the existing `statuses` text map stays for compatibility.
+    var jsonObject: [String: String] {
+        ["kind": kind.rawValue, "detail": detail]
+    }
+}
+
+/// Which per-seat actions the current state really allows.
+struct ArenaSeatControls: Equatable {
+    var canTakeOver = false
+    var canResume = false
+    var canBackfill = false
+    var canSkip = false
+    var canOpenHome = false
+
+    static let none = ArenaSeatControls()
+}
+
+/// Preview text for a seat. A streamed fragment and a complete answer that was
+/// not accepted are different things and must be labelled differently.
+struct ArenaPreview: Equatable {
+    var text: String
+    /// `true` when this is a complete answer the discussion engine refused
+    /// (e.g. a vote without an explicit stance), not a mid-stream fragment.
+    var isComplete: Bool
+}
+
+/// Opening text for the non-modal backfill panel.
+struct ArenaBackfillPrefill: Equatable {
+    var text: String
+    /// `true` only for a mid-stream preview fragment.
+    var isPartial: Bool
+    /// `true` for a complete answer the engine refused; also needs a note.
+    var isComplete: Bool
+}
+
+/// Unified stage wording (UI, export, statuses). Internal keys never change.
+enum ArenaStageNames {
+    static let labels: [String: String] = [
+        "independent": "独立作答",
+        "critique": "互评",
+        "proposal": "候选结论",
+        "vote": "表态",
+        "done": "结束",
+    ]
+
+    static func label(_ stage: String) -> String {
+        if stage.isEmpty { return "未开始" }
+        return labels[stage] ?? stage
+    }
+}
+
+/// A durable, session-derived seat outcome. Only saved rows are read, so this
+/// never reflects a transient "只读回看" UI label or an in-flight page command.
+enum ArenaSeatOutcome {
+    static func derive(session: [String: Any]?, provider: String, ballot: [String: Any]? = nil) -> ArenaSeatState {
+        guard let session else {
+            return ArenaSeatState(kind: .idle, detail: "待开始")
+        }
+        let participants = session.arenaStringArray("providers")
+        guard participants.contains(provider) else {
+            return ArenaSeatState(kind: .idle, detail: "未参与本场")
+        }
+        let stage = session.arenaString("stage") ?? ""
+        let round = session.arenaInt("round") ?? 1
+        let history = rows(session, key: "history")
+        let tasks = rows(session, key: "tasks")
+        let all = history + tasks
+        let proposal = latestProposal(history)
+        let version = proposal?.arenaInt("version")
+        let paused = session.arenaBool("paused") ?? false
+
+        if stage == "done" {
+            if let version {
+                let votes = ballot?["votes"] as? [[String: Any]] ?? []
+                if let vote = votes.last(where: { $0.arenaString("provider") == provider }),
+                   let stance = vote.arenaString("stance") {
+                    return ArenaSeatState(
+                        kind: .done,
+                        detail: "最终表态：\(stanceLabel(stance))（v\(version)）"
+                    )
+                }
+                let skip = all.last {
+                    $0.arenaString("stage") == "vote"
+                        && $0.arenaString("provider") == provider
+                        && $0.arenaInt("version") == version
+                        && $0.arenaString("status") == "skipped"
+                }
+                if skip != nil {
+                    return ArenaSeatState(kind: .skipped, detail: "已跳过 v\(version) 表态（计为缺席）")
+                }
+                return ArenaSeatState(
+                    kind: .needsAction,
+                    detail: "未对候选 v\(version) 明确表态（不计为同意）"
+                )
+            }
+            if let row = all.last(where: { $0.arenaString("provider") == provider }) {
+                switch row.arenaString("status") {
+                case "skipped": return ArenaSeatState(kind: .skipped, detail: "已跳过（计为缺席）")
+                case "pending": return ArenaSeatState(kind: .done, detail: "结束时仍待回答")
+                default: break
+                }
+            }
+            return ArenaSeatState(kind: .done, detail: "讨论已结束（未形成候选）")
+        }
+
+        let pending = tasks.first {
+            $0.arenaString("provider") == provider && $0.arenaString("status") == "pending"
+        }
+        if paused {
+            if pending != nil || tasks.isEmpty {
+                return ArenaSeatState(kind: .paused, detail: "已暂停 · \(stageLabel(stage)) · 第 \(round) 轮")
+            }
+            // A seat that already answered this stage keeps its real outcome;
+            // pause only withholds the next dispatch.
+        }
+        if let pending {
+            let pendingVersion = pending.arenaInt("version")
+            if stage == "vote", let version, pendingVersion == version {
+                return ArenaSeatState(kind: .generating, detail: "等待表态（v\(version) · 第 \(round) 轮）")
+            }
+            return ArenaSeatState(
+                kind: .generating,
+                detail: "等待回答（\(stageLabel(stage)) · 第 \(round) 轮）"
+            )
+        }
+
+        if let row = all.last(where: {
+            $0.arenaString("provider") == provider
+                && $0.arenaString("stage") == stage
+                && $0.arenaInt("round") == round
+        }) {
+            switch row.arenaString("status") {
+            case "answered":
+                if stage == "vote", let stance = row.arenaString("stance") {
+                    let rowVersion = row.arenaInt("version")
+                    return ArenaSeatState(
+                        kind: .answered,
+                        detail: "已表态：\(stanceLabel(stance))\(rowVersion.map { "（v\($0)）" } ?? "")"
+                    )
+                }
+                return ArenaSeatState(kind: .answered, detail: "已收到本阶段回答")
+            case "skipped":
+                return ArenaSeatState(kind: .skipped, detail: "已跳过本阶段任务（计为缺席）")
+            default:
+                return ArenaSeatState(kind: .generating, detail: "等待回答（\(stageLabel(stage)) · 第 \(round) 轮）")
+            }
+        }
+
+        if stage.isEmpty {
+            return ArenaSeatState(kind: .idle, detail: "待开始")
+        }
+        return ArenaSeatState(kind: .idle, detail: "本阶段无任务（等待其他席位）")
+    }
+
+    private static func rows(_ session: [String: Any], key: String) -> [[String: Any]] {
+        (session[key] as? [[String: Any]]) ?? []
+    }
+
+    private static func latestProposal(_ history: [[String: Any]]) -> [String: Any]? {
+        history.last {
+            $0.arenaString("stage") == "proposal"
+                && $0.arenaString("status") == "answered"
+                && $0.arenaInt("version") != nil
+        }
+    }
+
+    private static func stageLabel(_ stage: String) -> String {
+        ArenaStageNames.label(stage)
+    }
+
+    private static func stanceLabel(_ stance: String) -> String {
+        switch stance {
+        case "agree": return "同意"
+        case "conditional": return "有条件同意"
+        case "oppose": return "反对"
+        default: return stance
+        }
+    }
 }
 
 /// One bounded read-only recovery is allowed per delivered task after this many
@@ -64,19 +265,32 @@ final class ArenaModel: ObservableObject {
     /// Latest session document produced by `arena-core.js`.
     @Published private(set) var session: [String: Any]?
 
-    /// One short, user-facing status per provider.
-    @Published private(set) var statuses: [String: String] = [:]
+    /// Structured, per-seat state. The UI and diagnostics derive everything
+    /// from `kind` + `detail`; nothing is inferred from the wording.
+    @Published private(set) var seatStates: [String: ArenaSeatState] = [:]
+
+    /// Compatibility text view of `seatStates` for the smoke diagnostics and
+    /// existing fixtures. Always the exact `detail`, never a guessed label.
+    var statuses: [String: String] {
+        seatStates.mapValues { $0.detail }
+    }
 
     /// Last blocking or informational error. Seat-level problems stay in
-    /// `statuses` so one failing site does not hide the other two.
+    /// `seatStates` so one failing site does not hide the other two.
     @Published var errorMessage: String = ""
 
     /// Web panes owned by the discussion, keyed by provider id.
     @Published private(set) var panes: [String: SitePane] = [:]
 
-    /// Live answer preview (tail of the generating response), never saved as
-    /// the accepted answer.
-    @Published private(set) var previews: [String: String] = [:]
+    /// Latest preview for a seat, with an explicit partial/complete marker.
+    /// Never saved as the accepted answer.
+    @Published private(set) var previews: [String: ArenaPreview] = [:]
+
+    /// Saved discussions, newest first, with date and saved outcome.
+    @Published private(set) var historyList: [ArenaHistorySummary] = []
+
+    /// Unfinished history session that can reopen for manual verification.
+    @Published private(set) var historyResumeID: String?
 
     @Published private(set) var stageKey: String = ""
     @Published private(set) var stageLabel: String = "尚未开始"
@@ -90,6 +304,12 @@ final class ArenaModel: ObservableObject {
     /// restarted for the existing session. A normal launch stays manual.
     @Published private(set) var didContinueSavedDiscussion: Bool = false
 
+    /// A discussion exists and has not reached the final stage. Used by the app
+    /// delegate to confirm quitting/closing and by the destructive UI actions.
+    var hasRunningDiscussion: Bool {
+        !isReadOnly && session != nil && stageKey != "done"
+    }
+
     // MARK: Private state
 
     private let engine: ArenaEngine
@@ -99,6 +319,7 @@ final class ArenaModel: ObservableObject {
     private var workers: [String: Task<Void, Never>] = [:]
 
     private var manualProviders: Set<String> = []
+    private var verificationProviders: Set<String> = []
     private var blockedTasks: Set<String> = []
     private var intents: [String: ArenaDeliveryIntent] = [:]
 
@@ -131,7 +352,6 @@ final class ArenaModel: ObservableObject {
     private var currentID: String?
     private var createdAt: Double = 0
     private var storageFailed = false
-    private var historyCache: [(id: String, question: String)] = []
 
     /// How long a normal start keeps probing a real site whose composer has not
     /// mounted yet. The bound is deliberately inside the agreed 30–38 s window,
@@ -156,19 +376,14 @@ final class ArenaModel: ObservableObject {
         if let issue = engine.configurationIssue {
             self.errorMessage = issue
         }
-        refreshHistoryCache()
-        restoreLastSession()
+        refreshHistoryList()
+        restoreInitialSession()
         prepareInitialPanes()
         // Only the explicit, verified continuation restarts dispatch. A normal
         // launch of a saved discussion deliberately stays manual.
         if didContinueSavedDiscussion {
             startDispatcher(token: runToken)
         }
-    }
-
-    /// Saved discussions, newest first. Reading this never sends anything.
-    var historyList: [(id: String, question: String)] {
-        historyCache
     }
 
     // MARK: Discussion lifecycle
@@ -203,7 +418,7 @@ final class ArenaModel: ObservableObject {
             return
         }
         guard (1...5).contains(maxRounds) else {
-            errorMessage = "互评轮数请选择 1 到 5 轮"
+            errorMessage = "互评上限请选择 1 到 5 轮"
             return
         }
 
@@ -240,10 +455,12 @@ final class ArenaModel: ObservableObject {
         storageFailed = false
         intents.removeAll()
         manualProviders.removeAll()
+        verificationProviders.removeAll()
         blockedTasks.removeAll()
         previews.removeAll()
-        statuses.removeAll()
+        seatStates.removeAll()
         readRecoveryStalls.removeAll()
+        historyResumeID = nil
         currentID = created.arenaString("id")
         createdAt = Self.nowMillis()
         errorMessage = ""
@@ -259,7 +476,7 @@ final class ArenaModel: ObservableObject {
             // 新场次才解除上一场固定的对话；本场后续轮次与人工接管都不重置。
             pane.resetConversationBinding()
             pane.open(config.url)
-            setStatus(provider, "打开原页…")
+            setState(provider, .idle, "打开原页…")
         }
         startDispatcher(token: token)
     }
@@ -297,18 +514,18 @@ final class ArenaModel: ObservableObject {
         for provider in currentProviders {
             guard let pending = pendingTask(for: provider) else { continue }
             if isPaused {
-                setStatus(provider, "已暂停")
+                setState(provider, .paused, "已暂停")
             } else if manualProviders.contains(provider) {
-                setStatus(provider, "等待你处理")
+                setManualWaitingState(provider, task: pending)
             } else if blockedTasks.contains(pending.arenaString("id") ?? "") {
-                setStatus(provider, "需要你核对原页")
+                setState(provider, .needsAction, "需要你核对原页")
             } else if intents[pending.arenaString("id") ?? ""]?.phase == .submitted {
-                setStatus(provider, "继续读取回答…")
+                setState(provider, .generating, "继续读取回答…")
             } else if let phase = intents[pending.arenaString("id") ?? ""]?.phase,
                       phase == .inflight || phase == .uncertain {
-                setStatus(provider, "可能已发送，需你核对原页（不会重发）")
+                setState(provider, .needsAction, "可能已发送，需你核对原页（不会重发）")
             } else {
-                setStatus(provider, "继续…")
+                setState(provider, .sending, "继续…")
             }
         }
     }
@@ -341,7 +558,8 @@ final class ArenaModel: ObservableObject {
         refreshStage()
         persist()
         for provider in currentProviders {
-            setStatus(provider, finalStatus(for: provider))
+            let state = finalState(for: provider)
+            setState(provider, state.kind, state.detail)
         }
     }
 
@@ -360,11 +578,12 @@ final class ArenaModel: ObservableObject {
             return
         }
         manualProviders.insert(provider)
+        verificationProviders.remove(provider)
         if let pending = pendingTask(for: provider) {
             blockedTasks.remove(pending.arenaString("id") ?? "")
-            setStatus(provider, "已接管，等待你核对原页")
+            setState(provider, .takenOver, "已接管；核对原页后可从本席菜单「文本补录…」提交")
         } else {
-            setStatus(provider, "已接管")
+            setState(provider, .takenOver, "已接管")
         }
         persist()
     }
@@ -420,24 +639,25 @@ final class ArenaModel: ObservableObject {
         guard persist() else {
             manualProviders.insert(provider)
             blockedTasks.insert(taskID)
-            setStatus(provider, "本地保存失败，暂未恢复")
+            setState(provider, .needsAction, "本地保存失败，暂未恢复")
             return
         }
+        verificationProviders.remove(provider)
 
         let name = displayName(provider)
         switch intents[taskID]?.phase {
         case .submitted:
-            setStatus(provider, "恢复只读：继续读取本轮回答…")
+            setState(provider, .generating, "恢复只读：继续读取本轮回答…")
             if isRecovering {
                 recoveryNotice = "已恢复上次讨论。「\(name)」只读继续本轮回答，不会重发；其他席位仍为人工核对。"
             }
         case .inflight, .uncertain:
-            setStatus(provider, "恢复只读：可能已发送，只核对不重发…")
+            setState(provider, .needsAction, "恢复只读：可能已发送，只核对不重发…")
             if isRecovering {
                 recoveryNotice = "已恢复上次讨论。「\(name)」本轮可能已发送，只做只读核对，不会重发；其他席位仍为人工核对。"
             }
         case .prepared, .none:
-            setStatus(provider, "恢复自动：准备本轮提示…")
+            setState(provider, .sending, "恢复自动：准备本轮提示…")
             if isRecovering {
                 recoveryNotice = "已恢复上次讨论。「\(name)」尚未发送的任务恢复自动派发；其他席位仍为人工核对。"
             }
@@ -447,7 +667,7 @@ final class ArenaModel: ObservableObject {
             if isPaused {
                 // Keep the decision; the dispatcher starts the task after the
                 // user resumes the discussion.
-                setStatus(provider, "已暂停；继续讨论后生效")
+                setState(provider, .paused, "已暂停；继续讨论后生效")
             } else {
                 launchWorker(provider: provider, task: task, token: runToken)
             }
@@ -521,7 +741,7 @@ final class ArenaModel: ObservableObject {
             let resolved = stance.flatMap(Self.normalizeStance)
                 ?? Self.parseStance(trimmed)
             guard let resolved else {
-                errorMessage = "表决需要明确立场：同意、有条件同意或反对"
+                errorMessage = "表态需要明确立场：同意、有条件同意或反对"
                 return false
             }
             payload["stance"] = resolved
@@ -545,9 +765,9 @@ final class ArenaModel: ObservableObject {
         persist()
         markIdleSeats()
         if let label = stanceLabelText {
-            setStatus(provider, "已表态：\(label)")
+            setState(provider, .answered, "已表态：\(label)")
         } else {
-            setStatus(provider, "已提交回答")
+            setState(provider, .answered, "已提交回答")
         }
         return true
     }
@@ -572,6 +792,36 @@ final class ArenaModel: ObservableObject {
             round: currentRound,
             version: task.arenaInt("version")
         )
+    }
+
+    /// Which seat actions the current state really allows. Every menu item is
+    /// bound to one of these flags instead of "enabled whenever running".
+    func controls(for provider: String) -> ArenaSeatControls {
+        guard session != nil, !isReadOnly, stageKey != "done",
+              currentProviders.contains(provider) else {
+            return .none
+        }
+        let pending = pendingTask(for: provider)
+        let pendingID = pending?.arenaString("id")
+        let isManual = manualProviders.contains(provider)
+        let isBlocked = pendingID.map { blockedTasks.contains($0) } ?? false
+        return ArenaSeatControls(
+            canTakeOver: !isManual || verificationProviders.contains(provider),
+            canResume: (isManual || isBlocked) && pending != nil,
+            canBackfill: pending != nil,
+            canSkip: pending != nil,
+            canOpenHome: isManual || isBlocked
+        )
+    }
+
+    /// Starting text for the non-modal backfill panel. Only this round's saved
+    /// answer or the latest preview is offered; a previous round's answer is
+    /// never pasted into a new pending round.
+    func backfillPrefill(for provider: String) -> ArenaBackfillPrefill {
+        let answer = currentTasks
+            .last(where: { $0.arenaString("provider") == provider })?
+            .arenaString("answer")
+        return Self.backfillPrefill(currentAnswer: answer, preview: previews[provider])
     }
 
     /// Skip this seat's current task. A late answer is not accepted into the
@@ -603,7 +853,7 @@ final class ArenaModel: ObservableObject {
         workers[taskID]?.cancel()
         workers[taskID] = nil
         previews[provider] = nil
-        setStatus(provider, "已跳过")
+        setState(provider, .skipped, "已跳过")
         refreshStage()
         persist()
         markIdleSeats()
@@ -613,32 +863,21 @@ final class ArenaModel: ObservableObject {
 
     /// Open a saved discussion for read-only review. This never re-creates a
     /// delivery loop and never opens or sends to a site.
+    /// Open a saved discussion for read-only review. This never opens a page,
+    /// re-creates a delivery loop or sends anything. The shared restore path is
+    /// used in conservative mode: every pending seat, including one whose task
+    /// was never sent, waits for manual verification.
     func openHistory(_ id: String) {
-        guard let file = engine.store.load(id: id) else {
-            errorMessage = "找不到该历史场次"
-            return
-        }
-        guard let saved = Self.decodeSession(file.sessionJSON) else {
-            errorMessage = "该历史场次的记录已损坏"
+        guard let saved = loadSavedSession(id: id) else {
+            errorMessage = "找不到该历史场次，或记录已损坏"
             return
         }
         stopRunningWork()
-        session = saved
-        isReadOnly = true
-        isRecovering = true
-        isPaused = saved.arenaBool("paused") ?? false
-        currentID = file.id
-        question = file.question
-        createdAt = file.createdAt
-        intents = Dictionary(uniqueKeysWithValues: file.intents.map { ($0.taskId, $0) })
-        manualProviders = Set(saved.arenaStringArray("providers"))
-        blockedTasks.removeAll()
-        previews.removeAll()
-        statuses.removeAll()
-        for provider in saved.arenaStringArray("providers") {
+        installRestored(saved, mode: .manualVerification, readOnly: true)
+        for provider in saved.participants {
             _ = ensurePane(for: provider)
-            setStatus(provider, "只读回看")
         }
+        historyResumeID = saved.stage == "done" ? nil : id
         errorMessage = ""
         recoveryNotice = "历史回看为只读：不会打开原页、不会重发，也不能修改回答。"
         refreshStage()
@@ -653,9 +892,10 @@ final class ArenaModel: ObservableObject {
         createdAt = 0
         intents.removeAll()
         manualProviders.removeAll()
+        verificationProviders.removeAll()
         blockedTasks.removeAll()
         previews.removeAll()
-        statuses.removeAll()
+        seatStates.removeAll()
         readRecoveryStalls.removeAll()
         isReadOnly = false
         isRecovering = false
@@ -663,10 +903,11 @@ final class ArenaModel: ObservableObject {
         storageFailed = false
         recoveryNotice = ""
         errorMessage = ""
+        historyResumeID = nil
         stageKey = ""
         stageLabel = "尚未开始"
         engine.store.setCurrent(nil)
-        refreshHistoryCache()
+        refreshHistoryList()
     }
 
     // MARK: - Dispatch
@@ -697,7 +938,7 @@ final class ArenaModel: ObservableObject {
                   let provider = task.arenaString("provider") else { continue }
 
             if manualProviders.contains(provider) {
-                setStatus(provider, "等待你处理")
+                setManualWaitingState(provider, task: task)
                 continue
             }
             if blockedTasks.contains(taskID) {
@@ -725,6 +966,15 @@ final class ArenaModel: ObservableObject {
         }
     }
 
+    private func setManualWaitingState(_ provider: String, task: [String: Any]) {
+        if verificationProviders.contains(provider) {
+            let state = Self.restoredManualState(phase: intents[task.arenaString("id") ?? ""]?.phase)
+            setState(provider, state.kind, state.detail)
+        } else {
+            setState(provider, .takenOver, "已接管；核对原页后可从本席菜单提交补录")
+        }
+    }
+
     private func runSeat(provider: String, task: [String: Any], token: UUID) async {
         guard token == runToken, !isReadOnly, !isPaused else { return }
         guard let taskID = task.arenaString("id"),
@@ -735,15 +985,15 @@ final class ArenaModel: ObservableObject {
         do {
             config = try engine.config(for: provider)
         } catch {
-            setStatus(provider, "需要你处理：\(error.localizedDescription)")
+            setState(provider, .needsAction, "需要你处理：\(error.localizedDescription)")
             return
         }
         guard let pane = panes[provider] else {
-            setStatus(provider, "需要你处理：原页不可用")
+            setState(provider, .needsAction, "需要你处理：原页不可用")
             return
         }
         if manualProviders.contains(provider) {
-            setStatus(provider, "已接管，等待你核对原页")
+            setState(provider, .takenOver, "已接管，等待你核对原页")
             return
         }
 
@@ -781,7 +1031,7 @@ final class ArenaModel: ObservableObject {
         if let intent = intents[taskID] {
             switch intent.phase {
             case .submitted:
-                setStatus(provider, "继续读取本轮回答…")
+                setState(provider, .generating, "继续读取本轮回答…")
                 return true
             case .inflight, .uncertain:
                 // A previous click may have reached the page. Re-check it with
@@ -823,7 +1073,7 @@ final class ArenaModel: ObservableObject {
         while attempt < 8 {
             guard await waitWhilePaused(token) else { return false }
             if manualProviders.contains(provider) {
-                setStatus(provider, "已接管，等待你核对原页")
+                setState(provider, .takenOver, "已接管，等待你核对原页")
                 return false
             }
             guard isCurrentPending(taskID) else { return false }
@@ -850,10 +1100,10 @@ final class ArenaModel: ObservableObject {
                 safe.pageURL = nil
                 intents[taskID] = safe
                 blockedTasks.insert(taskID)
-                setStatus(provider, "本地保存失败，未发送；请先处理存储")
+                setState(provider, .needsAction, "本地保存失败，未发送；请先处理存储")
                 return false
             }
-            setStatus(provider, "填入本轮提示并发送…")
+            setState(provider, .sending, "填入本轮提示并发送…")
 
             let response: [String: Any]
             do {
@@ -885,7 +1135,7 @@ final class ArenaModel: ObservableObject {
                 intents[taskID] = intent
                 persist()
                 blockedTasks.insert(taskID)
-                setStatus(provider, "发送结果待确认：\(Self.short(error.localizedDescription))")
+                setState(provider, .needsAction, "发送结果待确认：\(Self.short(error.localizedDescription))")
                 return await adoptPossiblySent(
                     provider: provider,
                     task: task,
@@ -921,7 +1171,7 @@ final class ArenaModel: ObservableObject {
                     deliver(provider: provider, task: task, text: text)
                     return false
                 }
-                setStatus(provider, "已发送，等待回答…")
+                setState(provider, .generating, "已发送，等待回答…")
                 return true
             }
 
@@ -939,7 +1189,7 @@ final class ArenaModel: ObservableObject {
                 intent.phase = .prepared
                 intents[taskID] = intent
                 persist()
-                setStatus(provider, Self.preClickStatus(detail))
+                setState(provider, .sending, Self.preClickStatus(detail))
                 if case .blocked = await repairPreClickSendIfNeeded(
                     provider: provider,
                     taskID: taskID,
@@ -957,7 +1207,7 @@ final class ArenaModel: ObservableObject {
                 intent.submittedAt = Self.nowMillis()
                 intents[taskID] = intent
                 persist()
-                setStatus(provider, "本轮提问已在原页，只读核对…")
+                setState(provider, .generating, "本轮提问已在原页，只读核对…")
                 return true
             default:
                 if explicitlyPreClick {
@@ -965,7 +1215,7 @@ final class ArenaModel: ObservableObject {
                     intent.phase = .prepared
                     intents[taskID] = intent
                     persist()
-                    setStatus(provider, Self.preClickStatus(detail))
+                    setState(provider, .sending, Self.preClickStatus(detail))
                     if case .blocked = await repairPreClickSendIfNeeded(
                         provider: provider,
                         taskID: taskID,
@@ -984,7 +1234,7 @@ final class ArenaModel: ObservableObject {
                     intents[taskID] = intent
                     persist()
                     blockedTasks.insert(taskID)
-                    setStatus(provider, "需要你处理：\(Self.friendly(errorCode: code))")
+                    setState(provider, .needsAction, "需要你处理：\(Self.friendly(errorCode: code))")
                     return false
                 } else {
                     // Unknown or post-click failure: the submit may already have
@@ -993,7 +1243,7 @@ final class ArenaModel: ObservableObject {
                     intents[taskID] = intent
                     persist()
                     blockedTasks.insert(taskID)
-                    setStatus(provider, "发送结果待确认，只读核对原页（不会重发）…")
+                    setState(provider, .needsAction, "发送结果待确认，只读核对原页（不会重发）…")
                     return await adoptPossiblySent(
                         provider: provider,
                         task: task,
@@ -1007,7 +1257,7 @@ final class ArenaModel: ObservableObject {
         }
 
         blockedTasks.insert(taskID)
-        setStatus(provider, "发送控件长时间未就绪；原页可能已填入本轮提示，请核对")
+        setState(provider, .needsAction, "发送控件长时间未就绪；原页可能已填入本轮提示，请核对")
         return false
     }
 
@@ -1034,11 +1284,11 @@ final class ArenaModel: ObservableObject {
             guard !Task.isCancelled else { return nil }
             guard await waitWhilePaused(token) else { return nil }
             if manualProviders.contains(provider) {
-                setStatus(provider, "已接管，等待你核对原页")
+                setState(provider, .takenOver, "已接管，等待你核对原页")
                 return nil
             }
             guard isCurrentPending(taskID) else { return nil }
-            setStatus(provider, attempt == 0 ? "检查原页…" : "等待原页就绪…")
+            setState(provider, .sending, attempt == 0 ? "检查原页…" : "等待原页就绪…")
             do {
                 let response = try await pane.command(
                     engine.driverMessage(
@@ -1071,7 +1321,7 @@ final class ArenaModel: ObservableObject {
                             reloadAttempted: intents[taskID]?.reloadAttempted
                         )
                         persist()
-                        setStatus(provider, "已发送，只读核对中…")
+                        setState(provider, .generating, "已发送，只读核对中…")
                     }
                     return response
                 }
@@ -1084,7 +1334,7 @@ final class ArenaModel: ObservableObject {
                     continue
                 }
                 blockedTasks.insert(taskID)
-                setStatus(provider, "需要你处理：\(Self.friendly(errorCode: code))")
+                setState(provider, .needsAction, "需要你处理：\(Self.friendly(errorCode: code))")
                 return nil
             } catch {
                 guard token == runToken, !isReadOnly else { return nil }
@@ -1114,11 +1364,11 @@ final class ArenaModel: ObservableObject {
                     case .flagsCorrected:
                         // 文档其实已经 settled，只是 WebKit 标志过期：稍等后
                         // 重新 probe，不导航、不点击。
-                        setStatus(provider, "原页已就绪，继续核对…")
+                        setState(provider, .sending, "原页已就绪，继续核对…")
                         try? await Task.sleep(nanoseconds: 400_000_000)
                         continue
                     case .navigated:
-                        setStatus(provider, "原页未就绪，已自动回到本席原页一次；继续核对，不会点击…")
+                        setState(provider, .sending, "原页未就绪，已自动回到本席原页一次；继续核对，不会点击…")
                         try? await Task.sleep(nanoseconds: 1_500_000_000)
                         continue
                     case .declined:
@@ -1131,7 +1381,7 @@ final class ArenaModel: ObservableObject {
                     continue
                 }
                 blockedTasks.insert(taskID)
-                setStatus(provider, "需要你处理：原页命令失败（\(Self.short(error.localizedDescription))）")
+                setState(provider, .needsAction, "需要你处理：原页命令失败（\(Self.short(error.localizedDescription))）")
                 return nil
             }
         }
@@ -1156,7 +1406,7 @@ final class ArenaModel: ObservableObject {
         while true {
             if token != runToken || isReadOnly { return }
             if manualProviders.contains(provider) {
-                setStatus(provider, "已接管，等待你核对原页")
+                setState(provider, .takenOver, "已接管，等待你核对原页")
                 return
             }
             guard await waitWhilePaused(token) else { return }
@@ -1197,7 +1447,7 @@ final class ArenaModel: ObservableObject {
                         .trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !text.isEmpty else {
                         blockedTasks.insert(taskID)
-                        setStatus(provider, "回答为空，请核对原页")
+                        setState(provider, .needsAction, "回答为空，请核对原页")
                         return
                     }
                     previews[provider] = nil
@@ -1207,7 +1457,7 @@ final class ArenaModel: ObservableObject {
                     let detail = response["detail"] as? [String: Any]
                     if let preview = detail?["preview"] as? [String: Any],
                        let text = preview.arenaString("text") {
-                        previews[provider] = text
+                        previews[provider] = ArenaPreview(text: text, isComplete: false)
                     }
                     let reason = detail?.arenaString("reason")
                     let stalledFor = noteReadProgress(taskID: taskID, detail: detail)
@@ -1225,34 +1475,32 @@ final class ArenaModel: ObservableObject {
                         // The helper already set the precise status.
                         break
                     case .held(let text):
-                        setStatus(provider, text)
+                        setState(provider, .generating, text)
                     case .none:
-                        setStatus(
-                            provider,
-                            Self.pendingReadStatus(
-                                reason: reason,
-                                recoveryUsed: intents[taskID]?.reloadAttempted == true
-                            )
+                        let state = Self.pendingReadState(
+                            reason: reason,
+                            recoveryUsed: intents[taskID]?.reloadAttempted == true
                         )
+                        setState(provider, state.kind, state.detail)
                     }
                 case "submitted", "ready":
                     if !showedSubmitted {
-                        setStatus(provider, "已发送，等待回答…")
+                        setState(provider, .generating, "已发送，等待回答…")
                         showedSubmitted = true
                     }
                 case "unknown":
                     blockedTasks.insert(taskID)
-                    setStatus(provider, "需要你核对原页（\(Self.friendly(errorCode: code.isEmpty ? "unknown" : code))）")
+                    setState(provider, .needsAction, "需要你核对原页（\(Self.friendly(errorCode: code.isEmpty ? "unknown" : code))）")
                     return
                 default:
                     if code == "document-not-ready" || code == "not-authorized-page" {
                         if !showedSubmitted {
-                            setStatus(provider, "等待原页就绪…")
+                            setState(provider, .generating, "等待原页就绪…")
                             showedSubmitted = true
                         }
                     } else {
                         blockedTasks.insert(taskID)
-                        setStatus(provider, "需要你核对原页：\(Self.friendly(errorCode: code))")
+                        setState(provider, .needsAction, "需要你核对原页：\(Self.friendly(errorCode: code))")
                         return
                     }
                 }
@@ -1263,15 +1511,15 @@ final class ArenaModel: ObservableObject {
                 consecutiveErrors += 1
                 if Date() >= deadline || consecutiveErrors >= 20 {
                     blockedTasks.insert(taskID)
-                    setStatus(provider, "读取中断，请核对原页（\(Self.short(error.localizedDescription))）")
+                    setState(provider, .needsAction, "读取中断，请核对原页（\(Self.short(error.localizedDescription))）")
                     return
                 }
-                setStatus(provider, "读取中断，重试…")
+                setState(provider, .generating, "读取中断，重试…")
             }
 
             if Date() >= deadline {
                 blockedTasks.insert(taskID)
-                setStatus(provider, "生成超时，请核对原页")
+                setState(provider, .needsAction, "生成超时，请核对原页")
                 return
             }
             try? await Task.sleep(nanoseconds: 1_200_000_000)
@@ -1375,6 +1623,39 @@ final class ArenaModel: ObservableObject {
         default:
             return "继续只读等待原生完成标记\(suffix)…"
         }
+    }
+
+    /// A pending read is still generation, even when the text stopped moving or
+    /// this seat already used its one read-only reload. It must never look like
+    /// a completed answer.
+    nonisolated static func pendingReadState(
+        reason: String?,
+        recoveryUsed: Bool
+    ) -> ArenaSeatState {
+        ArenaSeatState(
+            kind: .generating,
+            detail: pendingReadStatus(reason: reason, recoveryUsed: recoveryUsed)
+        )
+    }
+
+    /// Pure starting-text rule for the backfill panel, testable without a live
+    /// web view. Only the current round's answer or preview may be offered.
+    nonisolated static func backfillPrefill(
+        currentAnswer: String?,
+        preview: ArenaPreview?
+    ) -> ArenaBackfillPrefill {
+        if let answer = currentAnswer?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !answer.isEmpty {
+            return ArenaBackfillPrefill(text: answer, isPartial: false, isComplete: false)
+        }
+        if let preview, !preview.text.isEmpty {
+            return ArenaBackfillPrefill(
+                text: preview.text,
+                isPartial: !preview.isComplete,
+                isComplete: preview.isComplete
+            )
+        }
+        return ArenaBackfillPrefill(text: "", isPartial: false, isComplete: false)
     }
 
     /// Track one task's visible progress and return how long the current
@@ -1499,7 +1780,7 @@ final class ArenaModel: ObservableObject {
             return .held("地址或页面状态已变化，未自动重载；请核对原页")
         }
 
-        setStatus(provider, "长时间无新内容，已只读重载同一会话一次；继续等待原生完成标记…")
+        setState(provider, .generating, "长时间无新内容，已只读重载同一会话一次；继续等待原生完成标记…")
         return .reloaded
     }
 
@@ -1604,7 +1885,7 @@ final class ArenaModel: ObservableObject {
         guard composer.safe else {
             // A human draft or a live Stop: never reload over it.
             blockedTasks.insert(taskID)
-            setStatus(provider, "原页有未发送草稿或生成控件；未重载、未发送，请核对原页")
+            setState(provider, .needsAction, "原页有未发送草稿或生成控件；未重载、未发送，请核对原页")
             return .blocked
         }
 
@@ -1623,7 +1904,7 @@ final class ArenaModel: ObservableObject {
             return .none
         }
         preClickStalls[taskID] = nil
-        setStatus(provider, "发送前检查长时间未通过，已只重载本席同一会话一次；未点击发送")
+        setState(provider, .sending, "发送前检查长时间未通过，已只重载本席同一会话一次；未点击发送")
 
         switch await waitForReloadedComposer(
             provider: provider,
@@ -1639,7 +1920,7 @@ final class ArenaModel: ObservableObject {
             return .none
         case .timedOut:
             blockedTasks.insert(taskID)
-            setStatus(provider, "重载后原页仍未就绪；已停止自动发送，请核对原页")
+            setState(provider, .needsAction, "重载后原页仍未就绪；已停止自动发送，请核对原页")
             return .blocked
         }
     }
@@ -1718,7 +1999,7 @@ final class ArenaModel: ObservableObject {
 
     private func deliver(provider: String, task: [String: Any], text: String) {
         guard !manualProviders.contains(provider) else {
-            setStatus(provider, "已接管，未自动回填")
+            setState(provider, .takenOver, "已接管，未自动回填")
             return
         }
         guard let session, !isReadOnly else { return }
@@ -1738,9 +2019,9 @@ final class ArenaModel: ObservableObject {
             guard let stance = Self.parseStance(text) else {
                 // The model has to state its stance explicitly. Keep the text
                 // visible so the user can take over without losing it.
-                previews[provider] = text
+                previews[provider] = ArenaPreview(text: text, isComplete: true)
                 blockedTasks.insert(taskID)
-                setStatus(provider, "已收到回答，但缺少明确立场；请接管后选择")
+                setState(provider, .needsAction, "已收到回答，但缺少明确立场；请接管后选择")
                 return
             }
             payload["stance"] = stance
@@ -1753,17 +2034,17 @@ final class ArenaModel: ObservableObject {
         do {
             self.session = try engine.apply(session: session, action: "answer", payload: payload)
         } catch {
-            previews[provider] = text
+            previews[provider] = ArenaPreview(text: text, isComplete: true)
             blockedTasks.insert(taskID)
-            setStatus(provider, "回答未采用：\(Self.short(error.localizedDescription))")
+            setState(provider, .needsAction, "回答未采用：\(Self.short(error.localizedDescription))")
             return
         }
 
         previews[provider] = nil
         if let stanceText {
-            setStatus(provider, "已表态：\(stanceText)")
+            setState(provider, .answered, "已表态：\(stanceText)")
         } else {
-            setStatus(provider, "已收到回答")
+            setState(provider, .answered, "已收到回答")
         }
         refreshStage()
         persist()
@@ -1772,7 +2053,7 @@ final class ArenaModel: ObservableObject {
 
     // MARK: - Helpers
 
-    private func stopRunningWork() {
+    func stopRunningWork() {
         runToken = UUID()
         dispatcher?.cancel()
         dispatcher = nil
@@ -1850,7 +2131,7 @@ final class ArenaModel: ObservableObject {
             return false
         }
         blockedTasks.insert(taskID)
-        setStatus(provider, "已转人工：\(paneError.localizedDescription)")
+        setState(provider, .needsAction, "已转人工：\(paneError.localizedDescription)")
         return true
     }
 
@@ -1941,7 +2222,7 @@ final class ArenaModel: ObservableObject {
                 guard token == runToken, !isReadOnly, !Task.isCancelled else { return .stopped }
                 if let paneError = error as? SitePaneError, paneError.isConversationChanged {
                     blockedTasks.insert(taskID)
-                    setStatus(provider, "已转人工：\(paneError.localizedDescription)")
+                    setState(provider, .needsAction, "已转人工：\(paneError.localizedDescription)")
                     return .unconfirmed("原页对话已更换")
                 }
                 if Date() < deadline {
@@ -1976,7 +2257,7 @@ final class ArenaModel: ObservableObject {
         case .generating:
             promoteToSubmitted(taskID: taskID, task: task, pane: pane)
             blockedTasks.remove(taskID)
-            setStatus(provider, "原页已确认本轮提问，只读读取回答…")
+            setState(provider, .generating, "原页已确认本轮提问，只读读取回答…")
             return true
         case .answered(let text):
             promoteToSubmitted(taskID: taskID, task: task, pane: pane)
@@ -1986,7 +2267,7 @@ final class ArenaModel: ObservableObject {
             return false
         case .unconfirmed(let why):
             blockedTasks.insert(taskID)
-            setStatus(provider, "需处理：只读核对未确认（\(why)）；不会重发")
+            setState(provider, .needsAction, "需处理：只读核对未确认（\(why)）；不会重发")
             return false
         }
     }
@@ -2056,6 +2337,7 @@ final class ArenaModel: ObservableObject {
             let savedURL = restored?.pageURLs[provider].flatMap(URL.init(string:))
             let target = savedURL.flatMap { SitePane.originString($0) == config.origin ? $0 : nil }
             let pane = ensurePane(for: provider)
+            pane.resetConversationBinding()
             pane.open(target ?? config.url)
             // 恢复上次场次时同时恢复本席固定的会话地址（仅同源且通过白名单）。
             if let target { pane.restoreConversationBinding(target) }
@@ -2113,11 +2395,18 @@ final class ArenaModel: ObservableObject {
         persist()
     }
 
-    private func setStatus(_ provider: String, _ text: String) {
-        if statuses[provider] != text {
-            statuses[provider] = text
+    private func setState(
+        _ provider: String,
+        _ kind: ArenaSeatStateKind,
+        _ detail: String
+    ) {
+        let next = ArenaSeatState(kind: kind, detail: detail)
+        if seatStates[provider] != next {
+            seatStates[provider] = next
             if ProcessInfo.processInfo.environment["ARENA_TRACE_STATUS"] == "1" {
-                FileHandle.standardError.write(Data("[Arena] \(stageKey) \(provider) \(text)\n".utf8))
+                FileHandle.standardError.write(
+                    Data("[Arena] \(stageKey) \(provider) \(kind.rawValue) \(detail)\n".utf8)
+                )
             }
         }
     }
@@ -2135,11 +2424,11 @@ final class ArenaModel: ObservableObject {
         case "independent":
             label = "独立作答 · 第\(round)轮"
         case "critique":
-            label = "交叉质询 · 第\(round)轮"
+            label = "互评 · 第\(round)轮"
         case "proposal":
             label = "起草候选 · 第\(round)轮"
         case "vote":
-            label = "逐席表态 · 第\(round)轮"
+            label = "表态 · 第\(round)轮"
         case "done":
             label = "讨论已结束"
         default:
@@ -2151,43 +2440,32 @@ final class ArenaModel: ObservableObject {
         stageLabel = label
     }
 
-    /// Give seats without work a truthful resting status. Never touches a
-    /// seat that is blocked or manually waiting.
+    /// Give seats without work a truthful resting status. A state that needs
+    /// the user (blocked, taken over, skipped, paused) is never overwritten.
     private func markIdleSeats() {
         guard stageKey != "done" else {
             for provider in currentProviders {
-                setStatus(provider, finalStatus(for: provider))
+                let state = finalState(for: provider)
+                setState(provider, state.kind, state.detail)
             }
             return
         }
         for provider in currentProviders {
             guard pendingTask(for: provider) == nil else { continue }
+            let current = seatStates[provider]?.kind
             if manualProviders.contains(provider) {
-                setStatus(provider, "本轮已完成（等待其他席位）")
-            } else if !statuses[provider, default: ""].contains("需要") {
-                setStatus(provider, "本轮已完成")
+                setState(provider, .takenOver, "本轮已完成（等待其他席位）")
+            } else if current == .needsAction || current == .takenOver
+                        || current == .skipped || current == .paused {
+                continue
+            } else {
+                setState(provider, .answered, "本轮已完成")
             }
         }
     }
 
-    private func finalStatus(for provider: String) -> String {
-        let history = (session?["history"] as? [[String: Any]]) ?? []
-        let votes = history.filter {
-            $0.arenaString("provider") == provider &&
-            $0.arenaString("stage") == "vote" &&
-            $0.arenaString("status") == "answered"
-        }
-        if let vote = votes.last, let stance = vote.arenaString("stance") {
-            return "最终表态：\(Self.stanceDisplay(stance))"
-        }
-        let skips = history.filter {
-            $0.arenaString("provider") == provider &&
-            $0.arenaString("status") == "skipped"
-        }
-        if !skips.isEmpty {
-            return "已结束（有跳过）"
-        }
-        return "讨论已结束"
+    private func finalState(for provider: String) -> ArenaSeatState {
+        ArenaSeatOutcome.derive(session: session, provider: provider, ballot: reportBallot())
     }
 
     // MARK: Persistence
@@ -2234,7 +2512,7 @@ final class ArenaModel: ObservableObject {
             updatedAt: Self.nowMillis(),
             sessionJSON: sessionJSON,
             intents: intents.values.sorted { $0.taskId < $1.taskId },
-            manualProviders: manualProviders.sorted(),
+            manualProviders: manualProviders.subtracting(verificationProviders).sorted(),
             pageURLs: pageURLs,
             stopReason: session.arenaString("stopReason")
         )
@@ -2253,7 +2531,7 @@ final class ArenaModel: ObservableObject {
             }
         }
         currentID = id
-        refreshHistoryCache()
+        refreshHistoryList()
         return true
     }
 
@@ -2270,95 +2548,186 @@ final class ArenaModel: ObservableObject {
         return try? engine.reportBallot(history: materials)
     }
 
-    private func restoreLastSession() {
+    // MARK: - Restore
+
+    /// One shared loader for the ordinary relaunch, the CLI continuation and
+    /// the history view. The mode is the only difference: a history view and a
+    /// plain relaunch treat every pending seat (including a never-sent one) as
+    /// manual verification, while an explicitly authorised continuation lets the
+    /// existing dispatcher advance a verified unsent task.
+    private enum ArenaRestoreMode {
+        case manualVerification
+        case explicitContinue
+    }
+
+    private struct ArenaSavedSession {
+        let file: ArenaSessionFile
+        let session: [String: Any]
+
+        var participants: [String] { session.arenaStringArray("providers") }
+        var stage: String { session.arenaString("stage") ?? "" }
+        var isPaused: Bool { session.arenaBool("paused") ?? false }
+    }
+
+    private func loadSavedSession(id: String) -> ArenaSavedSession? {
+        guard let file = engine.store.load(id: id),
+              let session = Self.decodeSession(file.sessionJSON) else {
+            return nil
+        }
+        return ArenaSavedSession(file: file, session: session)
+    }
+
+    /// Preconditions for the CLI path that can dispatch verified unsent tasks.
+    private func explicitContinueBlockedReason(_ saved: ArenaSavedSession) -> String? {
+        if saved.stage == "done" {
+            return "这场讨论已经结束，没有可继续的轮次。"
+        }
+        if saved.isPaused {
+            return "这场讨论处于暂停状态；为避免重复发送不会自动继续，请只读回看。"
+        }
+        if !saved.file.manualProviders.isEmpty {
+            return "这场讨论有席位处于人工接管；请只读回看后按席位逐项核对。"
+        }
+        return nil
+    }
+
+    private func restoreInitialSession() {
         guard let id = engine.store.currentID(),
-              let file = engine.store.load(id: id),
-              let saved = Self.decodeSession(file.sessionJSON) else {
+              let saved = loadSavedSession(id: id) else {
             return
         }
-
-        // `file.manualProviders` is the durable record of seats the user really
-        // took over by hand; a normal startup widens that set for safety below
-        // but never writes it back without a new user action.
-        let savedPaused = saved.arenaBool("paused") ?? false
-        let savedTakenOver = Set(file.manualProviders)
-        let savedStage = saved.arenaString("stage") ?? ""
         let requested = explicitContinueID
-        let idMatches = requested != nil && requested == id
-        let canContinue = idMatches && !savedPaused && savedTakenOver.isEmpty && savedStage != "done"
+        let explicit = requested != nil
+            && requested == id
+            && explicitContinueBlockedReason(saved) == nil
 
-        session = saved
-        currentID = file.id
-        question = file.question
-        createdAt = file.createdAt
-        intents = Dictionary(uniqueKeysWithValues: file.intents.map { ($0.taskId, $0) })
-        blockedTasks.removeAll()
-        previews.removeAll()
-        isReadOnly = false
-        isRecovering = true
-        isPaused = savedPaused
-        statuses.removeAll()
-        didContinueSavedDiscussion = canContinue
-        refreshStage()
-
-        if canContinue {
-            // Explicit continuation keeps only the seats that were genuinely
-            // taken over (none passed the check above), so the saved delivery
-            // intents and task ownership remain exactly as they were.
-            manualProviders = []
-            for provider in saved.arenaStringArray("providers") {
-                setStatus(provider, continueStatus(for: provider))
-            }
-            recoveryNotice = "已按指定场次继续讨论。已收齐的席位不重发；尚未发送的席位自动派发；可能已发送的席位只做只读核对。"
-            return
-        }
-
-        // Conservative restart: every seat waits for a human. This is the
-        // behaviour a plain relaunch keeps.
-        manualProviders = Set(saved.arenaStringArray("providers"))
-        for provider in saved.arenaStringArray("providers") {
-            if let pending = pendingTask(for: provider) {
-                if let phase = intents[pending.arenaString("id") ?? ""]?.phase,
-                   phase == .submitted {
-                    setStatus(provider, "已恢复：此前已发送，请核对原页（不会重发）")
-                } else {
-                    setStatus(provider, "已恢复：请核对原页（不会重发）")
-                }
-            } else if savedStage == "done" {
-                setStatus(provider, finalStatus(for: provider))
-            } else {
-                setStatus(provider, "本轮已完成")
-            }
-        }
+        installRestored(saved, mode: explicit ? .explicitContinue : .manualVerification)
 
         if let requested, requested != id {
             recoveryNotice = "指定的场次 \(requested) 与当前场次 \(id) 不一致，未自动恢复；已按人工核对方式打开当前场次。"
-        } else if requested != nil && savedPaused {
-            recoveryNotice = "当前场次处于暂停状态，未自动恢复；请先核对原页，再手动继续。"
-        } else if requested != nil && !savedTakenOver.isEmpty {
-            recoveryNotice = "当前场次有席位处于手工接管，未自动恢复；请核对接管席位后手动继续。"
-        } else if requested != nil && savedStage == "done" {
-            recoveryNotice = "当前场次已经结束，没有需要继续的轮次。"
-        } else {
+        } else if requested != nil && !explicit {
+            if saved.isPaused {
+                recoveryNotice = "当前场次处于暂停状态，未自动恢复；请先核对原页，再手动继续。"
+            } else if !saved.file.manualProviders.isEmpty {
+                recoveryNotice = "当前场次有席位处于手工接管，未自动恢复；请核对接管席位后手动继续。"
+            } else if saved.stage == "done" {
+                recoveryNotice = "当前场次已经结束，没有需要继续的轮次。"
+            } else {
+                recoveryNotice = "当前场次未通过自动恢复检查；已按人工核对方式打开。"
+            }
+        } else if !explicit {
             recoveryNotice = "已恢复上次讨论。为避免重复发送，本场改为人工核对：可打开原页核对后粘贴回答，或跳过；新建讨论才会恢复自动派发。"
         }
     }
 
-    /// The resting status of one seat in a verified explicit continuation.
-    /// It distinguishes the three persisted intent states so a seat that never
-    /// sent is described as ready to dispatch, not as "sending".
-    private func continueStatus(for provider: String) -> String {
+    private func installRestored(
+        _ saved: ArenaSavedSession,
+        mode: ArenaRestoreMode,
+        readOnly: Bool = false
+    ) {
+        session = saved.session
+        currentID = saved.file.id
+        question = saved.file.question
+        createdAt = saved.file.createdAt
+        intents = Dictionary(uniqueKeysWithValues: saved.file.intents.map { ($0.taskId, $0) })
+        blockedTasks.removeAll()
+        previews.removeAll()
+        seatStates.removeAll()
+        isReadOnly = readOnly
+        isRecovering = true
+        isPaused = saved.isPaused
+        historyResumeID = nil
+        didContinueSavedDiscussion = (mode == .explicitContinue)
+        verificationProviders.removeAll()
+        refreshStage()
+
+        switch mode {
+        case .explicitContinue:
+            // Only the seats the user really took over block this mode; the
+            // checks above already required that set to be empty. The saved
+            // intents and task ownership stay exactly as they were, and the
+            // normal dispatcher decides per phase what may happen next.
+            manualProviders = []
+            for provider in saved.participants {
+                let state = continueState(for: provider)
+                setState(provider, state.kind, state.detail)
+            }
+            recoveryNotice = "已按指定场次继续讨论。已收齐的席位不重发；尚未发送的席位自动派发；可能已发送的席位只做只读核对。"
+        case .manualVerification:
+            // Conservative: every pending seat waits for a human, including a
+            // task whose persisted phase is still `prepared` (never sent).
+            manualProviders = Set(saved.participants)
+            verificationProviders = manualProviders.subtracting(saved.file.manualProviders)
+            for provider in saved.participants {
+                if let pending = pendingTask(for: provider) {
+                    setManualWaitingState(provider, task: pending)
+                } else if saved.stage == "done" {
+                    let state = finalState(for: provider)
+                    setState(provider, state.kind, state.detail)
+                } else {
+                    setState(provider, .answered, "本轮已完成")
+                }
+            }
+        }
+        refreshStage()
+    }
+
+    /// Reopen a history session via the same restore pipeline as the CLI.
+    /// All seats wait for explicit user action, including tasks with no intent.
+    @discardableResult
+    func continueSavedDiscussion(_ id: String) -> Bool {
+        guard let saved = loadSavedSession(id: id) else {
+            errorMessage = "找不到该历史场次"
+            return false
+        }
+        guard saved.stage != "done" else {
+            errorMessage = "这场讨论已经结束，没有可继续的轮次。"
+            return false
+        }
+        stopRunningWork()
+        errorMessage = ""
+        installRestored(saved, mode: .manualVerification)
+        recoveryNotice = "已继续这一场。请逐席核对原页，再补录、跳过或恢复本站自动。"
+        panes = panes.filter { currentProviders.contains($0.key) }
+        engine.store.setCurrent(id)
+        prepareInitialPanes()
+        refreshHistoryList()
+        startDispatcher(token: runToken)
+        return true
+    }
+
+    /// The resting state of one seat in a verified explicit continuation. A
+    /// seat that never sent is described as ready to dispatch, not as sending.
+    private func continueState(for provider: String) -> ArenaSeatState {
         guard let pending = pendingTask(for: provider),
               let taskID = pending.arenaString("id") else {
-            return stageKey == "done" ? finalStatus(for: provider) : "本轮已完成"
+            return stageKey == "done"
+                ? finalState(for: provider)
+                : ArenaSeatState(kind: .answered, detail: "本轮已完成")
         }
         switch intents[taskID]?.phase {
         case .submitted:
-            return "已恢复：此前已发送，只读继续读取回答…"
+            return ArenaSeatState(kind: .generating, detail: "已恢复：此前已发送，只读继续读取回答…")
         case .inflight, .uncertain:
-            return "已恢复：可能已发送，只读核对原页（不会重发）…"
+            return ArenaSeatState(kind: .needsAction, detail: "已恢复：可能已发送，只读核对原页（不会重发）…")
         case .prepared, .none:
-            return "已恢复：本轮尚未发送，准备自动派发…"
+            return ArenaSeatState(kind: .sending, detail: "已恢复：本轮尚未发送，准备自动派发…")
+        }
+    }
+
+    /// Conservative pending-seat state for a history/relaunch restore. A
+    /// prepared task has evidence that nothing was clicked, but it still waits
+    /// for the same human verification as any other restored seat.
+    nonisolated static func restoredManualState(
+        phase: ArenaDeliveryIntent.Phase?
+    ) -> ArenaSeatState {
+        switch phase {
+        case .submitted:
+            return ArenaSeatState(kind: .needsAction, detail: "已恢复：此前已发送，请核对原页（不会重发）")
+        case .inflight, .uncertain:
+            return ArenaSeatState(kind: .needsAction, detail: "已恢复：可能已发送，需你核对原页（不会重发）")
+        case .prepared, .none:
+            return ArenaSeatState(kind: .needsAction, detail: "已恢复：本轮尚未发送，请核对原页后再手动继续（不会自动发送）")
         }
     }
 
@@ -2372,8 +2741,8 @@ final class ArenaModel: ObservableObject {
         return intents[taskID]?.phase.rawValue
     }
 
-    private func refreshHistoryCache() {
-        historyCache = engine.store.summaries().map { (id: $0.id, question: $0.question) }
+    private func refreshHistoryList() {
+        historyList = engine.store.summaries()
     }
 
     // MARK: Static helpers

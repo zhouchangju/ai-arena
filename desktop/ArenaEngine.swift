@@ -101,6 +101,23 @@ struct ArenaDeliveryIntent: Codable, Equatable {
 
 // MARK: - Persisted session file
 
+/// One saved discussion as shown in the history menu. The stage and outcome
+/// are read from the saved session document, never from the current UI state,
+/// so a history row stays truthful after the live workbench moved on.
+struct ArenaHistorySummary: Identifiable {
+    let id: String
+    let question: String
+    let createdAt: Double
+    let updatedAt: Double
+    let stage: String
+    let round: Int
+    let stopReason: String?
+    let hasReport: Bool
+    let paused: Bool
+
+    var isFinished: Bool { stage == "done" }
+}
+
 struct ArenaSessionFile: Codable {
     var version: Int
     var id: String
@@ -226,21 +243,43 @@ final class ArenaSessionStore {
         }
     }
 
-    func summaries() -> [(id: String, question: String, updatedAt: Double)] {
+    func summaries() -> [ArenaHistorySummary] {
         guard let names = try? fileManager.contentsOfDirectory(atPath: root.path) else {
             return []
         }
-        var result: [(id: String, question: String, updatedAt: Double)] = []
+        var result: [ArenaHistorySummary] = []
         for name in names where name.hasSuffix(".json") && name != "current.json" {
             let url = root.appendingPathComponent(name, isDirectory: false)
             guard let data = try? Data(contentsOf: url),
                   let file = try? decoder.decode(ArenaSessionFile.self, from: data) else {
                 continue
             }
-            result.append((id: file.id, question: file.question, updatedAt: file.updatedAt))
+            let session = Self.sessionDocument(file.sessionJSON)
+            result.append(
+                ArenaHistorySummary(
+                    id: file.id,
+                    question: file.question,
+                    createdAt: file.createdAt,
+                    updatedAt: file.updatedAt,
+                    stage: session?.arenaString("stage") ?? "",
+                    round: session?.arenaInt("round") ?? 1,
+                    stopReason: session?.arenaString("stopReason"),
+                    hasReport: session?.arenaString("report")?.isEmpty == false,
+                    paused: session?.arenaBool("paused") ?? false
+                )
+            )
         }
         result.sort { $0.updatedAt > $1.updatedAt }
         return result
+    }
+
+    private static func sessionDocument(_ json: String) -> [String: Any]? {
+        guard let data = json.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data, options: []),
+              let dictionary = object as? [String: Any] else {
+            return nil
+        }
+        return dictionary
     }
 }
 

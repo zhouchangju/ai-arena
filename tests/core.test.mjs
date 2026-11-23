@@ -759,11 +759,11 @@ test('an early finish names the outstanding seat and stage, never implying nobod
   );
 
   // The unfinished stage and the seats still pending are named explicitly...
-  assert.match(session.report, /提前结束阶段：表决（第1轮），该阶段未完成/);
-  assert.match(session.report, /未完成席位：`claude`（表决 · 第1轮）/);
+  assert.match(session.report, /提前结束阶段：表态（第1轮），该阶段未完成/);
+  assert.match(session.report, /未完成席位：`claude`（表态 · 第1轮）/);
   assert.match(
     session.report,
-    /`claude` 在表决（第1轮）尚未提交，状态仍为 pending；不计为同意/,
+    /`claude` 在表态（第1轮）尚未提交，状态仍为 pending；不计为同意/,
   );
   // ...and the absence section never collapses to "无" while a seat is pending.
   assert.doesNotMatch(session.report, /## 缺席与跳过\n\n- 无。/);
@@ -865,7 +865,7 @@ test('guidance added while paused reaches only newly issued prompts', () => {
   assert.match(session.report, /独立作答第1轮提出：GUIDE_WEEKEND_LIMIT/);
   assert.match(
     session.report,
-    /随新任务发出：质询（第1轮）· chatgpt；质询（第1轮）· claude/,
+    /随新任务发出：互评（第1轮）· chatgpt；互评（第1轮）· claude/,
   );
 });
 
@@ -924,7 +924,7 @@ test('guidance is rejected outside independent/critique and never enters vote pr
   // unverified, and names the tasks that actually carried it.
   assert.match(session.report, /## 用户补充条件/);
   assert.match(session.report, /补充 #1 · \d{4}-\d{2}-\d{2} \d{2}:\d{2}/);
-  assert.match(session.report, /质询第1轮提出：GUIDE_CRITIQUE/);
+  assert.match(session.report, /互评第1轮提出：GUIDE_CRITIQUE/);
   assert.match(session.report, /未经事实核验/);
   assert.match(
     session.report,
@@ -1063,6 +1063,60 @@ test('unanimous explicit agreement produces a final report with source ids', () 
   for (const sourceId of sourceIds) {
     assert.match(session.report, new RegExp(`\\[${sourceId}\\]`));
   }
+});
+
+test('reports use 互评/表态 once for the review budget', () => {
+  let session = toVote(undefined, 3);
+  session = voteAll(
+    session,
+    { chatgpt: 'agree', claude: 'agree' },
+    {
+      chatgpt: 'TERM_VOTE_A 同意。',
+      claude: 'TERM_VOTE_B 同意。',
+    },
+  );
+  assert.equal(session.stage, 'done');
+  assert.match(session.report, /^- 互评轮次：1 \/ 3$/m);
+  assert.doesNotMatch(session.report, /质询轮次|讨论轮次/);
+  assert.match(session.report, /^## 互评与最强反例$/m);
+  assert.match(session.report, /^## 各席最终表态$/m);
+  assert.match(session.report, /完成本轮互评/);
+});
+
+test('a session saved without a round budget keeps the legacy two-round default', () => {
+  const legacy = JSON.parse(JSON.stringify(start()));
+  delete legacy.maxRounds;
+  let session = applyAction(legacy, 'finish');
+  assert.match(session.report, /^- 互评轮次：0 \/ 2$/m);
+  assert.doesNotMatch(session.report, /互评轮次：[1-9]/);
+
+  // A new desktop session states three explicitly and the report follows it.
+  let desktop = createSession(QUESTION, PROVIDERS, { maxRounds: 3 });
+  desktop = applyAction(desktop, 'finish');
+  assert.match(desktop.report, /^- 互评轮次：0 \/ 3$/m);
+  assert.doesNotMatch(desktop.report, /互评轮次：[1-9]/);
+});
+
+test('finishing during independent answers reports zero review cycles', () => {
+  let session = createSession(QUESTION, PROVIDERS, { maxRounds: 3 });
+  session = applyAction(session, 'finish');
+  assert.equal(session.stopReason, 'user-finished');
+  assert.equal(
+    session.history.some((task) => task.stage === 'critique'),
+    false,
+  );
+  assert.match(session.report, /^- 互评轮次：0 \/ 3$/m);
+  assert.doesNotMatch(session.report, /互评轮次：[1-9]/);
+});
+
+test('a review cycle that began counts even while its tasks are still pending', () => {
+  let session = start();
+  session = answerFor(session, 'chatgpt', 'PENDING_CYCLE_A');
+  session = answerFor(session, 'claude', 'PENDING_CYCLE_B');
+  assert.equal(session.stage, 'critique');
+  session = applyAction(session, 'finish');
+  assert.equal(session.stopReason, 'user-finished');
+  assert.match(session.report, /^- 互评轮次：1 \/ 2$/m);
 });
 
 test('unknown or out-of-session candidate references are rejected before vote and can be corrected', () => {
@@ -1226,8 +1280,8 @@ test('a seat that skipped cross-review cannot produce full consensus', () => {
 
   assert.equal(session.stage, 'done');
   assert.equal(session.stopReason, 'no-cross-review');
-  assert.match(session.report, /本轮交叉质询席位：`claude`（1\/2）/);
-  assert.match(session.report, /仅收到对方文字不等于完成质询/);
+  assert.match(session.report, /本轮互评席位：`claude`（1\/2）/);
+  assert.match(session.report, /仅收到对方文字不等于完成互评/);
   assert.doesNotMatch(session.report, /^- 全体一致/m);
 });
 
@@ -1338,7 +1392,7 @@ test('explicit opposition runs one targeted critique round and then stops unreso
   assert.deepEqual([...critiqueRounds].sort(), [1, 2]);
   assert.match(session.report, /未解决分歧/);
   assert.match(session.report, /R2_OPPOSE/);
-  assert.match(session.report, /往轮表决/);
+  assert.match(session.report, /往轮表态/);
   assert.match(session.report, /v1.*oppose|反对/);
   assert.doesNotMatch(session.report, /全体一致/);
 });
@@ -1359,7 +1413,7 @@ test('opposition resolved in the second round still requires every seat to agree
   assert.match(session.report, /全体一致/);
   assert.match(session.report, /候选版本 v2/);
   assert.match(session.report, /R2_NOW_AGREE/);
-  assert.match(session.report, /往轮表决/);
+  assert.match(session.report, /往轮表态/);
   assert.match(session.report, /ROUND1_OPPOSE/);
 });
 
@@ -1445,8 +1499,8 @@ test('a three-round desktop session follows conditions across v1, v2 and v3 and 
   assert.equal(session.stage, 'done');
   assert.equal(session.stopReason, 'conditional-agreement');
   assert.equal(session.round, 3);
-  assert.match(session.report, /讨论轮次：第 3 轮 \/ 上限 3 轮/);
-  assert.match(session.report, /质询轮次：3 \/ 3/);
+  assert.match(session.report, /互评轮次：3 \/ 3/);
+  assert.doesNotMatch(session.report, /质询轮次/);
   assert.match(session.report, /候选版本：v3/);
   assert.match(session.report, /R3_COND/);
   assert.match(session.report, /附加条件/);
@@ -1484,7 +1538,7 @@ test('an explicit two-round desktop budget follows one condition and then stops 
   assert.equal(session.stage, 'done');
   assert.equal(session.stopReason, 'conditional-agreement');
   assert.equal(session.round, 2);
-  assert.match(session.report, /讨论轮次：第 2 轮 \/ 上限 2 轮/);
+  assert.match(session.report, /互评轮次：2 \/ 2/);
   assert.match(session.report, /R2_COND/);
   assert.match(session.report, /已到轮数上限（2 轮）/);
   assert.doesNotMatch(session.report, /全体一致/);
@@ -1535,7 +1589,7 @@ test('a three-round desktop session stops at the cap with explicit opposition st
   assert.equal(session.stage, 'done');
   assert.equal(session.stopReason, 'unresolved-opposition');
   assert.equal(session.round, 3);
-  assert.match(session.report, /讨论轮次：第 3 轮 \/ 上限 3 轮/);
+  assert.match(session.report, /互评轮次：3 \/ 3/);
   assert.match(session.report, /候选版本：v3/);
   assert.match(session.report, /R3_OPPOSE/);
   assert.match(session.report, /未解决分歧/);
@@ -1556,7 +1610,7 @@ test('real unanimous agreement stops early even when more rounds remain', () => 
   assert.equal(session.stage, 'done');
   assert.equal(session.stopReason, 'consensus');
   assert.equal(session.round, 1);
-  assert.match(session.report, /讨论轮次：第 1 轮 \/ 上限 5 轮/);
+  assert.match(session.report, /互评轮次：1 \/ 5/);
 
   // After one opposition follow-up, a unanimous v2 still converges without
   // spending the remaining rounds.
@@ -1577,7 +1631,7 @@ test('real unanimous agreement stops early even when more rounds remain', () => 
   assert.equal(later.stage, 'done');
   assert.equal(later.stopReason, 'consensus');
   assert.equal(later.round, 2);
-  assert.match(later.report, /讨论轮次：第 2 轮 \/ 上限 5 轮/);
+  assert.match(later.report, /互评轮次：2 \/ 5/);
 });
 
 // ---------------------------------------------------------------------------
@@ -1645,7 +1699,9 @@ test('all critiques skipped ends in a partial report without a proposal', () => 
 
   assert.equal(session.stage, 'done');
   assert.equal(session.stopReason, 'no-critique');
-  assert.match(session.report, /缺少可用的质询材料/);
+  assert.match(session.report, /缺少可用的互评材料/);
+  // The cycle began even though both review tasks were skipped.
+  assert.match(session.report, /^- 互评轮次：1 \/ 2$/m);
   assert.match(session.report, /## 独立回答/);
   assert.doesNotMatch(session.report, /全体一致/);
 });

@@ -3,6 +3,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -146,8 +147,21 @@ def main():
         assert answers == [x["answer"] for x in saved], site
     assert all(x["stance"] == "agree" for x in history if x["stage"] == "vote")
     assert len({x["proposalDigest"] for x in history if x["stage"] == "vote"}) == 1
-    assert session["report"] in (out / "export.md").read_text()
-    assert all(row["prompt"] in (out / "export.md").read_text() for row in history)
+    exported = (out / "export.md").read_text()
+    assert session["report"] in exported
+    assert all(row["prompt"] in exported for row in history)
+    metadata, _, _ = exported.partition("## 题面")
+    assert metadata.count(session["id"]) == 1, metadata
+    assert re.search(
+        r"^- 导出时间：\d{4}-\d{2}-\d{2}T[\d:]+[+-]\d{2}:\d{2}(?:（本地时间）)?$",
+        metadata,
+        re.M,
+    ), metadata
+    _, _, seat_section = exported.partition("## 参与者与状态")
+    seat_table, _, _ = seat_section.partition("\n## ")
+    for site in PROVIDERS:
+        row = next(line for line in seat_table.splitlines() if line.startswith(f"| `{site}` |"))
+        assert "同意" in row and "只读回看" not in row, row
     print(f"PASS: 3 provider views; {len(events)//2} exactly matched automatic sends and replies; same-version votes, restore, QA-isolated session cookie persisted across both launches and Markdown; takeover={args.takeover}")
 
 

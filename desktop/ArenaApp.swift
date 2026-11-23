@@ -142,45 +142,94 @@ enum ArenaLaunchOptions {
 @main
 struct ArenaDesktopApp: App {
     @NSApplicationDelegateAdaptor(ArenaAppDelegate.self) private var appDelegate
-    @StateObject private var model: ArenaModel
 
     init() {
         // 冒烟配置不合法时必须在 ArenaModel 创建（会打开原页）之前退出。
         SmokeRunner.preflight()
-        _model = StateObject(
-            wrappedValue: ArenaModel(
-                continueSessionID: ArenaLaunchOptions.continueSessionID()
-            )
+        appDelegate.model = ArenaModel(
+            continueSessionID: ArenaLaunchOptions.continueSessionID()
         )
     }
 
     var body: some Scene {
-        Window("AI Arena", id: "arena-main") {
-            ArenaRootView(model: model)
-                .frame(minWidth: 860, minHeight: 560)
+        Settings {
+            EmptyView()
         }
-        .defaultSize(width: 1280, height: 860)
+        .commands { CommandGroup(replacing: .appSettings) {} }
     }
 }
 
-final class ArenaAppDelegate: NSObject, NSApplicationDelegate {
+final class ArenaAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+    @MainActor var model: ArenaModel?
+    private var mainWindow: NSWindow?
+    private var terminationConfirmed = false
+
+    @MainActor
     func applicationDidFinishLaunching(_ notification: Notification) {
+        guard let model else { return }
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1280, height: 860),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "AI Arena"
+        window.contentMinSize = NSSize(width: 860, height: 560)
+        window.contentView = NSHostingView(rootView: ArenaRootView(model: model))
+        window.delegate = self
+        window.isReleasedWhenClosed = false
+        window.collectionBehavior = [.fullScreenPrimary]
+        window.center()
+        window.setFrameAutosaveName("arena-main")
+        mainWindow = window
         NSApp.setActivationPolicy(.regular)
+        window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            if NSApp.keyWindow == nil { NSApp.windows.first?.makeKeyAndOrderFront(nil) }
-        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
     }
 
+    @MainActor
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard sender === mainWindow, !terminationConfirmed,
+              model?.hasRunningDiscussion == true else { return true }
+        // Ask through the same path as ⌘Q while the workbench is still visible.
+        DispatchQueue.main.async { NSApp.terminate(nil) }
+        return false
+    }
+
+    @MainActor
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !terminationConfirmed, let model, model.hasRunningDiscussion else { return .terminateNow }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "仍有讨论在进行"
+        alert.informativeText = "退出会停止后续派发。已发送的请求可能仍会在原页生成；之后可以从「历史」继续核对已保存的进度。"
+        alert.addButton(withTitle: "退出")
+        let cancel = alert.addButton(withTitle: "取消")
+        cancel.keyEquivalent = "\r"
+        alert.buttons[0].keyEquivalent = ""
+        if alert.runModal() == .alertFirstButtonReturn {
+            terminationConfirmed = true
+            model.stopRunningWork()
+            return .terminateNow
+        }
+        // The last window may already have closed. Bring the workbench back
+        // instead of leaving an app with no window.
+        if let main = mainWindow {
+            if main.isMiniaturized { main.deminiaturize(nil) }
+            main.makeKeyAndOrderFront(nil)
+        }
+        return .terminateCancel
+    }
+
     /// Dock 点击或重新激活时，优先把主工作台带回前台。详情窗口是独立
     /// 辅助窗口，不能代替主窗口成为“重新打开”的落点。
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         guard !flag else { return true }
-        if let main = Self.mainArenaWindow() {
+        if let main = mainWindow {
             if main.isMiniaturized { main.deminiaturize(nil) }
             main.makeKeyAndOrderFront(nil)
         } else if !ArenaDetailsWindowController.shared.focusIfVisible() {
@@ -189,16 +238,6 @@ final class ArenaAppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
-    @MainActor
-    private static func mainArenaWindow() -> NSWindow? {
-        let details = ArenaDetailsWindowController.shared.window
-        return NSApp.windows.first {
-            $0 !== details
-                && $0.styleMask.contains(.titled)
-                && !$0.isSheet
-                && $0.canBecomeMain
-        }
-    }
 }
 
 // MARK: - 主界面
@@ -209,12 +248,9 @@ struct ArenaRootView: View {
     @State private var selectedProviders: Set<String> = Set(ArenaSeatCatalog.ordered)
     @State private var roundLimit = 3
     private var hasStarted: Bool { model.session != nil }
-    @State private var takenOver: Set<String> = []
-    @State private var backfillRequest: ArenaSeatTarget?
-    @State private var backfillTarget: ArenaManualTarget?
-    @State private var backfillError = ""
-    @State private var backfillText = ""
-    @State private var backfillStance = ""
+    @State private var confirmation: ArenaConfirmation?
+    @State private var seatHint: String?
+    @State private var hintTask: Task<Void, Never>?
 
     @FocusState private var questionFocused: Bool
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -249,15 +285,41 @@ struct ArenaRootView: View {
             SmokeRunner.shared.begin(model: model)
         }
         .onChange(of: model.stageKey) { stage in
-            if stage == "done", !model.isReadOnly, backfillRequest == nil {
+            if stage == "done", !model.isReadOnly {
                 presentDetails(provider: nil, tab: .report)
             }
         }
-        .sheet(item: $backfillRequest, onDismiss: {
-            backfillTarget = nil
-            backfillError = ""
-        }) { target in
-            backfillSheet(provider: target.id)
+        .alert(item: $confirmation) { item in
+            switch item {
+            case .newDiscussion:
+                return Alert(
+                    title: Text("新建讨论？"),
+                    message: Text("当前讨论会停止并保留在历史中。已发送的请求可能仍会在原页生成；之后可从「历史」继续核对。"),
+                    primaryButton: .destructive(Text("新建")) { performNewDiscussion() },
+                    secondaryButton: .cancel(Text("取消"))
+                )
+            case .finish:
+                return Alert(
+                    title: Text("结束整场讨论？"),
+                    message: Text("将停止后续派发并生成当前报告，保留已保存的回答。已发送的请求可能仍会在原页生成。"),
+                    primaryButton: .destructive(Text("结束整场")) { model.finish() },
+                    secondaryButton: .cancel(Text("取消"))
+                )
+            case .continueHistory(let id):
+                return Alert(
+                    title: Text("继续这一场？"),
+                    message: Text("各待处理席位会先等待你核对原页。你可以补录、跳过，或逐席恢复自动。可能已发送的任务只做只读核对。"),
+                    primaryButton: .default(Text("继续")) { continueSaved(id) },
+                    secondaryButton: .cancel(Text("取消"))
+                )
+            case .openHistory(let id):
+                return Alert(
+                    title: Text("打开历史场次？"),
+                    message: Text("当前讨论会停在已保存的进度。已发送的请求可能仍会在原页生成，之后可以从「历史」继续。"),
+                    primaryButton: .default(Text("打开历史")) { openHistory(id) },
+                    secondaryButton: .cancel(Text("取消"))
+                )
+            }
         }
     }
 
@@ -385,9 +447,20 @@ struct ArenaRootView: View {
             if model.historyList.isEmpty {
                 Button("暂无历史") {}.disabled(true)
             } else {
-                ForEach(Array(model.historyList.enumerated()), id: \.offset) { _, item in
-                    Button(arenaShorten(item.question, limit: 42)) {
-                        openHistory(item.id)
+                ForEach(model.historyList) { item in
+                    Menu {
+                        Button("只读回看") {
+                            if isRunning { confirmation = .openHistory(item.id) }
+                            else { openHistory(item.id) }
+                        }
+                        if !item.isFinished {
+                            Button("继续这一场…") {
+                                confirmation = .continueHistory(item.id)
+                            }
+                            .help("先逐席核对原页，可能已发送的任务只做只读核对")
+                        }
+                    } label: {
+                        Text(historyLabel(item))
                     }
                 }
             }
@@ -421,12 +494,48 @@ struct ArenaRootView: View {
         .accessibilityLabel("历史场次")
     }
 
+    /// One history row: local date/time, saved outcome and enough of the
+    /// question to tell sessions apart. An unfinished session says so.
+    private func historyLabel(_ item: ArenaHistorySummary) -> String {
+        let stamp = Self.historyDateFormatter.string(
+            from: Date(timeIntervalSince1970: item.updatedAt / 1000)
+        )
+        let outcome = historyOutcome(item)
+        return "\(stamp) · \(outcome) · \(arenaShorten(item.question, limit: 34))"
+    }
+
+    private func historyOutcome(_ item: ArenaHistorySummary) -> String {
+        if !item.isFinished {
+            return item.paused ? "未完成 · 已暂停" : "未完成 · 可继续"
+        }
+        switch item.stopReason {
+        case "consensus": return "全体一致"
+        case "conditional-agreement": return "有条件一致"
+        case "unresolved-opposition": return "仍有反对"
+        case "partial-votes": return "部分表态"
+        case "partial-participation": return "参与不足"
+        case "no-cross-review": return "互评缺失"
+        case "proposal-skipped": return "未形成候选"
+        case "draft": return "候选草稿"
+        case "user-finished": return "提前结束"
+        case "no-answers": return "无有效回答"
+        default: return "已结束"
+        }
+    }
+
+    private static let historyDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "MM-dd HH:mm"
+        return formatter
+    }()
+
     // MARK: 开始前：大号多行问题输入
 
     private var composerCard: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top, spacing: 10) {
-                Image(systemName: "magnifyingglass")
+                Image(systemName: "questionmark.bubble")
                     .font(.system(size: 16, weight: .medium))
                     .foregroundStyle(.secondary)
                     .padding(.top, 3)
@@ -499,49 +608,66 @@ struct ArenaRootView: View {
     }
 
     private var seatChips: some View {
-        HStack(spacing: 6) {
-            ForEach(ArenaSeatCatalog.ordered, id: \.self) { provider in
-                let selected = selectedProviders.contains(provider)
-                Button {
-                    toggleSeat(provider)
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: selected ? "checkmark.circle.fill" : "circle")
-                            .font(.system(size: 11, weight: .semibold))
-                        Text(ArenaSeatCatalog.name(provider))
-                            .font(.system(size: 13, weight: .medium))
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                ForEach(ArenaSeatCatalog.ordered, id: \.self) { provider in
+                    let selected = selectedProviders.contains(provider)
+                    Button {
+                        toggleSeat(provider)
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                                .font(.system(size: 11, weight: .semibold))
+                            Text(ArenaSeatCatalog.name(provider))
+                                .font(.system(size: 13, weight: .medium))
+                        }
+                        .padding(.horizontal, 10)
+                        .frame(minHeight: 32)
+                        .contentShape(Capsule())
+                        .background(
+                            Capsule().fill(
+                                selected
+                                    ? Color.accentColor.opacity(0.16)
+                                    : Color.primary.opacity(0.06)
+                            )
+                        )
+                        .overlay(
+                            Capsule().strokeBorder(
+                                selected
+                                    ? Color.accentColor.opacity(0.28)
+                                    : Color.primary.opacity(0.08)
+                            )
+                        )
+                        .foregroundStyle(selected ? Color.accentColor : Color.secondary)
                     }
-                    .padding(.horizontal, 10)
-                    .frame(minHeight: 32)
-                    .contentShape(Capsule())
-                    .background(
-                        Capsule().fill(
-                            selected
-                                ? Color.accentColor.opacity(0.16)
-                                : Color.primary.opacity(0.06)
-                        )
-                    )
-                    .overlay(
-                        Capsule().strokeBorder(
-                            selected
-                                ? Color.accentColor.opacity(0.28)
-                                : Color.primary.opacity(0.08)
-                        )
-                    )
-                    .foregroundStyle(selected ? Color.accentColor : Color.secondary)
+                    .buttonStyle(.plain)
+                    .disabled(isRunning)
+                    .help(seatChipHelp(provider, selected: selected))
+                    .accessibilityLabel("\(ArenaSeatCatalog.name(provider))，\(selected ? "已选择" : "未选择")")
                 }
-                .buttonStyle(.plain)
-                .disabled(isRunning)
-                .help(selected ? "本场参与：\(ArenaSeatCatalog.name(provider))" : "点击加入本场")
-                .accessibilityLabel("\(ArenaSeatCatalog.name(provider))，\(selected ? "已选择" : "未选择")")
+            }
+            .fixedSize()
+
+            if let seatHint {
+                Text(seatHint)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(Color.orange)
+                    .transition(.opacity)
             }
         }
-        .fixedSize()
+    }
+
+    private func seatChipHelp(_ provider: String, selected: Bool) -> String {
+        if isRunning { return "本场参与：\(ArenaSeatCatalog.name(provider))" }
+        if selected && selectedProviders.count == 2 {
+            return "至少保留两席；先加入另一席再取消本席"
+        }
+        return selected ? "本场参与：\(ArenaSeatCatalog.name(provider))" : "点击加入本场"
     }
 
     private var roundPicker: some View {
         HStack(spacing: 5) {
-            Text("轮数")
+            Text("互评上限")
                 .font(.system(size: 11.5, weight: .medium))
                 .foregroundStyle(.secondary)
             Picker("", selection: $roundLimit) {
@@ -554,7 +680,7 @@ struct ArenaRootView: View {
             .controlSize(.regular)
             .fixedSize()
             .disabled(model.session != nil)
-            .help("新场次最多讨论轮数（含首轮独立作答、互评、候选与表态，默认 3）")
+            .help("最多讨论轮次（1–5，默认 3）：第 1 轮从独立作答开始；之后每轮针对未解决分歧做互评、修订候选并重新表态")
         }
         .fixedSize()
     }
@@ -639,23 +765,41 @@ struct ArenaRootView: View {
             )
             .disabled(!isRunning)
             .help(isPaused ? "继续派发后续轮次" : "暂停后续派发，保留当前进度")
-            toolButton("结束", icon: "stop.fill", large: true, action: finishDiscussion)
-                .disabled(!isRunning)
-                .help("结束本轮讨论并保留已保存内容")
-            toolButton("新建", icon: "square.and.pencil", large: true, action: newDiscussion)
-                .help("清空当前场次，开始新的问题")
+            toolButton("结束", icon: "stop.fill", large: true) {
+                confirmation = .finish
+            }
+            .disabled(!isRunning)
+            .help("结束整场讨论并生成当前报告（已发送的请求可能仍会生成）")
+            toolButton("新建", icon: "square.and.pencil", large: true) {
+                if model.hasRunningDiscussion {
+                    confirmation = .newDiscussion
+                } else {
+                    performNewDiscussion()
+                }
+            }
+            .help(
+                model.hasRunningDiscussion
+                    ? "停止当前讨论并开始新的问题（会确认，可从历史继续）"
+                    : "清空当前场次，开始新的问题"
+            )
         }
     }
 
     private var stagePill: some View {
         HStack(spacing: 7) {
-            Circle()
-                .fill(isRunning ? Color.green : Color.secondary.opacity(0.55))
-                .frame(width: 8, height: 8)
-                .shadow(color: isRunning ? Color.green.opacity(0.6) : .clear, radius: 3)
+            if isPaused && isRunning {
+                Image(systemName: "pause.circle.fill")
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(Color.orange)
+            } else {
+                Circle()
+                    .fill(isRunning ? Color.green : Color.secondary.opacity(0.55))
+                    .frame(width: 8, height: 8)
+                    .shadow(color: isRunning ? Color.green.opacity(0.6) : .clear, radius: 3)
+            }
             Text(stageText)
                 .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(isPaused && isRunning ? Color.orange : Color.secondary)
                 .lineLimit(1)
         }
         .padding(.horizontal, 10)
@@ -698,12 +842,16 @@ struct ArenaRootView: View {
         GeometryReader { geometry in
             let providers = gridProviders
             if model.isReadOnly, let saved = model.session {
-                if ArenaSessionDigest.report(saved) != nil {
-                    ArenaReportReader(session: saved, ballot: model.reportBallot())
-                        .id(ArenaSessionDigest.id(saved))
-                } else {
-                    Text("该场次尚未生成报告，可在详情中查阅已保存的发言。")
-                        .padding()
+                VStack(spacing: 0) {
+                    readOnlyBanner
+                    if ArenaSessionDigest.report(saved) != nil {
+                        ArenaReportReader(session: saved, ballot: model.reportBallot())
+                            .id(ArenaSessionDigest.id(saved))
+                    } else {
+                        Text("该场次尚未生成报告，可在详情中查阅已保存的发言。")
+                            .padding()
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
                 }
             } else if providers.isEmpty {
                 VStack(spacing: 8) {
@@ -714,46 +862,103 @@ struct ArenaRootView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                let columns = columnCount(for: providers.count, width: geometry.size.width)
-                let rows = rowsOf(providers, columns: columns)
-                VStack(spacing: 8) {
-                    ForEach(rows.indices, id: \.self) { rowIndex in
-                        HStack(spacing: 8) {
-                            ForEach(rows[rowIndex], id: \.self) { provider in
-                                seatCard(provider)
-                                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                            }
-                            ForEach(Array(0..<max(0, columns - rows[rowIndex].count)), id: \.self) { _ in
-                                Color.clear
-                                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                            }
-                        }
-                        .frame(maxHeight: .infinity)
-                    }
-                }
+                seatColumns(providers, size: geometry.size)
             }
         }
         .padding(10)
     }
 
+    /// Three seats always stay full-height columns. At the 860 pt minimum the
+    /// available width is narrower than three usable site columns, so the row
+    /// scrolls horizontally instead of wrapping into a 2+1 grid with half-height
+    /// pages. Two seats still share the width evenly.
+    @ViewBuilder
+    private func seatColumns(_ providers: [String], size: CGSize) -> some View {
+        let gap: CGFloat = 8
+        let minimumColumn: CGFloat = 320
+        if providers.count <= 2 {
+            HStack(spacing: gap) {
+                ForEach(providers, id: \.self) { provider in
+                    seatCard(provider)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+        } else {
+            let available = max(size.width - gap * CGFloat(providers.count - 1), 0)
+            let ideal = available / CGFloat(providers.count)
+            if ideal >= minimumColumn {
+                HStack(spacing: gap) {
+                    ForEach(providers, id: \.self) { provider in
+                        seatCard(provider)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                }
+            } else {
+                ScrollView(.horizontal, showsIndicators: true) {
+                    HStack(spacing: gap) {
+                        ForEach(providers, id: \.self) { provider in
+                            seatCard(provider)
+                                .frame(width: minimumColumn, height: max(size.height, 0))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var readOnlyBanner: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: "book.closed")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("历史回看 · 只读")
+                    .font(.system(size: 12, weight: .semibold))
+                Text("不会打开原页、不会重发")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 8)
+            if let id = model.historyResumeID {
+                Button {
+                    confirmation = .continueHistory(id)
+                } label: {
+                    Label("继续这一场", systemImage: "play.circle.fill")
+                        .font(.system(size: 12.5, weight: .medium))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.regular)
+                .help("恢复上次讨论；已发送的席位只读核对，不会重发")
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(Color.primary.opacity(0.035))
+    }
+
     @ViewBuilder
     private func seatCard(_ provider: String) -> some View {
         if let pane = model.panes[provider] {
-            let badge = seatBadge(provider)
+            let state = seatBadge(provider)
             ArenaSeatCard(
                 pane: pane,
                 provider: provider,
-                statusText: badge.text,
-                statusColor: badge.color,
+                status: state,
                 isParticipant: isParticipant(provider),
                 hasStarted: hasStarted,
-                canOpenHome: canOpenHome(provider),
+                controls: model.controls(for: provider),
                 onPrompt: { presentDetails(provider: provider, tab: .prompts) },
-                onTakeOver: { takeOver(provider) },
-                onResume: { takenOver.remove(provider); model.resumeSeat(provider) },
-                canManage: isRunning && isParticipant(provider),
+                onTakeOver: { model.takeOver(provider) },
+                onResume: { model.resumeSeat(provider) },
                 onBackfill: { presentBackfill(provider) },
-                onSkip: { model.skip(provider) }
+                skipTarget: model.manualTarget(for: provider),
+                onSkip: { target in
+                    guard target == model.manualTarget(for: provider) else {
+                        model.errorMessage = "本席任务已变化，请核对后再跳过"
+                        return
+                    }
+                    model.skip(provider)
+                }
             )
             .id(ObjectIdentifier(pane))
         } else {
@@ -771,76 +976,10 @@ struct ArenaRootView: View {
         }
     }
 
-    // MARK: 补录
+    // MARK: 补录（非模态面板，便于同时核对原页）
 
-    private func backfillSheet(provider: String) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("文本补录 · \(ArenaSeatCatalog.name(provider))")
-                    .font(.system(size: 15, weight: .semibold))
-                Spacer()
-                Button("取消") { backfillRequest = nil }
-                    .keyboardShortcut(.cancelAction)
-            }
-            Text("仅保存本席这一轮的原文；其他席继续运行。")
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-
-            if let target = backfillTarget {
-                Text("已固定为 \(ArenaStageNames.label(target.stage)) · 第 \(target.round) 轮\(target.version.map { " · 候选 v\($0)" } ?? "")。保存时若本轮已变化，草稿会保留并报错。")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-            } else {
-                Text("本席当前没有待处理任务；草稿不会贴入下一轮。请关闭后等本轮出现待答再录入。")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.orange)
-            }
-
-            if let message = backfillError.trimmedNonEmpty {
-                Text(message)
-                    .font(.system(size: 12))
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            TextEditor(text: $backfillText)
-                .font(.system(size: 13))
-                .scrollContentBackground(.hidden)
-                .padding(7)
-                .background(
-                    RoundedRectangle(cornerRadius: 7)
-                        .fill(Color(nsColor: .textBackgroundColor))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 7)
-                        .strokeBorder(Color.primary.opacity(0.12))
-                )
-                .frame(minHeight: 220)
-
-            HStack(spacing: 8) {
-                Text("表态")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                Picker("", selection: $backfillStance) {
-                    Text("未指定").tag("")
-                    Text("同意").tag("agree")
-                    Text("有条件同意").tag("conditional")
-                    Text("反对").tag("oppose")
-                }
-                .labelsHidden()
-                .pickerStyle(.segmented)
-                .frame(maxWidth: 300)
-                Spacer()
-                Button("提交补录") {
-                    submitBackfill(provider)
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .disabled(backfillText.trimmedNonEmpty == nil || backfillTarget == nil)
-            }
-        }
-        .padding(14)
-        .frame(minWidth: 560, minHeight: 380)
+    private func presentBackfill(_ provider: String) {
+        ArenaBackfillWindowController.shared.present(model: model, provider: provider)
     }
 
     // MARK: 动作
@@ -849,12 +988,12 @@ struct ArenaRootView: View {
         guard canStart else { return }
         let providers = ArenaSeatCatalog.ordered.filter { selectedProviders.contains($0) }
         guard providers.count >= 2 else {
-            model.errorMessage = "至少保留两席"
+            showSeatHint("至少保留两席")
             return
         }
-        takenOver = []
-        // 新场次会替换阅读内容；旧详情窗口不再代表当前讨论。
+        // 新场次会替换阅读内容；旧详情与补录面板不再代表当前讨论。
         ArenaDetailsWindowController.shared.close()
+        ArenaBackfillWindowController.shared.close()
         model.start(providers, maxRounds: roundLimit)
     }
 
@@ -862,66 +1001,26 @@ struct ArenaRootView: View {
         model.pauseOrResume()
     }
 
-    private func finishDiscussion() {
-        model.finish()
-    }
-
-    private func newDiscussion() {
-        takenOver = []
+    /// The confirmed path behind 「新建」. Stops the current discussion (which
+    /// is already saved), clears the workbench and focuses the composer.
+    private func performNewDiscussion() {
         selectedProviders = Set(ArenaSeatCatalog.ordered)
         roundLimit = 3
         ArenaDetailsWindowController.shared.close()
-        backfillRequest = nil
-        backfillTarget = nil
-        backfillError = ""
-        backfillText = ""
-        backfillStance = ""
+        ArenaBackfillWindowController.shared.close()
         model.newDiscussion()
         model.prepareHome()
         DispatchQueue.main.async { questionFocused = true }
     }
 
-    private func takeOver(_ provider: String) {
-        model.takeOver(provider)
-        takenOver.insert(provider)
-        presentBackfill(provider)
-    }
-
-    private func presentBackfill(_ provider: String) {
-        backfillText = ArenaSessionDigest.answerText(model.session, provider: provider) ?? ""
-        backfillStance = ""
-        backfillError = ""
-        // Pin the exact round now. A save checks this snapshot again, so the
-        // draft cannot be pasted into whatever task the next round creates.
-        backfillTarget = model.manualTarget(for: provider)
-        backfillRequest = ArenaSeatTarget(id: provider)
-    }
-
-    private func submitBackfill(_ provider: String) {
-        guard let text = backfillText.trimmedNonEmpty else { return }
-        guard let target = backfillTarget, target.provider == provider else {
-            backfillError = "本席当前没有待处理任务；草稿已保留，请关闭后按当前轮重新录入"
-            return
-        }
-        let accepted = model.manualAnswer(
-            provider,
-            text: text,
-            stance: backfillStance.trimmedNonEmpty,
-            expected: target
-        )
-        guard accepted else {
-            // Keep the sheet, the text and the pinned snapshot: the round may
-            // have moved on, and this draft must not land in the next one.
-            backfillError = model.errorMessage.trimmedNonEmpty ?? "回答未采用，草稿已保留"
-            return
-        }
-        backfillRequest = nil
-        backfillText = ""
-        backfillStance = ""
+    private func continueSaved(_ id: String) {
+        ArenaDetailsWindowController.shared.close()
+        ArenaBackfillWindowController.shared.close()
+        guard model.continueSavedDiscussion(id) else { return }
     }
 
     private func openHistory(_ id: String) {
-        takenOver = []
+        ArenaBackfillWindowController.shared.close()
         model.openHistory(id)
         presentDetails(provider: nil, tab: .report)
     }
@@ -937,11 +1036,28 @@ struct ArenaRootView: View {
         if selectedProviders.contains(provider) {
             if selectedProviders.count > 2 {
                 selectedProviders.remove(provider)
+            } else {
+                showSeatHint("至少保留两席；先加入另一席再取消本席")
+                return
             }
         } else {
             selectedProviders.insert(provider)
         }
         model.prepareHome(selectedProviders)
+    }
+
+    private func showSeatHint(_ text: String) {
+        hintTask?.cancel()
+        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.15)) {
+            seatHint = text
+        }
+        hintTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 2_400_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) {
+                seatHint = nil
+            }
+        }
     }
 
     // MARK: 派生状态
@@ -992,51 +1108,19 @@ struct ArenaRootView: View {
         return known + extra
     }
 
-    private func columnCount(for count: Int, width: CGFloat) -> Int {
-        if count <= 2 { return max(count, 1) }
-        return width >= 1040 ? 3 : 2
-    }
-
-    private func rowsOf(_ providers: [String], columns: Int) -> [[String]] {
-        guard columns > 0 else { return [providers] }
-        return stride(from: 0, to: providers.count, by: columns).map {
-            Array(providers[$0..<min($0 + columns, providers.count)])
-        }
-    }
-
     private func isParticipant(_ provider: String) -> Bool {
         guard let providers = model.session?["providers"] as? [String] else { return true }
         return providers.contains(provider)
     }
 
-    private func canOpenHome(_ provider: String) -> Bool {
-        if !hasStarted { return true }
-        if takenOver.contains(provider) { return true }
-        if let raw = model.statuses[provider]?.lowercased(),
-           raw.contains("manual") || raw.contains("takeover") || raw.contains("接管") {
-            return true
+    /// The badge always comes from a structured seat state: the live model
+    /// state when the discussion is running, otherwise a durable outcome read
+    /// from the saved session. Free-text status wording is never parsed.
+    private func seatBadge(_ provider: String) -> ArenaSeatState {
+        if let state = model.seatStates[provider] {
+            return state
         }
-        return false
-    }
-
-    private func seatBadge(_ provider: String) -> (text: String, color: Color) {
-        if let raw = model.statuses[provider]?.trimmedNonEmpty {
-            return ArenaSeatStatus.describe(raw)
-        }
-        guard let session = model.session else { return ("待开始", Color.secondary) }
-        let stage = (session["stage"] as? String) ?? ""
-        let rows = ArenaSessionDigest.rows(session)
-        if let row = rows.last(where: { $0.provider == provider && $0.stage == stage }) {
-            switch row.status.lowercased() {
-            case "answered": return ("已收到", Color.green)
-            case "skipped": return ("已跳过", Color.secondary)
-            default: return ("等待回复", Color.orange)
-            }
-        }
-        if rows.contains(where: { $0.provider == provider && $0.answer?.trimmedNonEmpty != nil }) {
-            return ("已完成", Color.green)
-        }
-        return ("未参与", Color.secondary)
+        return ArenaSeatOutcome.derive(session: model.session, provider: provider)
     }
 }
 
@@ -1048,62 +1132,76 @@ struct ArenaSeatCard: View {
     @ObservedObject var pane: SitePane
 
     let provider: String
-    let statusText: String
-    let statusColor: Color
+    let status: ArenaSeatState
     let isParticipant: Bool
     let hasStarted: Bool
-    let canOpenHome: Bool
+    let controls: ArenaSeatControls
 
     let onPrompt: () -> Void
     let onTakeOver: () -> Void
     let onResume: () -> Void
-    let canManage: Bool
     let onBackfill: () -> Void
-    let onSkip: () -> Void
+    let skipTarget: ArenaManualTarget?
+    let onSkip: (ArenaManualTarget) -> Void
+
+    @State private var confirmingSkip = false
+    @State private var confirmedSkipTarget: ArenaManualTarget?
 
     private var openError: String? {
         pane.lastError ?? pane.lastNavigationError
     }
 
+    private var statusColor: Color { ArenaSeatStatus.color(status.kind) }
+
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(statusColor)
-                    .frame(width: 8, height: 8)
-                    .shadow(color: statusColor.opacity(0.45), radius: 3)
-                Text(ArenaSeatCatalog.name(provider))
-                    .font(.system(size: 13, weight: .semibold))
-                    .lineLimit(1)
-                Text(statusText)
-                    .font(.system(size: 11.5, weight: .medium))
-                    .foregroundStyle(statusColor)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 2)
-                    .background(Capsule().fill(statusColor.opacity(0.12)))
-                    .frame(maxWidth: 190, alignment: .leading)
-                    .help(statusText)
-                if !isParticipant && hasStarted {
-                    Text("未参与")
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(statusColor)
+                        .frame(width: 8, height: 8)
+                        .shadow(color: statusColor.opacity(0.45), radius: 3)
+                    Text(ArenaSeatCatalog.name(provider))
+                        .font(.system(size: 13, weight: .semibold))
+                        .lineLimit(1)
+                    Text(ArenaSeatStatus.label(status.kind))
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(statusColor)
+                        .lineLimit(1)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2)
+                        .background(Capsule().fill(statusColor.opacity(0.12)))
+                        .help(status.detail)
+                    if !isParticipant && hasStarted {
+                        Text("未参与")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 4)
+                    Button(action: onPrompt) {
+                        Image(systemName: "text.bubble")
+                            .font(.system(size: 12.5, weight: .medium))
+                            .frame(width: 28, height: 28)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.borderless)
+                    .help("查看本席当前真正提示")
+                    .accessibilityLabel("查看本席当前提示")
+                    menu
                 }
-                Spacer(minLength: 4)
-                Button(action: onPrompt) {
-                    Image(systemName: "text.bubble")
-                        .font(.system(size: 12.5, weight: .medium))
-                        .frame(width: 28, height: 28)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.borderless)
-                .help("查看本席当前真正提示")
-                .accessibilityLabel("查看本席当前提示")
-                menu
+                Text(status.detail)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(status.detail)
+                    .padding(.leading, 16)
+                    .padding(.trailing, 4)
+                    .accessibilityLabel("\(ArenaSeatCatalog.name(provider)) 状态：\(status.detail)")
             }
             .padding(.horizontal, 9)
-            .frame(height: 36)
+            .padding(.vertical, 3)
+            .frame(height: 50)
             .background(Color.primary.opacity(0.035))
 
             Divider()
@@ -1124,21 +1222,37 @@ struct ArenaSeatCard: View {
         .shadow(color: .black.opacity(0.07), radius: 5, y: 2)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(ArenaSeatCatalog.name(provider)) 席位")
+        .alert("跳过 \(ArenaSeatCatalog.name(provider))？", isPresented: $confirmingSkip) {
+            Button("跳过本席", role: .destructive) {
+                if let target = confirmedSkipTarget { onSkip(target) }
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("跳过本席后，本轮该席计为缺席；晚到的回答也不会进入本轮。")
+        }
     }
 
     private var menu: some View {
         Menu {
             Button("查看当前提示…", action: onPrompt)
             Button("回原站首页") { pane.openHome() }
-                .disabled(!canOpenHome)
+                .disabled(!homeAllowed)
             Divider()
-            Group {
-                Button("恢复本站自动", action: onResume)
-                Button("人工接管", action: onTakeOver)
-                Button("文本补录…", action: onBackfill)
-                Button("跳过本席", action: onSkip)
+            Button("恢复本站自动", action: onResume)
+                .disabled(!controls.canResume)
+                .help(resumeHelp)
+            Button("人工接管", action: onTakeOver)
+                .disabled(!controls.canTakeOver)
+                .help(controls.canTakeOver ? "停止本席自动派发，其他席继续" : "本席已是人工接管或不在本轮")
+            Button("文本补录…", action: onBackfill)
+                .disabled(!controls.canBackfill)
+                .help(controls.canBackfill ? "打开非模态补录面板，可同时核对原页" : "本席当前没有待处理任务")
+            Button("跳过本席…") {
+                confirmedSkipTarget = skipTarget
+                confirmingSkip = skipTarget != nil
             }
-            .disabled(!canManage)
+                .disabled(!controls.canSkip)
+                .help(controls.canSkip ? "本轮该席计为缺席（会确认）" : "本席当前没有待处理任务")
         } label: {
             Image(systemName: "ellipsis.circle")
                 .font(.system(size: 14, weight: .medium))
@@ -1148,8 +1262,19 @@ struct ArenaSeatCard: View {
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .frame(width: 28)
-        .help("本席操作：回首页（未开始或已接管时）、接管、补录、跳过")
+        .help("本席操作：回首页、恢复自动、接管、补录、跳过")
         .accessibilityLabel("本席操作")
+    }
+
+    private var homeAllowed: Bool {
+        !hasStarted || controls.canOpenHome
+    }
+
+    private var resumeHelp: String {
+        if controls.canResume {
+            return "按已保存的发送阶段继续：可能已发送的只读核对，不会重发"
+        }
+        return "仅在本席已接管或需要核对时可用"
     }
 
     private var placeholder: some View {
@@ -1185,46 +1310,37 @@ struct ArenaSeatCard: View {
     }
 }
 
-// MARK: - 席位状态词典
+// MARK: - 席位状态表现
 
+/// Colour and short badge text for one structured seat state. This is the only
+/// place UI wording is chosen; no status sentence is ever inspected.
 enum ArenaSeatStatus {
-    static func describe(_ raw: String) -> (String, Color) {
-        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        let lower = text.lowercased()
-        if text.isEmpty { return ("待开始", Color.secondary) }
-        if lower.contains("skip") || text.contains("跳过") { return ("已跳过", Color.secondary) }
-        if lower.contains("error") || lower.contains("fail") || lower.contains("timeout")
-            || text.contains("失败") || text.contains("需处理") {
-            return ("需处理", Color.red)
+    static func label(_ kind: ArenaSeatStateKind) -> String {
+        switch kind {
+        case .idle: return "待开始"
+        case .sending: return "发送中"
+        case .generating: return "生成中"
+        case .answered: return "已收到"
+        case .needsAction: return "需处理"
+        case .takenOver: return "人工接管"
+        case .skipped: return "已跳过"
+        case .paused: return "已暂停"
+        case .done: return "已结束"
         }
-        if lower.contains("manual") || lower.contains("takeover") || text.contains("接管") {
-            return ("人工接管", Color.orange)
-        }
-        if lower.contains("answer") || lower.contains("done") || lower.contains("complete")
-            || lower.contains("ok") || text.contains("已收到") || text.contains("完成") {
-            return ("已收到", Color.green)
-        }
-        if lower.contains("stream") || lower.contains("generat") || lower.contains("working")
-            || lower.contains("sent") || lower.contains("progress") || lower.contains("wait")
-            || lower.contains("pending") || text.contains("生成") || text.contains("等待") {
-            return ("进行中", Color.blue)
-        }
-        return (text, Color.secondary)
     }
-}
 
-enum ArenaStageNames {
-    static let labels: [String: String] = [
-        "independent": "独立作答",
-        "critique": "质询",
-        "proposal": "候选结论",
-        "vote": "表决",
-        "done": "结束",
-    ]
-
-    static func label(_ stage: String) -> String {
-        if stage.isEmpty { return "未开始" }
-        return labels[stage] ?? stage
+    static func color(_ kind: ArenaSeatStateKind) -> Color {
+        switch kind {
+        case .idle: return Color.secondary
+        case .sending: return Color.blue
+        case .generating: return Color.blue
+        case .answered: return Color.green
+        case .needsAction: return Color.red
+        case .takenOver: return Color.orange
+        case .skipped: return Color.secondary
+        case .paused: return Color.orange
+        case .done: return Color.secondary
+        }
     }
 }
 
@@ -1399,6 +1515,10 @@ enum ArenaInspectorTab: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
+    /// Tabs shown as the primary segmented control. The raw JSON record is
+    /// deliberately kept behind a secondary menu.
+    static var primaryCases: [ArenaInspectorTab] { [.prompts, .answers, .report] }
+
     var label: String {
         switch self {
         case .prompts: return "当前提示"
@@ -1418,8 +1538,22 @@ enum ArenaInspectorTab: String, CaseIterable, Identifiable {
     }
 }
 
-struct ArenaSeatTarget: Identifiable {
-    let id: String
+/// One pending confirmation. Destructive actions and the verified history
+/// continuation all route through a single native alert.
+enum ArenaConfirmation: Identifiable {
+    case newDiscussion
+    case finish
+    case continueHistory(String)
+    case openHistory(String)
+
+    var id: String {
+        switch self {
+        case .newDiscussion: return "new"
+        case .finish: return "finish"
+        case .continueHistory(let id): return "continue-\(id)"
+        case .openHistory(let id): return "history-\(id)"
+        }
+    }
 }
 
 struct ArenaDetailRequest: Identifiable {
@@ -1436,9 +1570,15 @@ struct ArenaDetailRequest: Identifiable {
 final class ArenaDetailsWindowState: ObservableObject {
     @Published var tab: ArenaInspectorTab = .report
     @Published var provider: String = ArenaSeatCatalog.ordered.first ?? "chatgpt"
+    @Published var showsRawRecord = false
 
     func apply(request: ArenaDetailRequest, session: [String: Any]?) {
-        tab = request.tab
+        if request.tab == .json {
+            showsRawRecord = true
+        } else {
+            tab = request.tab
+            showsRawRecord = false
+        }
         let choices = ArenaSessionDigest.providerChoices(session)
         if let requested = request.provider, choices.contains(requested) {
             provider = requested
@@ -1456,7 +1596,7 @@ final class ArenaDetailsWindowState: ObservableObject {
 
 /// 独立的标准 NSWindow：有标题栏、可缩放、可最小化、可关闭，绿色按钮和
 /// ⌃⌘F 使用系统全屏，标题栏双击遵循“系统设置 → 桌面与程序坞”的用户偏好。
-/// 工具栏另给一个明确的最大化/还原按钮。
+/// 不再重复提供「最大化」按钮；系统绿色按钮即缩放入口。
 @MainActor
 final class ArenaDetailsWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate, NSToolbarItemValidation {
 
@@ -1466,14 +1606,11 @@ final class ArenaDetailsWindowController: NSObject, NSWindowDelegate, NSToolbarD
     private var hostingController: NSHostingController<ArenaDetailsWindowView>?
     private var hostedModel: ArenaModel?
     private let state = ArenaDetailsWindowState()
-    private var restoreFrame: NSRect?
     private var copyReportItem: NSToolbarItem?
-    private var zoomItem: NSToolbarItem?
 
     private enum Item {
         static let copyReport = NSToolbarItem.Identifier("arena.details.copy-report")
         static let export = NSToolbarItem.Identifier("arena.details.export")
-        static let zoom = NSToolbarItem.Identifier("arena.details.zoom")
     }
 
     private override init() {
@@ -1567,11 +1704,11 @@ final class ArenaDetailsWindowController: NSObject, NSWindowDelegate, NSToolbarD
     // MARK: 工具栏
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [Item.copyReport, Item.export, .flexibleSpace, Item.zoom]
+        [Item.copyReport, Item.export]
     }
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [Item.copyReport, Item.export, .flexibleSpace, .space, Item.zoom]
+        [Item.copyReport, Item.export]
     }
 
     func toolbar(
@@ -1599,17 +1736,6 @@ final class ArenaDetailsWindowController: NSObject, NSWindowDelegate, NSToolbarD
                 symbol: "square.and.arrow.up",
                 action: #selector(exportMarkdown(_:))
             )
-        case Item.zoom:
-            let item = makeItem(
-                itemIdentifier,
-                label: "最大化",
-                toolTip: "最大化到屏幕可用区域",
-                symbol: "arrow.up.left.and.arrow.down.right",
-                action: #selector(toggleMaximize(_:))
-            )
-            zoomItem = item
-            updateZoomItem()
-            return item
         default:
             return nil
         }
@@ -1646,7 +1772,6 @@ final class ArenaDetailsWindowController: NSObject, NSWindowDelegate, NSToolbarD
 
     private func refreshToolbar() {
         copyReportItem?.isEnabled = ArenaSessionDigest.report(hostedModel?.session) != nil
-        updateZoomItem()
         window?.toolbar?.validateVisibleItems()
     }
 
@@ -1660,58 +1785,8 @@ final class ArenaDetailsWindowController: NSObject, NSWindowDelegate, NSToolbarD
         ArenaExporter.export(model: model)
     }
 
-    // MARK: 最大化 / 还原 / 全屏
-
-    @objc private func toggleMaximize(_ sender: Any?) {
-        guard let window else { return }
-        if window.styleMask.contains(.fullScreen) {
-            window.toggleFullScreen(nil)
-            return
-        }
-        if isMaximized(window), let restoreFrame {
-            window.setFrame(restoreFrame, display: true, animate: true)
-            self.restoreFrame = nil
-        } else if isMaximized(window) {
-            // 用户可能用绿色按钮放大过；交给系统还原到它记住的标准尺寸。
-            window.zoom(nil)
-        } else if let screen = window.screen ?? NSScreen.main {
-            restoreFrame = window.frame
-            window.setFrame(screen.visibleFrame, display: true, animate: true)
-        }
-        updateZoomItem()
-    }
-
-    private func isMaximized(_ window: NSWindow) -> Bool {
-        if window.styleMask.contains(.fullScreen) { return true }
-        guard let screen = window.screen ?? NSScreen.main else { return false }
-        let target = screen.visibleFrame
-        return abs(window.frame.minX - target.minX) <= 1
-            && abs(window.frame.minY - target.minY) <= 1
-            && abs(window.frame.width - target.width) <= 1
-            && abs(window.frame.height - target.height) <= 1
-    }
-
-    private func updateZoomItem() {
-        guard let item = zoomItem, let window else { return }
-        let fullScreen = window.styleMask.contains(.fullScreen)
-        let maximized = isMaximized(window)
-        let symbol: String
-        let label: String
-        let toolTip: String
-        if maximized {
-            symbol = "arrow.down.right.and.arrow.up.left"
-            label = fullScreen ? "退出全屏" : "还原"
-            toolTip = fullScreen ? "退出全屏" : "还原窗口大小"
-        } else {
-            symbol = "arrow.up.left.and.arrow.down.right"
-            label = "最大化"
-            toolTip = "最大化到屏幕可用区域（⌃⌘F 进入全屏）"
-        }
-        item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)
-        item.label = label
-        item.paletteLabel = label
-        item.toolTip = toolTip
-    }
+    // The system green button, ⌃⌘F and the title-bar double-click own zoom and
+    // full screen. The window deliberately adds no duplicate 「最大化」 item.
 
     // MARK: NSWindowDelegate
 
@@ -1719,23 +1794,16 @@ final class ArenaDetailsWindowController: NSObject, NSWindowDelegate, NSToolbarD
         refreshToolbar()
     }
 
-    func windowDidResize(_ notification: Notification) {
-        updateZoomItem()
-    }
-
     func windowDidEnterFullScreen(_ notification: Notification) {
-        updateZoomItem()
         refreshToolbar()
     }
 
     func windowDidExitFullScreen(_ notification: Notification) {
-        updateZoomItem()
         refreshToolbar()
     }
 
     func windowWillClose(_ notification: Notification) {
         guard (notification.object as? NSWindow) === window else { return }
-        restoreFrame = nil
     }
 }
 
@@ -1777,64 +1845,66 @@ struct ArenaDetailsWindowView: View {
     // MARK: 顶部
 
     private var header: some View {
-        tabBar
-            .frame(maxWidth: 640)
-            .frame(maxWidth: .infinity, alignment: .center)
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-            .background(ArenaGlassSurface(material: .headerView, cornerRadius: 0))
+        HStack(spacing: 10) {
+            Picker("", selection: tabSelection) {
+                ForEach(ArenaInspectorTab.primaryCases) { item in
+                    Label(item.label, systemImage: item.symbol)
+                        .tag(item)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .controlSize(.large)
+            .frame(maxWidth: 560)
+
+            Menu {
+                Button("原始记录（JSON）") { state.showsRawRecord = true }
+                Button("复制 JSON") {
+                    arenaCopyToPasteboard(ArenaJSON.string(session))
+                }
+                .disabled(session == nil)
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .font(.system(size: 13, weight: .medium))
+                    .frame(width: 30, height: 26)
+                    .contentShape(Rectangle())
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("更多：原始记录")
+            .accessibilityLabel("更多")
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(ArenaGlassSurface(material: .headerView, cornerRadius: 0))
     }
 
-    private var tabBar: some View {
-        HStack(spacing: 6) {
-            ForEach(ArenaInspectorTab.allCases) { item in
-                let selected = state.tab == item
-                Button {
-                    state.tab = item
-                } label: {
-                    HStack(spacing: 7) {
-                        Image(systemName: item.symbol)
-                            .font(.system(size: 13, weight: .semibold))
-                        Text(item.label)
-                            .font(.system(size: 13.5, weight: .medium))
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.8)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .frame(minHeight: 38)
-                    .padding(.horizontal, 8)
-                    .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    .background(
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .fill(selected
-                                  ? Color.accentColor.opacity(0.18)
-                                  : Color.primary.opacity(0.05))
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .strokeBorder(
-                                selected
-                                    ? Color.accentColor.opacity(0.30)
-                                    : Color.primary.opacity(0.08)
-                            )
-                    )
-                    .foregroundStyle(selected ? Color.accentColor : Color.primary)
-                }
-                .buttonStyle(.plain)
-                .accessibilityAddTraits(selected ? .isSelected : [])
+    private var tabSelection: Binding<ArenaInspectorTab> {
+        Binding(
+            get: { state.tab },
+            set: { value in
+                state.tab = value
+                state.showsRawRecord = false
             }
-        }
+        )
     }
 
     // MARK: 内容
 
     @ViewBuilder
     private var content: some View {
-        switch state.tab {
-        case .prompts: promptsView
-        case .answers: answersView
-        case .report: reportView
-        case .json: jsonView
+        if state.showsRawRecord {
+            jsonView
+        } else {
+            switch state.tab {
+            case .prompts: promptsView
+            case .answers: answersView
+            case .report: reportView
+            case .json: jsonView
+            }
         }
     }
 
@@ -2118,7 +2188,223 @@ struct ArenaAnswerDisclosure: View {
     }
 }
 
+// MARK: - 非模态文本补录面板
+
+/// Draft state for one backfill panel. The pinned target is captured when the
+/// panel opens; a later round change makes the save fail without clearing the
+/// text, so a draft can never land in the next round.
+@MainActor
+final class ArenaBackfillDraft: ObservableObject {
+    @Published var provider = ""
+    @Published var text = ""
+    @Published var stance = ""
+    @Published var error = ""
+    @Published var note: String?
+    @Published var noteIsWarning = false
+
+    private(set) var target: ArenaManualTarget?
+
+    func configure(model: ArenaModel, provider: String) {
+        self.provider = provider
+        let prefill = model.backfillPrefill(for: provider)
+        text = prefill.text
+        stance = ""
+        error = ""
+        target = model.manualTarget(for: provider)
+        if prefill.isPartial {
+            note = "以下为流式预览片段，尚未确认完成；请先核对原页，再修改后提交。"
+            noteIsWarning = true
+        } else if prefill.isComplete {
+            note = "以下为本席已收到但未被采用的完整回答；请核对立场与正文后提交。"
+            noteIsWarning = true
+        } else if !prefill.text.isEmpty {
+            note = "已填入本席当前轮已保存的原文；如与原页不符请直接修改。"
+            noteIsWarning = false
+        } else {
+            note = nil
+            noteIsWarning = false
+        }
+    }
+}
+
+struct ArenaBackfillView: View {
+    @ObservedObject var model: ArenaModel
+    @ObservedObject var draft: ArenaBackfillDraft
+    let onClose: () -> Void
+
+    private var providerName: String {
+        ArenaSeatCatalog.name(draft.provider)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("文本补录 · \(providerName)")
+                    .font(.system(size: 15, weight: .semibold))
+                Spacer()
+                Button("关闭", action: onClose)
+                    .keyboardShortcut(.cancelAction)
+            }
+
+            Text("面板不遮挡原页，便于同时核对。只保存本席这一轮的原文；其他席继续运行。")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let target = draft.target {
+                Text("已固定为 \(ArenaStageNames.label(target.stage)) · 第 \(target.round) 轮\(target.version.map { " · 候选 v\($0)" } ?? "")。保存时若本轮已变化，草稿会保留并报错。")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("本席当前没有待处理任务；草稿不会贴入下一轮。请关闭后等本轮出现待答再录入。")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Color.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let note = draft.note {
+                Text(note)
+                    .font(.system(size: 12))
+                    .foregroundStyle(draft.noteIsWarning ? Color.orange : Color.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if !draft.error.isEmpty {
+                Text(draft.error)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            TextEditor(text: $draft.text)
+                .font(.system(size: 13))
+                .scrollContentBackground(.hidden)
+                .padding(7)
+                .background(
+                    RoundedRectangle(cornerRadius: 7)
+                        .fill(Color(nsColor: .textBackgroundColor))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 7)
+                        .strokeBorder(Color.primary.opacity(0.12))
+                )
+                .frame(minHeight: 190)
+
+            HStack(spacing: 8) {
+                Text("表态")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                Picker("", selection: $draft.stance) {
+                    Text("未指定").tag("")
+                    Text("同意").tag("agree")
+                    Text("有条件同意").tag("conditional")
+                    Text("反对").tag("oppose")
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 300)
+                Spacer()
+                Button("提交补录") { submit() }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .disabled(draft.text.trimmedNonEmpty == nil || draft.target == nil)
+            }
+        }
+        .padding(14)
+        .frame(minWidth: 520, minHeight: 360)
+    }
+
+    private func submit() {
+        guard let target = draft.target else {
+            draft.error = "本席当前没有待处理任务；草稿已保留，请按当前轮重新打开补录"
+            return
+        }
+        guard let text = draft.text.trimmedNonEmpty else { return }
+        let accepted = model.manualAnswer(
+            draft.provider,
+            text: text,
+            stance: draft.stance.trimmedNonEmpty,
+            expected: target
+        )
+        guard accepted else {
+            draft.error = model.errorMessage.trimmedNonEmpty ?? "回答未采用，草稿已保留"
+            return
+        }
+        onClose()
+    }
+}
+
+@MainActor
+final class ArenaBackfillWindowController: NSObject, NSWindowDelegate {
+    static let shared = ArenaBackfillWindowController()
+
+    private var panel: NSPanel?
+    private weak var model: ArenaModel?
+    private var provider: String?
+
+    private override init() {
+        super.init()
+    }
+
+    /// Open (or reuse) the panel for one seat. Re-opening the same seat keeps
+    /// the current draft; switching seats pins the new round afresh.
+    func present(model: ArenaModel, provider: String) {
+        if let panel, panel.isVisible, self.model === model, self.provider == provider {
+            panel.makeKeyAndOrderFront(nil)
+            return
+        }
+        let draft = ArenaBackfillDraft()
+        draft.configure(model: model, provider: provider)
+        let root = ArenaBackfillView(model: model, draft: draft, onClose: { [weak self] in
+            self?.panel?.close()
+        })
+        let hosting = NSHostingController(rootView: root)
+
+        let panel: NSPanel
+        if let existing = self.panel {
+            panel = existing
+            panel.contentViewController = hosting
+        } else {
+            let rect = NSRect(x: 0, y: 0, width: 580, height: 460)
+            hosting.view.frame = rect
+            panel = NSPanel(
+                contentRect: rect,
+                styleMask: [.titled, .closable, .resizable, .utilityWindow],
+                backing: .buffered,
+                defer: false
+            )
+            panel.contentViewController = hosting
+            panel.isFloatingPanel = true
+            panel.becomesKeyOnlyIfNeeded = false
+            panel.hidesOnDeactivate = false
+            panel.isReleasedWhenClosed = false
+            panel.minSize = NSSize(width: 480, height: 320)
+            panel.tabbingMode = .disallowed
+            panel.collectionBehavior = [.fullScreenAuxiliary, .managed]
+            panel.animationBehavior = .utilityWindow
+            panel.delegate = self
+            panel.center()
+        }
+        panel.title = "文本补录 · \(ArenaSeatCatalog.name(provider))"
+        self.panel = panel
+        self.model = model
+        self.provider = provider
+        panel.makeKeyAndOrderFront(nil)
+    }
+
+    func close() {
+        panel?.close()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard (notification.object as? NSPanel) === panel else { return }
+        provider = nil
+    }
+}
+
 // MARK: - Markdown 导出
+
 
 enum ArenaExporter {
 
@@ -2160,16 +2446,13 @@ enum ArenaExporter {
         lines.append("# AI Arena 讨论记录")
         lines.append("")
         lines.append("- 场次：\(ArenaSessionDigest.id(session) ?? "（未编号）")")
-        lines.append("- 导出时间：\(ISO8601DateFormatter().string(from: Date()))")
+        lines.append("- 导出时间：\(localTimestamp())（本地时间）")
         lines.append("- 阶段：\(ArenaStageNames.label((session?["stage"] as? String) ?? ""))")
         if let round = ArenaValue.int(session?["round"]) {
             lines.append("- 轮次：第 \(round) 轮")
         }
         if let paused = session?["paused"] as? Bool, paused {
             lines.append("- 暂停：是")
-        }
-        if let id = ArenaSessionDigest.id(session), !id.isEmpty {
-            lines.append("- 记录编号：\(id)")
         }
         lines.append("")
         lines.append("## 题面")
@@ -2180,9 +2463,13 @@ enum ArenaExporter {
         lines.append("")
         lines.append("| 席位 | 站点 | 状态 |")
         lines.append("| --- | --- | --- |")
+        let ballot = model.reportBallot()
         for provider in providers {
-            let status = model.statuses[provider]?.trimmedNonEmpty ?? "—"
-            lines.append("| `\(provider)` | \(ArenaSeatCatalog.name(provider)) | \(status) |")
+            // Durable, session-derived status: the final same-version stance,
+            // a skip, a pending seat or "not in this stage". Never the transient
+            // UI badge (which would say e.g. 「只读回看」 in history).
+            let state = ArenaSeatOutcome.derive(session: session, provider: provider, ballot: ballot)
+            lines.append("| `\(provider)` | \(ArenaSeatCatalog.name(provider)) | \(state.detail) |")
         }
         lines.append("")
 
@@ -2250,6 +2537,14 @@ enum ArenaExporter {
     private static func fenced(_ text: String, language: String = "text") -> String {
         // 用四个反引号，正文里出现三反引号时也不会截断。
         return "````\(language)\n\(text)\n````"
+    }
+
+    /// ISO 8601 in the machine's local time zone, including its offset.
+    private static func localTimestamp(_ date: Date = Date()) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.timeZone = .current
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.string(from: date)
     }
 
     private static func defaultFilename(session: [String: Any]?) -> String {
@@ -2379,6 +2674,15 @@ final class SmokeRunner {
         }
 
         if CommandLine.arguments.contains("--smoke-check-restart") {
+            if CommandLine.arguments.contains("--smoke-check-history") {
+                guard let id = model.session?.arenaString("id") else { exit(10) }
+                model.openHistory(id)
+                guard model.isReadOnly, model.historyResumeID == id,
+                      model.continueSavedDiscussion(id), !model.isReadOnly else {
+                    Self.writeStderr("[smoke] could not continue the unfinished history session")
+                    exit(10)
+                }
+            }
             // Prove the ordinary relaunch path stays conservative: wait long
             // enough for a stray dispatch to show, then report without sending.
             try? await Task.sleep(nanoseconds: 3_000_000_000)
@@ -2387,6 +2691,7 @@ final class SmokeRunner {
                 "reason": "restart-conservative",
                 "didContinue": model.didContinueSavedDiscussion,
                 "statuses": model.statuses,
+                "seatStates": SmokeRunner.seatStatePayload(model),
                 "stage": model.session?.arenaString("stage") ?? "",
                 "session": model.session ?? [:],
             ]
@@ -2491,6 +2796,7 @@ final class SmokeRunner {
                         "sessionID": model.session?.arenaString("id") ?? "",
                         "stage": model.session?.arenaString("stage") ?? "",
                         "statuses": model.statuses,
+                        "seatStates": SmokeRunner.seatStatePayload(model),
                         "pendingProvider": provider,
                         "pendingPhase": "prepared",
                         "session": model.session ?? [:],
@@ -2556,6 +2862,7 @@ final class SmokeRunner {
                     "reason": "recovered",
                     "sessionID": sessionID,
                     "statuses": model.statuses,
+                    "seatStates": SmokeRunner.seatStatePayload(model),
                     "session": model.session ?? [:],
                 ]
                 Self.write(payload, to: resultPath)
@@ -2577,6 +2884,12 @@ final class SmokeRunner {
 
     // MARK: 写出
 
+    /// A JSON-safe, explicit `{kind, detail}` map for the smoke diagnostics.
+    @MainActor
+    static func seatStatePayload(_ model: ArenaModel) -> [String: [String: String]] {
+        model.seatStates.mapValues { $0.jsonObject }
+    }
+
     @MainActor
     private func writeDiagnostics(
         path: String,
@@ -2591,6 +2904,7 @@ final class SmokeRunner {
             "detail": detail,
             "timestamp": ISO8601DateFormatter().string(from: Date()),
             "statuses": model.statuses,
+            "seatStates": Self.seatStatePayload(model),
             "errorMessage": model.errorMessage,
             "question": model.question,
         ]

@@ -163,7 +163,7 @@ def check_vote_round(page, ui: WorkspaceUI, runtime: Runtime, out_dir: Path, che
     checks.check("Markdown preserves both vote versions and cites the final disagreement separately", (
         "未解决分歧：当前版本仍有明确反对，未形成共识。" in exported
         and f"明确反对：`deepseek` — {FINAL_OBJECTION} [{final_source}]" in exported
-        and "往轮表决（不计入当前版本）" in exported
+        and "往轮表态（不计入当前版本）" in exported
         and f"v1 · `deepseek`：反对 — {FIRST_OBJECTION} [{first_source}]" in exported
         and first_candidate in exported and second_candidate in exported and response["answer"] in exported
         and STALE_VOTE not in exported

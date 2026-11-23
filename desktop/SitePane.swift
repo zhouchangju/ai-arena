@@ -12,7 +12,11 @@
 //      WKContentWorld，绝不改写站点脚本、UA、Cookie 或安全策略；
 //    - 命令通过 callAsyncJavaScript 的参数通道传递，绝不把提示拼进 JS 源码；
 //    - 主 frame、当前 URL、document 与任务形状都在执行前核对；
-//    - 每次失败、恢复与最近命令结果都可在 inspectState() 中查看。
+//    - 每次失败、恢复与最近命令结果都可在 inspectState() 中查看；
+//    - 网页的 alert/confirm/prompt 以所属窗口的 sheet 呈现并串行排队，任一
+//      窗口不可用/正在关闭时立即按“取消”语义回调，不阻塞其它席位；
+//    - 登录/OAuth 弹窗返回真实的子 WKWebView（小型原生窗口），保留
+//      window.opener / postMessage 回调；同站普通弹窗仍留在本席位。
 //
 //  端到端测试入口（仅显式测试模式）：
 //    let pane = SitePane(
@@ -218,6 +222,10 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
     private var cachedDriverSource: String?
     private var didInstallDriverUserScript = false
     private var keyValueObservations: [NSKeyValueObservation] = []
+
+    /// 本席当前打开的登录/OAuth 子窗口。窗口自己关闭时从这里移除；
+    /// 同站普通弹窗不会进入这个列表（它们仍在当前 WKWebView 内打开）。
+    private var popupWindows: [SitePanePopupWindow] = []
 
     // MARK: Initialisers
 
@@ -1258,60 +1266,43 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
                  for navigationAction: WKNavigationAction,
                  windowFeatures: WKWindowFeatures) -> WKWebView? {
         guard let url = navigationAction.request.url else { return nil }
-        let scheme = url.scheme?.lowercased() ?? ""
 
-        guard scheme == "http" || scheme == "https" else {
-            if navigationAction.navigationType == .linkActivated {
-                openExternally(url)
-            } else {
-                record(.navigationBlocked("非用户点击的外部协议：\(scheme)"))
-            }
-            return nil
-        }
-
-        if let site {
-            let sameSite = Self.originString(url) == site.origin
-            let loginPopup = !site.isTest && Self.isAuthenticationURL(url)
-            guard sameSite || loginPopup else {
-                if site.isTest || navigationAction.navigationType != .linkActivated {
-                    record(.navigationBlocked(url.absoluteString))
-                } else {
-                    openExternally(url)
-                }
-                return nil
-            }
-            // 同站弹窗和登录弹窗（很多登录/附件流程使用 target=_blank）
-            // 留在这个席位里，保持用户当前登录态和同窗导航。
+        switch popupDestination(for: url, navigationType: navigationAction.navigationType) {
+        case .currentPage:
+            // 同站普通弹窗（附件、预览、帮助等）仍留在本席位，沿用当前
+            // 登录态和同窗导航，和本轮改动之前完全一致。
             webView.load(URLRequest(url: url))
             return nil
+        case .authenticationWindow:
+            // 登录 / OAuth 弹窗必须是真的子窗口：提供方回跳依赖
+            // window.opener 与 postMessage，塞回本窗口会让回调失去来源。
+            return openAuthenticationPopup(
+                configuration: configuration,
+                url: url,
+                opener: webView,
+                windowFeatures: windowFeatures
+            )
+        case .external:
+            openExternally(url)
+            return nil
+        case .blocked(let reason):
+            record(.navigationBlocked(reason))
+            return nil
         }
-
-        openExternally(url)
-        return nil
     }
 
     func webView(_ webView: WKWebView,
                  runJavaScriptAlertPanelWithMessage message: String,
                  initiatedByFrame frame: WKFrameInfo,
                  completionHandler: @escaping () -> Void) {
-        let alert = NSAlert()
-        alert.messageText = pageTitle ?? label
-        alert.informativeText = message
-        alert.addButton(withTitle: "好")
-        alert.runModal()
-        completionHandler()
+        presentScriptAlert(from: webView, message: message, completion: completionHandler)
     }
 
     func webView(_ webView: WKWebView,
                  runJavaScriptConfirmPanelWithMessage message: String,
                  initiatedByFrame frame: WKFrameInfo,
                  completionHandler: @escaping (Bool) -> Void) {
-        let alert = NSAlert()
-        alert.messageText = pageTitle ?? label
-        alert.informativeText = message
-        alert.addButton(withTitle: "确定")
-        alert.addButton(withTitle: "取消")
-        completionHandler(alert.runModal() == .alertFirstButtonReturn)
+        presentScriptConfirm(from: webView, message: message, completion: completionHandler)
     }
 
     func webView(_ webView: WKWebView,
@@ -1319,18 +1310,180 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
                  defaultText: String?,
                  initiatedByFrame frame: WKFrameInfo,
                  completionHandler: @escaping (String?) -> Void) {
-        let alert = NSAlert()
-        alert.messageText = pageTitle ?? label
-        alert.informativeText = prompt
-        alert.addButton(withTitle: "确定")
-        alert.addButton(withTitle: "取消")
+        presentScriptPrompt(
+            from: webView,
+            prompt: prompt,
+            defaultText: defaultText,
+            completion: completionHandler
+        )
+    }
 
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
-        field.stringValue = defaultText ?? ""
-        alert.accessoryView = field
+    // MARK: Popup classification
 
-        let response = alert.runModal()
-        completionHandler(response == .alertFirstButtonReturn ? field.stringValue : nil)
+    /// 一个 target=_blank / window.open 请求应落到哪里。
+    enum PopupDestination {
+        /// 同站非登录弹窗：沿用旧行为，在当前 WKWebView 里加载。
+        case currentPage
+        /// 已知登录/OAuth 来源：开真实子 WKWebView 与独立窗口。
+        case authenticationWindow
+        /// 用户点击的站外常规链接：交给系统浏览器。
+        case external
+        /// 不满足白名单要求：不导航，只记录原因。
+        case blocked(String)
+    }
+
+    /// 子窗口内部导航的处置。登录窗口需要放行跨站授权跳转，但用户点击的
+    /// 站外普通链接仍交给系统，避免把授权窗口变成通用浏览器。
+    enum PopupNavigationDisposition {
+        case allow
+        case external
+        case block(String)
+    }
+
+    /// 登录窗口只关心 WebKit 给出的建议尺寸；裁剪与默认值在窗口层统一处理。
+    @MainActor
+    struct PopupWindowMetrics {
+        var width: CGFloat?
+        var height: CGFloat?
+
+        init(width: CGFloat? = nil, height: CGFloat? = nil) {
+            self.width = width
+            self.height = height
+        }
+
+        init(windowFeatures: WKWindowFeatures) {
+            width = windowFeatures.width.map { CGFloat(truncating: $0) }
+            height = windowFeatures.height.map { CGFloat(truncating: $0) }
+        }
+    }
+
+    /// 与原先 createWebViewWith 的白名单一致，只把登录弹窗从“本窗加载”
+    /// 改成“真实子窗口”。
+    func popupDestination(for url: URL, navigationType: WKNavigationType) -> PopupDestination {
+        let scheme = url.scheme?.lowercased() ?? ""
+        guard scheme == "http" || scheme == "https" else {
+            if navigationType == .linkActivated {
+                return .external
+            }
+            return .blocked("非用户点击的外部协议：\(scheme)")
+        }
+
+        guard let site else { return .external }
+
+        if site.isTest {
+            return Self.originString(url) == site.origin ? .currentPage : .blocked(url.absoluteString)
+        }
+        if Self.originString(url) == site.origin { return .currentPage }
+        if Self.isAuthenticationURL(url) { return .authenticationWindow }
+        return navigationType == .linkActivated ? .external : .blocked(url.absoluteString)
+    }
+
+    func navigationDisposition(for url: URL, navigationType: WKNavigationType) -> PopupNavigationDisposition {
+        let scheme = url.scheme?.lowercased() ?? ""
+        if scheme == "about" { return .allow }
+        guard scheme == "http" || scheme == "https" else {
+            if navigationType == .linkActivated { return .external }
+            return .block("不支持的链接协议：\(scheme)")
+        }
+
+        if let site, site.isTest {
+            return Self.originString(url) == site.origin ? .allow : .block(url.absoluteString)
+        }
+
+        if navigationType == .linkActivated,
+           let site,
+           Self.originString(url) != site.origin,
+           !Self.isAuthenticationURL(url) {
+            return .external
+        }
+        return .allow
+    }
+
+    // MARK: JavaScript dialog presentation
+
+    /// 网页脚本对话框走“所属窗口的 sheet + 全局串行队列”，不再 app-modal。
+    /// 窗口不可用（例如正在关闭、面板未挂载）时立即按取消语义回调，
+    /// WebKit 的 completionHandler 不会悬空，另外两席也不会被卡住。
+    func presentScriptAlert(from webView: WKWebView,
+                            message: String,
+                            completion: @escaping () -> Void) {
+        presentScriptDialog(kind: .alert, from: webView, message: message, defaultText: nil) { _, _ in
+            completion()
+        }
+    }
+
+    func presentScriptConfirm(from webView: WKWebView,
+                              message: String,
+                              completion: @escaping (Bool) -> Void) {
+        presentScriptDialog(kind: .confirm, from: webView, message: message, defaultText: nil) { response, _ in
+            completion(response == .alertFirstButtonReturn)
+        }
+    }
+
+    func presentScriptPrompt(from webView: WKWebView,
+                             prompt: String,
+                             defaultText: String?,
+                             completion: @escaping (String?) -> Void) {
+        presentScriptDialog(kind: .prompt, from: webView, message: prompt, defaultText: defaultText) { response, text in
+            completion(response == .alertFirstButtonReturn ? text : nil)
+        }
+    }
+
+    private func presentScriptDialog(kind: SitePaneScriptDialogKind,
+                                     from webView: WKWebView,
+                                     message: String,
+                                     defaultText: String?,
+                                     completion: @escaping (NSApplication.ModalResponse, String?) -> Void) {
+        guard let window = webView.window, window.isVisible, NSApp.isRunning else {
+            completion(.alertSecondButtonReturn, nil)
+            return
+        }
+        let host = webView.url?.host ?? websiteHostFallback
+        let title = host.isEmpty ? label : "\(label) · \(host)"
+        SitePaneScriptDialogCenter.shared.enqueue(
+            SitePaneScriptDialogRequest(
+                window: window,
+                title: title,
+                message: message,
+                kind: kind,
+                defaultText: defaultText
+            ),
+            completion: completion
+        )
+    }
+
+    private var websiteHostFallback: String {
+        site?.homeURL.host ?? provider
+    }
+
+    // MARK: Authentication popup windows
+
+    /// 用 WebKit 传入的 configuration 创建真实子 WKWebView：opener 关系、
+    /// postMessage 与授权回跳都由 WebKit 维持。弹窗不注入自动命令。
+    private func openAuthenticationPopup(configuration: WKWebViewConfiguration,
+                                         url: URL,
+                                         opener: WKWebView,
+                                         windowFeatures: WKWindowFeatures) -> WKWebView {
+        let popup = SitePanePopupWindow(
+            configuration: configuration,
+            url: url,
+            label: label,
+            pane: self,
+            owner: nil,
+            opener: opener,
+            metrics: PopupWindowMetrics(windowFeatures: windowFeatures)
+        )
+        popupWindows.append(popup)
+        popup.show()
+        return popup.webView
+    }
+
+    func popupWindowDidClose(_ popup: SitePanePopupWindow) {
+        popupWindows.removeAll { $0 === popup }
+    }
+
+    func recordPopupBlocked(_ reason: String) {
+        record(.navigationBlocked(reason))
     }
 
     // MARK: Helpers
@@ -1354,7 +1507,7 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
         lastError = nsError.localizedDescription
     }
 
-    private func openExternally(_ url: URL) {
+    func openExternally(_ url: URL) {
         guard let scheme = url.scheme?.lowercased() else { return }
         // 只把用户明确点击的常规链接和系统通信链接交给系统；不打开 file:、
         // javascript: 或未知自定义协议。
@@ -1759,6 +1912,461 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
         bundledAdapters[provider]?["options"] as? [String: Any]
     }
 
+}
+
+// MARK: - JavaScript dialog coordination
+
+/// alert / confirm / prompt 共用同一套 sheet 语义。一个席位弹出的网页
+/// 对话框会阻塞该文档的脚本，所以这里一次只挂一个 sheet，其余按到达
+/// 顺序排队；窗口关闭或不可用时立即回调取消，绝不使用 app-modal。
+private enum SitePaneScriptDialogKind: Equatable {
+    case alert
+    case confirm
+    case prompt
+
+    var buttonTitles: [String] {
+        switch self {
+        case .alert: return ["好"]
+        case .confirm, .prompt: return ["确定", "取消"]
+        }
+    }
+}
+
+private struct SitePaneScriptDialogRequest {
+    let window: NSWindow
+    let title: String
+    let message: String
+    let kind: SitePaneScriptDialogKind
+    let defaultText: String?
+}
+
+@MainActor
+private final class SitePaneScriptDialogCenter {
+    static let shared = SitePaneScriptDialogCenter()
+
+    private var active: SitePaneScriptDialogPresenter?
+    private var pending: [(request: SitePaneScriptDialogRequest,
+                           completion: (NSApplication.ModalResponse, String?) -> Void)] = []
+
+    func enqueue(_ request: SitePaneScriptDialogRequest,
+                 completion: @escaping (NSApplication.ModalResponse, String?) -> Void) {
+        pending.append((request, completion))
+        pump()
+    }
+
+    fileprivate func presenterDidFinish() {
+        active = nil
+        pump()
+    }
+
+    private func pump() {
+        guard active == nil, !pending.isEmpty else { return }
+        let next = pending.removeFirst()
+        let presenter = SitePaneScriptDialogPresenter(
+            request: next.request,
+            center: self,
+            completion: next.completion
+        )
+        active = presenter
+        presenter.start()
+    }
+}
+
+/// 单个 sheet 的生命周期。完成回调保证只调用一次：正常按钮、父窗口关闭、
+/// 应用退出和窗口不可用都走同一个 finish 路径。
+@MainActor
+private final class SitePaneScriptDialogPresenter {
+    private let request: SitePaneScriptDialogRequest
+    private weak var center: SitePaneScriptDialogCenter?
+    private let completion: (NSApplication.ModalResponse, String?) -> Void
+
+    private var alert: NSAlert?
+    private var textField: NSTextField?
+    private var endSheetObserver: NSObjectProtocol?
+    private var closeObserver: NSObjectProtocol?
+    private var didFinish = false
+
+    init(request: SitePaneScriptDialogRequest,
+         center: SitePaneScriptDialogCenter,
+         completion: @escaping (NSApplication.ModalResponse, String?) -> Void) {
+        self.request = request
+        self.center = center
+        self.completion = completion
+    }
+
+    func start() {
+        guard !didFinish else { return }
+        let window = request.window
+        guard window.isVisible, NSApp.isRunning else {
+            finish(.alertSecondButtonReturn)
+            return
+        }
+
+        closeObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification,
+            object: window,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.finish(.alertSecondButtonReturn)
+            }
+        }
+
+        if window.attachedSheet == nil {
+            present(on: window)
+        } else {
+            // 已有其它 sheet（例如补录面板）时不叠加：等它结束再显示。
+            endSheetObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didEndSheetNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self, weak window] _ in
+                Task { @MainActor [weak self, weak window] in
+                    guard let self, let window,
+                          !self.didFinish,
+                          window.attachedSheet == nil else { return }
+                    self.removeEndSheetObserver()
+                    self.present(on: window)
+                }
+            }
+        }
+    }
+
+    private func present(on window: NSWindow) {
+        guard !didFinish else { return }
+        guard window.isVisible, !window.isSheet, window.attachedSheet == nil else {
+            finish(.alertSecondButtonReturn)
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = request.title
+        alert.informativeText = request.message
+        alert.alertStyle = .informational
+        for title in request.kind.buttonTitles {
+            alert.addButton(withTitle: title)
+        }
+        if request.kind == .prompt {
+            let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
+            field.stringValue = request.defaultText ?? ""
+            alert.accessoryView = field
+            alert.window.initialFirstResponder = field
+            textField = field
+        }
+        self.alert = alert
+
+        alert.beginSheetModal(for: window) { [weak self] response in
+            Task { @MainActor [weak self] in
+                self?.finish(response)
+            }
+        }
+    }
+
+    private func finish(_ response: NSApplication.ModalResponse) {
+        guard !didFinish else { return }
+        didFinish = true
+        removeObservers()
+        let text = textField?.stringValue
+        alert = nil
+        textField = nil
+        completion(response, text)
+        center?.presenterDidFinish()
+    }
+
+    private func removeObservers() {
+        if let closeObserver {
+            NotificationCenter.default.removeObserver(closeObserver)
+            self.closeObserver = nil
+        }
+        removeEndSheetObserver()
+    }
+
+    private func removeEndSheetObserver() {
+        if let endSheetObserver {
+            NotificationCenter.default.removeObserver(endSheetObserver)
+            self.endSheetObserver = nil
+        }
+    }
+}
+
+// MARK: - Authentication popup window
+
+/// 真实子 WKWebView + 小型原生窗口。WebKit 传入的 configuration 已带有
+/// opener 关系，因此 window.opener、postMessage 和授权回跳保持网页原样。
+/// 子窗口自身再弹登录窗口时按同一规则嵌套，并由各自的 webViewDidClose
+/// 关闭正确的窗口。
+@MainActor
+final class SitePanePopupWindow: NSObject, WKUIDelegate, WKNavigationDelegate, NSWindowDelegate {
+
+    let webView: WKWebView
+
+    private weak var pane: SitePane?
+    private weak var owner: SitePanePopupWindow?
+    private let label: String
+    private let authenticationURL: URL
+    private weak var openerWindow: NSWindow?
+    private var openerCloseObserver: NSObjectProtocol?
+    private var window: NSWindow?
+    private var children: [SitePanePopupWindow] = []
+    private var isClosed = false
+
+    init(configuration: WKWebViewConfiguration,
+         url: URL,
+         label: String,
+         pane: SitePane,
+         owner: SitePanePopupWindow?,
+         opener: WKWebView,
+         metrics: SitePane.PopupWindowMetrics) {
+        self.authenticationURL = url
+        self.label = label
+        self.pane = pane
+        self.owner = owner
+        self.openerWindow = opener.window
+        self.webView = WKWebView(frame: .zero, configuration: configuration)
+        super.init()
+
+        self.webView.uiDelegate = self
+        self.webView.navigationDelegate = self
+        makeWindow(opener: opener, metrics: metrics)
+    }
+
+    func show() {
+        guard !isClosed, let window else { return }
+        observeOpenerWindowClose()
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    /// 主工作台窗口关闭后，留在外面的登录窗口既没有 opener 也没有可用的
+    /// 回调。这里跟随关闭，避免应用只剩一个失去上下文的授权窗口。
+    private func observeOpenerWindowClose() {
+        guard openerCloseObserver == nil, let openerWindow else { return }
+        openerCloseObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification,
+            object: openerWindow,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.close()
+            }
+        }
+    }
+
+    private func removeOpenerCloseObserver() {
+        if let openerCloseObserver {
+            NotificationCenter.default.removeObserver(openerCloseObserver)
+            self.openerCloseObserver = nil
+        }
+    }
+
+    func close() {
+        guard !isClosed else { return }
+        isClosed = true
+        removeOpenerCloseObserver()
+        let closingWindow = window
+        window = nil
+        webView.stopLoading()
+        webView.navigationDelegate = nil
+        webView.uiDelegate = nil
+        if let closingWindow {
+            closingWindow.delegate = nil
+            closingWindow.orderOut(nil)
+            closingWindow.close()
+        }
+        finishCleanup()
+    }
+
+    private func finishCleanup() {
+        let nested = children
+        children.removeAll()
+        for child in nested { child.close() }
+        if let owner {
+            owner.popupWindowDidClose(self)
+        } else {
+            pane?.popupWindowDidClose(self)
+        }
+    }
+
+    private func popupWindowDidClose(_ popup: SitePanePopupWindow) {
+        children.removeAll { $0 === popup }
+    }
+
+    // MARK: Window
+
+    private func makeWindow(opener: WKWebView, metrics: SitePane.PopupWindowMetrics) {
+        let size = NSSize(
+            width: Self.dimension(metrics.width.map { Double($0) }, fallback: 520, range: 360...1200),
+            height: Self.dimension(metrics.height.map { Double($0) }, fallback: 680, range: 420...1000)
+        )
+
+        let window = SitePanePopupNSWindow(
+            contentRect: NSRect(origin: .zero, size: size),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+        window.title = "\(label) · \(authenticationURL.host ?? "登录")"
+        window.minSize = NSSize(width: 360, height: 420)
+
+        webView.frame = NSRect(origin: .zero, size: size)
+        webView.autoresizingMask = [.width, .height]
+        window.contentView = webView
+        window.setContentSize(size)
+        window.setFrameOrigin(position(for: size, opener: opener))
+        self.window = window
+    }
+
+    private static func dimension(_ raw: Double?,
+                                  fallback: CGFloat,
+                                  range: ClosedRange<CGFloat>) -> CGFloat {
+        guard let raw, raw.isFinite, raw > 0 else { return fallback }
+        return min(max(CGFloat(raw), range.lowerBound), range.upperBound)
+    }
+
+    private func position(for size: NSSize, opener: WKWebView) -> NSPoint {
+        let openerWindow = opener.window
+        let screen = openerWindow?.screen ?? NSScreen.main
+        let visible = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+
+        var origin: NSPoint
+        if let frame = openerWindow?.frame {
+            origin = NSPoint(x: frame.midX - size.width / 2, y: frame.midY - size.height / 2)
+        } else {
+            origin = NSPoint(x: visible.midX - size.width / 2, y: visible.midY - size.height / 2)
+        }
+        origin.x = min(max(origin.x, visible.minX + 12), visible.maxX - size.width - 12)
+        origin.y = min(max(origin.y, visible.minY + 12), visible.maxY - size.height - 12)
+        return origin
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard !isClosed else { return }
+        isClosed = true
+        removeOpenerCloseObserver()
+        webView.stopLoading()
+        webView.navigationDelegate = nil
+        webView.uiDelegate = nil
+        window = nil
+        finishCleanup()
+    }
+
+    // MARK: WKUIDelegate
+
+    func webViewDidClose(_ webView: WKWebView) {
+        // 网页里的 window.close() 只关闭当前子窗口，不触碰主工作台。
+        close()
+    }
+
+    func webView(_ webView: WKWebView,
+                 createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction,
+                 windowFeatures: WKWindowFeatures) -> WKWebView? {
+        guard let url = navigationAction.request.url, let pane else { return nil }
+
+        switch pane.popupDestination(for: url, navigationType: navigationAction.navigationType) {
+        case .currentPage:
+            webView.load(URLRequest(url: url))
+            return nil
+        case .authenticationWindow:
+            let child = SitePanePopupWindow(
+                configuration: configuration,
+                url: url,
+                label: label,
+                pane: pane,
+                owner: self,
+                opener: webView,
+                metrics: SitePane.PopupWindowMetrics(windowFeatures: windowFeatures)
+            )
+            children.append(child)
+            child.show()
+            return child.webView
+        case .external:
+            pane.openExternally(url)
+            return nil
+        case .blocked(let reason):
+            pane.recordPopupBlocked(reason)
+            return nil
+        }
+    }
+
+    func webView(_ webView: WKWebView,
+                 runJavaScriptAlertPanelWithMessage message: String,
+                 initiatedByFrame frame: WKFrameInfo,
+                 completionHandler: @escaping () -> Void) {
+        guard let pane else {
+            completionHandler()
+            return
+        }
+        pane.presentScriptAlert(from: webView, message: message, completion: completionHandler)
+    }
+
+    func webView(_ webView: WKWebView,
+                 runJavaScriptConfirmPanelWithMessage message: String,
+                 initiatedByFrame frame: WKFrameInfo,
+                 completionHandler: @escaping (Bool) -> Void) {
+        guard let pane else {
+            completionHandler(false)
+            return
+        }
+        pane.presentScriptConfirm(from: webView, message: message, completion: completionHandler)
+    }
+
+    func webView(_ webView: WKWebView,
+                 runJavaScriptTextInputPanelWithPrompt prompt: String,
+                 defaultText: String?,
+                 initiatedByFrame frame: WKFrameInfo,
+                 completionHandler: @escaping (String?) -> Void) {
+        guard let pane else {
+            completionHandler(nil)
+            return
+        }
+        pane.presentScriptPrompt(
+            from: webView,
+            prompt: prompt,
+            defaultText: defaultText,
+            completion: completionHandler
+        )
+    }
+
+    // MARK: WKNavigationDelegate
+
+    func webView(_ webView: WKWebView,
+                 decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        guard let url = navigationAction.request.url, let pane else {
+            decisionHandler(.cancel)
+            return
+        }
+        switch pane.navigationDisposition(for: url, navigationType: navigationAction.navigationType) {
+        case .allow:
+            decisionHandler(.allow)
+        case .external:
+            decisionHandler(.cancel)
+            pane.openExternally(url)
+        case .block(let reason):
+            decisionHandler(.cancel)
+            pane.recordPopupBlocked(reason)
+        }
+    }
+
+    func webView(_ webView: WKWebView,
+                 decidePolicyFor navigationResponse: WKNavigationResponse,
+                 decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+        decisionHandler(.allow)
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard let title = webView.title?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !title.isEmpty
+        else { return }
+        window?.title = "\(label) · \(title)"
+    }
+}
+
+/// 登录窗口是辅助窗口，不参与主工作台的“重新打开”目标选择。
+private final class SitePanePopupNSWindow: NSWindow {
+    override var canBecomeMain: Bool { false }
 }
 
 // MARK: - Serial command gate

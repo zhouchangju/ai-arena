@@ -32,7 +32,15 @@
  *   independent -> critique -> proposal -> vote -> done
  * A vote that does not settle the discussion runs one more targeted critique
  * round, a revised candidate and a fresh vote on that candidate version.
- * The budget is `maxRounds` (1-5, default 2). The default keeps the original
+ * The budget is `maxRounds` (1-5), the number of review cycles. Independent
+ * answers are a prerequisite stage before the first cycle and are not counted
+ * by the budget. Each cycle starts with critique, then a candidate (or a
+ * revised candidate) and a stance on that exact text. The shared engine's
+ * default is 2 (`DEFAULT_MAX_ROUNDS`): that is what the browser extension
+ * passes and what every session saved before the budget existed is treated as.
+ * The native desktop app creates a new discussion with an explicit 3, so its
+ * visible default is three review cycles unless the user picks another budget
+ * (1-5). A session created without an explicit budget keeps the original
  * behaviour: explicit opposition gets one follow-up round and conditional
  * agreement stops immediately. A new desktop session states a budget
  * explicitly and also follows unresolved conditions. At the limit the session
@@ -66,10 +74,14 @@ const PROVIDER_ID_RE = /^[a-z0-9]+(?:[-_][a-z0-9]+)*$/;
 export const MIN_SEATS = 2;
 export const MAX_SEATS = 3;
 
-// Total discussion rounds, including the first independent/critique/proposal/
-// vote round. Two is the original, extension-compatible budget: one targeted
-// follow-up for explicit opposition only. A desktop session may request up to
-// five and then also follows unresolved conditions.
+// Maximum number of review cycles. Independent answers are a prerequisite
+// stage and are not part of the budget. `DEFAULT_MAX_ROUNDS` is the
+// legacy/shared-engine budget: two cycles, one targeted follow-up for explicit
+// opposition only, which is what the browser extension and every session saved
+// before the option keep. The native desktop app passes 3 explicitly for a new
+// discussion (its UI label is 互评上限); an explicit budget also follows
+// unresolved conditions. Each cycle starts with critique, then candidate and
+// stance.
 export const MIN_ROUNDS = 1;
 export const MAX_ROUNDS = 5;
 export const DEFAULT_MAX_ROUNDS = 2;
@@ -96,9 +108,9 @@ const MAX_GUIDANCE = 2000;
 
 const STAGE_LABELS = {
   independent: '独立作答',
-  critique: '质询',
+  critique: '互评',
   proposal: '候选结论',
-  vote: '表决',
+  vote: '表态',
   done: '结束',
 };
 
@@ -1342,8 +1354,13 @@ function buildReport(session, reason) {
   const lines = ['# AI Arena 讨论结论', ''];
   lines.push('## 状态', '');
   lines.push(`- ${statusLabel(reason)}`);
+  // One budget line only: count the review cycles that actually began, not
+  // `session.round`. A session finished during independent answers has no
+  // critique entry in history and must render 0; a cycle that began with
+  // skipped or still-pending review tasks still counts because its review
+  // stage exists in the archived history.
   const maxRounds = sessionMaxRounds(session);
-  lines.push(`- 讨论轮次：第 ${session.round} 轮 / 上限 ${maxRounds} 轮`);
+  lines.push(`- 互评轮次：${critiqueRoundCount(history)} / ${maxRounds}`);
   lines.push(`- 候选版本：${version > 0 ? `v${version}` : '无'}`);
   lines.push(`- 参与席位：${session.providers.map((p) => `\`${p}\``).join('、')}`);
   const independentSeats = session.providers.filter((provider) =>
@@ -1367,9 +1384,8 @@ function buildReport(session, reason) {
     `- 独立回答席位：${independentSeats.map((p) => `\`${p}\``).join('、') || '无'}（${independentSeats.length}/${session.providers.length}）`,
   );
   lines.push(
-    `- 本轮交叉质询席位：${crossReviewSeats.map((p) => `\`${p}\``).join('、') || '无'}（${crossReviewSeats.length}/${session.providers.length}）`,
+    `- 本轮互评席位：${crossReviewSeats.map((p) => `\`${p}\``).join('、') || '无'}（${crossReviewSeats.length}/${session.providers.length}）`,
   );
-  lines.push(`- 质询轮次：${critiqueRoundCount(history)} / ${maxRounds}`);
   if (session.round >= maxRounds) {
     if (reason === 'conditional-agreement') {
       lines.push(
@@ -1456,11 +1472,11 @@ function buildReport(session, reason) {
   }
   lines.push('');
 
-  lines.push('## 各席最终态度', '');
+  lines.push('## 各席最终表态', '');
   if (!proposal) {
-    lines.push('- 尚未进入对候选结论的表决。');
+    lines.push('- 尚未进入对候选结论的表态。');
   } else if (votes.length === 0) {
-    lines.push('- 当前候选版本没有有效表决；未表态不能视为同意。');
+    lines.push('- 当前候选版本没有有效表态；未表态不能视为同意。');
   } else {
     for (const provider of session.providers) {
       const vote = votes.find((task) => task.provider === provider);
@@ -1499,9 +1515,9 @@ function buildReport(session, reason) {
   }
   lines.push('');
 
-  lines.push('## 质询与最强反例', '');
+  lines.push('## 互评与最强反例', '');
   if (critiques.length === 0) {
-    lines.push('- 没有可用的质询材料。');
+    lines.push('- 没有可用的互评材料。');
   } else {
     for (const task of critiques) {
       lines.push(
@@ -1514,7 +1530,7 @@ function buildReport(session, reason) {
   }
 
   if (olderVotes.length > 0) {
-    lines.push('## 往轮表决（不计入当前版本）', '');
+    lines.push('## 往轮表态（不计入当前版本）', '');
     for (const vote of olderVotes) {
       lines.push(
         `- v${vote.version} · \`${vote.provider}\`：${STANCE_LABELS[vote.stance]} — ${reportMaterial(vote)} [${vote.sourceId}]`,
@@ -1659,7 +1675,7 @@ function pendingSeatLabels(pending) {
 function statusLabel(reason) {
   switch (reason) {
     case 'consensus':
-      return '全体一致：每位参与者都独立作答、完成本轮交叉质询，并对同一候选版本的完整文本明确同意，没有未解决反对或附加条件。';
+      return '全体一致：每位参与者都独立作答、完成本轮互评，并对同一候选版本的完整文本明确同意，没有未解决反对或附加条件。';
     case 'conditional-agreement':
       return '有条件一致：没有明确反对，但至少一席附加了条件；这不等于全体无条件同意。';
     case 'unresolved-opposition':
@@ -1669,13 +1685,13 @@ function statusLabel(reason) {
     case 'partial-participation':
       return '部分完成：有席位没有提供独立回答，参与席位不齐；即使其余席位点了同意，也不构成全体一致。';
     case 'no-cross-review':
-      return '部分完成：至少一席没有提交本轮的交叉质询回应；仅收到对方文字不等于完成质询，不能声称全体一致。';
+      return '部分完成：至少一席没有提交本轮的互评回应；仅收到对方文字不等于完成互评，不能声称全体一致。';
     case 'draft':
       return '草稿：候选结论缺少可核实的 [S#] 出处，未形成可核验的全体一致；请按草稿使用或重新起草。';
     case 'proposal-skipped':
-      return '部分完成：候选结论没有完成，未进入有效表决。';
+      return '部分完成：候选结论没有完成，未进入有效表态。';
     case 'no-critique':
-      return '部分完成：独立回答已收到，但缺少可用的质询材料。';
+      return '部分完成：独立回答已收到，但缺少可用的互评材料。';
     case 'no-answers':
       return '未形成结论：没有收到有效回答。';
     case 'no-tasks':
@@ -1687,6 +1703,7 @@ function statusLabel(reason) {
   }
 }
 
+/** Review cycles that began, whether their tasks were answered, skipped or left pending. */
 function critiqueRoundCount(history) {
   const rounds = new Set(
     history

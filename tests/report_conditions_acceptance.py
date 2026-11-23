@@ -157,7 +157,7 @@ def main() -> int:
             markdown = exported.read_text(encoding="utf-8")
             checks.check("Markdown preserves the exact current reason and labels v1 votes as prior", (
                 f"附加条件：`chatgpt` — {CONDITION} [{current['sourceId']}]" in markdown
-                and "往轮表决（不计入当前版本）" in markdown
+                and "往轮表态（不计入当前版本）" in markdown
                 and all(f"{vote['answer']} [{vote['sourceId']}]" in markdown for vote in previous)
             ))
             checks.check("No external requests or workspace script errors", not requests and not errors, str(requests + errors))

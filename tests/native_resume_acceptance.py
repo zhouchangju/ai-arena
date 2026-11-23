@@ -155,6 +155,7 @@ def main():
         provider = armed["pendingProvider"]
         assert armed["pendingPhase"] == "prepared", armed
         assert "已填入" in armed["statuses"][provider], armed["statuses"]
+        assert armed["seatStates"][provider]["kind"] == "sending", armed["seatStates"]
 
         session_1 = armed["session"]
         answers_1 = [task for task in session_1["tasks"] if task["status"] == "answered"]
@@ -210,6 +211,13 @@ def main():
         assert checked["didContinue"] is False, checked
         assert checked["stage"] == "independent", checked["stage"]
         assert "核对原页" in checked["statuses"][provider], checked["statuses"]
+        assert checked["seatStates"][provider]["kind"] == "needsAction", checked["seatStates"]
+        for provider_id in answered_seats:
+            assert checked["seatStates"][provider_id]["kind"] == "answered", checked["seatStates"]
+
+        from_history = check_restart(["--smoke-check-history"], "restart-from-history")
+        assert from_history["didContinue"] is False, from_history
+        assert from_history["seatStates"][provider]["kind"] == "needsAction", from_history
 
         mismatch = check_restart(
             ["--continue-saved-discussion", "arena-other-session"],
@@ -235,12 +243,16 @@ def main():
                 ["--continue-saved-discussion", session_id], "restart-paused"
             )
             assert paused["didContinue"] is False, paused
+            paused_history = check_restart(["--smoke-check-history"], "restart-paused-history")
+            assert paused_history["session"]["paused"] is True, paused_history
 
             rewrite_state(lambda state: state.update(manualProviders=[provider]))
             taken = check_restart(
                 ["--continue-saved-discussion", session_id], "restart-taken-over"
             )
             assert taken["didContinue"] is False, taken
+            taken_history = check_restart(["--smoke-check-history"], "restart-taken-over-history")
+            assert taken_history["seatStates"][provider]["kind"] == "takenOver", taken_history
         finally:
             session_file.write_text(original_state)
 
