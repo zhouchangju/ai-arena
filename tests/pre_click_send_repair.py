@@ -43,6 +43,7 @@ from playwright.sync_api import sync_playwright
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fixtures import find_chromium_executable  # noqa: E402
+from swift_sources import stage_desktop_sources  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 DRIVER = ROOT / "shared" / "web-driver.js"
@@ -118,7 +119,14 @@ def probe(page, base, task_id, expected=None):
 def run_swift_checks() -> int:
     """Compile the native decision gate with a pure, non-app test binary."""
     with tempfile.TemporaryDirectory(prefix="arena-pre-click-check-") as temp:
-        binary = Path(temp) / "pre-click-send-repair-check"
+        directory = Path(temp)
+        # The check needs the whole desktop module (ArenaModel references the
+        # evaluated-session digest). Compile a stable copy and drop only the
+        # production @main from the copied ArenaApp.swift.
+        sources = stage_desktop_sources(ROOT, directory)
+        check = directory / "pre_click_send_repair.swift"
+        check.write_bytes((ROOT / "tests" / "pre_click_send_repair.swift").read_bytes())
+        binary = directory / "pre-click-send-repair-check"
         compile_cmd = [
             "xcrun",
             "--sdk",
@@ -134,10 +142,8 @@ def run_swift_checks() -> int:
             "SwiftUI",
             "-framework",
             "JavaScriptCore",
-            str(ROOT / "desktop" / "ArenaEngine.swift"),
-            str(ROOT / "desktop" / "SitePane.swift"),
-            str(ROOT / "desktop" / "ArenaModel.swift"),
-            str(ROOT / "tests" / "pre_click_send_repair.swift"),
+            *[str(source) for source in sources],
+            str(check),
             "-o",
             str(binary),
         ]

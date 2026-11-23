@@ -264,6 +264,19 @@ struct GuidanceHistoryCheck {
             "an exact outcome filter is applied",
             ArenaHistorySearch.filter(fixtures, criteria: criteria).map(\.id) == ["d"]
         )
+        // Core ends the discussion with `no-critique` when independent answers
+        // exist but no critique did; it must not collapse into generic ended.
+        let noCritique = summary("e", "本轮没有可用互评", updatedAt: 50,
+                                 stopReason: "no-critique", providers: ["chatgpt", "gemini"])
+        check(
+            "a core no-critique stop reason keeps its own outcome and label",
+            ArenaHistoryOutcome.key(for: noCritique) == "no-critique"
+                && ArenaHistoryOutcome.label(for: noCritique) == "缺少互评材料"
+                && ArenaHistorySearch.filter(
+                    fixtures + [noCritique],
+                    criteria: ArenaHistorySearchCriteria(outcome: "no-critique")
+                ).map(\.id) == ["e"]
+        )
         criteria = ArenaHistorySearchCriteria(seat: "deepseek")
         check(
             "a seat filter uses the persisted seats",

@@ -6,12 +6,7 @@
 //  `kind + detail`，导出和历史回看使用同一套由已保存场次推导的结构化结果。
 //  本检查只验证纯函数，不启动应用、不创建窗口、不访问网络或真实账号。
 //
-//  由 tests/native_seat_state.py 编译运行：
-//    xcrun --sdk macosx swiftc -swift-version 5 \
-//      -framework AppKit -framework WebKit -framework SwiftUI \
-//      -framework JavaScriptCore \
-//      desktop/ArenaEngine.swift desktop/SitePane.swift \
-//      desktop/ArenaModel.swift tests/native_seat_state.swift -o <bin>
+//  从仓库根目录运行 `python3 tests/native_seat_state.py`。
 //
 
 import Foundation

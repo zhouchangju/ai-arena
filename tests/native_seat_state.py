@@ -7,8 +7,9 @@ outcome is used by export and read-only history, so a saved session keeps its
 final same-version stance or skip instead of a transient UI label.
 
 The check is a pure binary: no app launch, no window, no web view, no network
-and no real account. It compiles ``ArenaEngine``, ``SitePane`` and
-``ArenaModel`` together with ``tests/native_seat_state.swift``.
+and no real account. It compiles a disposable copy of the current desktop Swift
+sources, with only the production ``@main`` removed from ``ArenaApp.swift``,
+together with ``tests/native_seat_state.swift``.
 
 Run from the repository root:
 
@@ -24,6 +25,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from swift_sources import stage_desktop_sources
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -31,13 +34,9 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="arena-seat-state-") as temp:
         root = Path(temp)
         # Copy the sources once so a concurrent editor cannot change an input
-        # file in the middle of the Swift build.
-        sources = []
-        for name in ("ArenaEngine.swift", "SitePane.swift", "ArenaModel.swift"):
-            source = ROOT / "desktop" / name
-            target = root / name
-            target.write_bytes(source.read_bytes())
-            sources.append(target)
+        # file in the middle of the Swift build. The copied ArenaApp.swift
+        # drops only its production @main; this check supplies the entry point.
+        sources = stage_desktop_sources(ROOT, root)
         check = root / "native_seat_state.swift"
         check.write_bytes((ROOT / "tests" / "native_seat_state.swift").read_bytes())
 

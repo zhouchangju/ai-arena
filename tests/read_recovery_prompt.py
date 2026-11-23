@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Compile and run the read-only rebuild prompt checks.
 
-``desktop/ArenaEngine.swift`` (intent-phase gate) and ``desktop/SitePane.swift``
-(shape check) are compiled with ``tests/read_recovery_prompt.swift``. The check
-is pure: no app launch, no web view, no network, no account and no page click.
+``desktop/ArenaEngine.swift`` (intent-phase gate), ``desktop/ArenaEvaluation.swift``
+(shared evaluation error type) and ``desktop/SitePane.swift`` (shape check) are
+compiled with ``tests/read_recovery_prompt.swift``. The check is pure: no app
+launch, no web view, no network, no account and no page click.
 
 Run from the repository root:
 
@@ -39,6 +40,7 @@ def main() -> int:
             "-framework",
             "JavaScriptCore",
             str(ROOT / "desktop" / "ArenaEngine.swift"),
+            str(ROOT / "desktop" / "ArenaEvaluation.swift"),
             str(ROOT / "desktop" / "SitePane.swift"),
             str(ROOT / "tests" / "read_recovery_prompt.swift"),
             "-o",

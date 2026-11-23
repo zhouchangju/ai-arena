@@ -478,24 +478,45 @@ final class ArenaSessionStore {
                   let file = try? decoder.decode(ArenaSessionFile.self, from: data) else {
                 continue
             }
-            let session = Self.sessionDocument(file.sessionJSON)
-            result.append(
-                ArenaHistorySummary(
-                    id: file.id,
-                    question: file.question,
-                    createdAt: file.createdAt,
-                    updatedAt: file.updatedAt,
-                    stage: session?.arenaString("stage") ?? "",
-                    round: session?.arenaInt("round") ?? 1,
-                    stopReason: session?.arenaString("stopReason"),
-                    hasReport: session?.arenaString("report")?.isEmpty == false,
-                    paused: session?.arenaBool("paused") ?? false,
-                    providers: session?.arenaStringArray("providers") ?? []
-                )
-            )
+            result.append(summary(for: file, session: Self.sessionDocument(file.sessionJSON)))
         }
-        result.sort { $0.updatedAt > $1.updatedAt }
-        return result
+        return Self.newestFirst(result)
+    }
+
+    /// The one summary projection. A full read passes the parsed `sessionJSON`
+    /// document; a caller that already holds the just-saved file and its parsed
+    /// session passes those instead, so both produce the identical row without
+    /// a second file read. `session` is nil only for an unparseable document,
+    /// which keeps the historical schema defaults below.
+    func summary(for file: ArenaSessionFile, session: [String: Any]?) -> ArenaHistorySummary {
+        ArenaHistorySummary(
+            id: file.id,
+            question: file.question,
+            createdAt: file.createdAt,
+            updatedAt: file.updatedAt,
+            stage: session?.arenaString("stage") ?? "",
+            round: session?.arenaInt("round") ?? 1,
+            stopReason: session?.arenaString("stopReason"),
+            hasReport: session?.arenaString("report")?.isEmpty == false,
+            paused: session?.arenaBool("paused") ?? false,
+            providers: session?.arenaStringArray("providers") ?? []
+        )
+    }
+
+    /// Newest-first order shared by the full read and the post-save upsert, so
+    /// a freshly saved row lands exactly where a re-read would place it.
+    private static func newestFirst(_ items: [ArenaHistorySummary]) -> [ArenaHistorySummary] {
+        items.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    /// Replace (or insert) one durable summary in the newest-first list the
+    /// caller already holds. Pure: no file access, and the caller keeps the
+    /// only cache.
+    static func upserting(
+        _ summary: ArenaHistorySummary,
+        into items: [ArenaHistorySummary]
+    ) -> [ArenaHistorySummary] {
+        newestFirst(items.filter { $0.id != summary.id } + [summary])
     }
 
     private static func sessionDocument(_ json: String) -> [String: Any]? {
@@ -508,34 +529,23 @@ final class ArenaSessionStore {
     }
 }
 
-// MARK: - Resource lookup
-
-enum ArenaResource {
-    static func url(name: String, extension ext: String, bundle: Bundle) -> URL? {
-        bundle.url(forResource: name, withExtension: ext)
-    }
-}
-
 // MARK: - JavaScript core bridge
 
 /// Hosts `arena-core.js`.
 ///
-/// `arena-core.js` may be shipped either as a plain script exposing global
-/// `createSession` / `applyAction`, or as a copy of the ES module with
-/// `import`/`export` syntax. The latter is normalised here (module keywords
-/// removed, provider-id constants supplied) so the two shapes share one
-/// bridge. Only JSON text crosses the boundary.
+/// The shipped resource is already a plain script exposing global
+/// `createSession` / `applyAction` (plus the `reportBallot` /
+/// `reviewMaterials` helpers): `desktop/build.sh` strips the ES-module
+/// `import`/`export` syntax from `shared/providers.js` and `shared/core.js`
+/// while writing the bundle resource. This bridge evaluates that script
+/// as-is and lets only JSON text cross the boundary.
 @MainActor
 final class ArenaCore {
     private let context: JSContext
 
     init(bundle: Bundle) throws {
-        guard let url = ArenaResource.url(
-            name: "arena-core",
-            extension: "js",
-            bundle: bundle
-        ) else {
-            throw ArenaEngineError("缺少 arena-core.js（应用包或 desktop/ 目录）")
+        guard let url = bundle.url(forResource: "arena-core", withExtension: "js") else {
+            throw ArenaEngineError("缺少 arena-core.js（应用包资源）")
         }
         let source: String
         do {
@@ -917,12 +927,8 @@ final class ArenaEngine {
             return
         }
 
-        guard let url = ArenaResource.url(
-            name: "sites",
-            extension: "json",
-            bundle: bundle
-        ) else {
-            sitesFailure = "缺少 sites.json（应用包或 desktop/ 目录）"
+        guard let url = bundle.url(forResource: "sites", withExtension: "json") else {
+            sitesFailure = "缺少 sites.json（应用包资源）"
             return
         }
         let data: Data

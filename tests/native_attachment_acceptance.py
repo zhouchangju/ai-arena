@@ -359,7 +359,8 @@ def check_pasteboard(out):
     binary = directory / "attachment-pasteboard-check"
     subprocess.run([
         "xcrun", "swiftc", "-swift-version", "5", "-parse-as-library",
-        root / "desktop/ArenaEngine.swift", root / "desktop/ArenaAttachmentComposer.swift",
+        root / "desktop/ArenaEngine.swift", root / "desktop/ArenaEvaluation.swift",
+        root / "desktop/ArenaAttachmentComposer.swift",
         root / "tests/attachment_pasteboard.swift", "-o", binary,
     ], check=True)
     subprocess.run([binary, directory], check=True)

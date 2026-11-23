@@ -2089,13 +2089,6 @@ enum ArenaSessionDigest {
         return lastTask(session, provider: provider)?.prompt.trimmedNonEmpty
     }
 
-    static func answerText(_ session: [String: Any]?, provider: String) -> String? {
-        if let task = currentTask(session, provider: provider), let answer = task.answer?.trimmedNonEmpty {
-            return answer
-        }
-        return lastTask(session, provider: provider)?.answer?.trimmedNonEmpty
-    }
-
     static func answerRows(_ session: [String: Any]?) -> [ArenaTaskRow] {
         rows(session).filter { $0.answer?.trimmedNonEmpty != nil }
     }
@@ -2431,10 +2424,6 @@ final class ArenaDetailsWindowController: NSObject, NSWindowDelegate, NSToolbarD
 
     func windowDidExitFullScreen(_ notification: Notification) {
         refreshToolbar()
-    }
-
-    func windowWillClose(_ notification: Notification) {
-        guard (notification.object as? NSWindow) === window else { return }
     }
 }
 

@@ -3547,7 +3547,13 @@ final class ArenaModel: ObservableObject {
             }
         }
         currentID = id
-        refreshHistoryList()
+        // The write above is durable and `session` is already parsed, so the
+        // history row is projected from this save instead of re-reading every
+        // saved record. A failed save returned before this point.
+        historyList = ArenaSessionStore.upserting(
+            engine.store.summary(for: file, session: session),
+            into: historyList
+        )
         if let event = completionTracker.recordPersisted(
             sessionID: id,
             stage: session.arenaString("stage") ?? "",
@@ -3789,10 +3795,22 @@ final class ArenaModel: ObservableObject {
 
     private func loadSavedSession(id: String) -> ArenaSavedSession? {
         guard let file = engine.store.load(id: id),
-              let session = Self.decodeSession(file.sessionJSON) else {
+              let session = Self.decodeSession(file.sessionJSON),
+              Self.hasUniqueIntentIDs(file.intents) else {
             return nil
         }
         return ArenaSavedSession(file: file, session: session)
+    }
+
+    /// Reject a saved record whose delivery intents reuse a task id. No single
+    /// phase can be chosen for such a task: a guessed `prepared` could resend
+    /// something already sent, so the record is refused and left on disk.
+    private nonisolated static func hasUniqueIntentIDs(_ intents: [ArenaDeliveryIntent]) -> Bool {
+        var seen: Set<String> = []
+        for intent in intents where !seen.insert(intent.taskId).inserted {
+            return false
+        }
+        return true
     }
 
     /// Preconditions for the CLI path that can dispatch verified unsent tasks.
@@ -3810,8 +3828,15 @@ final class ArenaModel: ObservableObject {
     }
 
     private func restoreInitialSession() {
-        guard let id = engine.store.currentID(),
-              let saved = loadSavedSession(id: id) else {
+        guard let id = engine.store.currentID() else {
+            return
+        }
+        guard let saved = loadSavedSession(id: id) else {
+            // The pointer is valid but the record is not: keep the file as it
+            // is, install nothing and say so instead of starting silently.
+            // `recoveryNotice` only renders after a restore installs a running
+            // session, so this failure belongs in the dismissible error banner.
+            errorMessage = "上次场次未能恢复：本地记录没有通过校验。历史里可能仍看得到这一场，但打开它会被拒绝。为避免重复发送，本场不会自动继续；可新建讨论。"
             return
         }
         let requested = explicitContinueID
