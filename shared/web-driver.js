@@ -12,6 +12,8 @@
  *     type: 'arena.web.probe' | 'arena.web.submit' | 'arena.web.read',
  *     taskId: 'round1.seatA',
  *     prompt: '本轮要发送的原文',          // submit 必填
+ *     // 首轮有图时先用 prepareImagesOnly:true 和 images:[{name,mediaType,base64}]
+ *     // 准备页面文件；下次 submit/read 只传 imageNames:[...] 核对同组图片。
  *     selectors: {
  *       input: '#composer',                 // 输入框（必填）
  *       send: '#send',                     // 发送控件（必填）
@@ -37,8 +39,8 @@
  * 与旧版完全相同；同源首页 → 首个已核对会话的 SPA 进展不受影响。
  *
  * 回应：{ ok, status, text?, error?, detail? }
- *   status: 'ready' | 'submitted' | 'pending' | 'done' | 'unknown' | 'error'
- *   ok     : 仅 ready / submitted / pending / done 为 true
+ *   status: 'ready' | 'attachments-ready' | 'submitted' | 'pending' | 'done' | 'unknown' | 'error'
+ *   ok     : 仅 ready / attachments-ready / submitted / pending / done 为 true
  *   text   : 仅 done 返回完整回答；pending 只给 detail.preview 正文片段
  *   detail.preview: { text, chars, truncated } 生成中的预览片段（绝不作为回答写入）
  *   error  : 稳定错误码（见 README/交接说明）
@@ -146,7 +148,7 @@
   const MAX_PROMPT_CHARS = 100000;
   const MAX_SELECTOR_CHARS = 400;
   const MAX_KNOWN_DRAFT_DIGESTS = 8;
-  const SELECTOR_KEYS = ['input', 'send', 'user', 'answer', 'stop', 'done', 'container'];
+  const SELECTOR_KEYS = ['input', 'send', 'user', 'answer', 'stop', 'done', 'container', 'attachmentComposer'];
   /**
    * 允许“同会话窗口裁切恢复”的站点，只限 providers.js 里登记过的对话地址：
    *
@@ -192,7 +194,7 @@
   function noop() {}
 
   function reply(status, fields) {
-    const ok = status === 'ready' || status === 'submitted' || status === 'pending' || status === 'done';
+    const ok = status === 'ready' || status === 'attachments-ready' || status === 'submitted' || status === 'pending' || status === 'done';
     const out = { ok: ok, status: status };
     if (fields) {
       for (const key of Object.keys(fields)) {
@@ -409,13 +411,23 @@
    * so only the exact native expander suffix is stripped and everything else
    * is compared verbatim.
    */
-  function userTextOf(node, expected = '') {
+  function userTextOf(node, expected = '', imageNames = []) {
     if (node.localName === 'user-query') {
       const lines = Array.from(node.querySelectorAll('.query-text-line'));
       if (lines.length) return lines.map((line) => line.textContent.trim()).join('\n');
     }
-    if (!node.matches('[data-content-search-unit-key$=":user"]')) return textOf(node);
     const visible = textOf(node);
+    // Some sites place filename text in the same user bubble as the question.
+    // Exclude only recognized cards in this bubble; the caller independently
+    // verifies each card's ordered identity, including after a page reload.
+    if (imageNames.length && expected && collapse(visible) !== collapse(expected)) {
+      const cards = new Set(attachmentRoots(node));
+      if (cards.size) {
+        const text = renderedQuestion(node, cards);
+        if (collapse(text) === collapse(expected)) return text;
+      }
+    }
+    if (!node.matches('[data-content-search-unit-key$=":user"]')) return visible;
     const control = expandControlOf(node);
     if (!control) return visible;
     const stripped = stripExpandMarker(visible, collapse(control.textContent), expected);
@@ -641,6 +653,38 @@
     return { value: out };
   }
 
+  function sameItems(actual, wanted) {
+    return actual.length === wanted.length && actual.every((value, index) => value === wanted[index]);
+  }
+
+  function parseImages(message) {
+    const images = message.images;
+    const preparing = message.prepareImagesOnly === true;
+    if (images === undefined && message.imageNames === undefined && !preparing) return { names: [] };
+    const names = preparing && Array.isArray(images) ? images.map((item) => item?.name) : message.imageNames;
+    if (!message.taskId.includes(':independent:') || !Array.isArray(names) || !names.length || names.length > 8 ||
+        names.some((name) => typeof name !== 'string' || !name.trim() || name.length > 255 ||
+          /[\\/\u0000-\u001f]/.test(name)) || new Set(names).size !== names.length) {
+      return { error: fail('bad-message', { field: 'imageNames' }) };
+    }
+    if (preparing) {
+      if (message.type !== TYPES.submit || message.imageNames !== undefined || !Array.isArray(images) ||
+          images.some((item) => !['image/png', 'image/jpeg'].includes(item?.mediaType) ||
+            typeof item.base64 !== 'string' || !item.base64.length || item.base64.length > 11184812) ||
+          images.reduce((sum, item) => sum + item.base64.length, 0) > 33554456) {
+        return { error: fail('bad-message', { field: 'images' }) };
+      }
+    } else if (images !== undefined) {
+      return { error: fail('bad-message', { field: 'prepareImagesOnly' }) };
+    }
+    const pixels = message.imagePixels ?? [];
+    if (!Array.isArray(pixels) || (pixels.length && pixels.length !== names.length) ||
+        pixels.some((hash) => typeof hash !== 'string' || (hash !== '' && !/^[0-9a-f]{64}$/.test(hash)))) {
+      return { error: fail('bad-message', { field: 'imagePixels' }) };
+    }
+    return { names, images, pixels };
+  }
+
   function parseCommon(message, needPrompt) {
     const scope = parseScope(message.scope);
     if (scope.error) {
@@ -658,6 +702,8 @@
     if (typeof message.taskId !== 'string' || !TASK_ID_RE.test(message.taskId)) {
       return { error: fail('bad-message', { field: 'taskId' }) };
     }
+    const attachments = parseImages(message);
+    if (attachments.error) return { error: attachments.error };
     const selectors = parseSelectors(message.selectors);
     if (selectors.error) return { error: selectors.error };
     let prompt = null;
@@ -697,6 +743,9 @@
       options: parseOptions(message.options),
       scope: scope.value,
       knownDraftDigests: draftDigests.value,
+      imageNames: attachments.names,
+      images: attachments.images,
+      imagePixels: attachments.pixels || [],
     };
   }
 
@@ -891,7 +940,7 @@
     }
     const users = listNodes(selectors.user, container);
     const items = users.map((node, index) => {
-      const raw = userTextOf(node, record.promptCollapsed);
+      const raw = userTextOf(node, record.promptCollapsed, record.imageNames);
       return {
         node: node,
         index: index,
@@ -930,7 +979,38 @@
    * 有新的用户消息但文本不符 → user-turn-mismatch（失败关闭），不退化成“取最后一条”。
    * 历史节点变少或一个不剩时，先试一次同会话窗口裁切恢复；不适用时保持原判定。
    */
-  function locateUserTurn(record, selectors, container, options) {
+  // ChatGPT's text selector is inside the user bubble; its image grid can be
+  // a sibling of that text. The parent must be the site's marked user bubble
+  // and contain this exact single text node so a previous turn cannot count.
+  function receiptArea(node, selectors) {
+    if (location.origin === CHATGPT_ORIGIN) {
+      const bubble = node.closest('[class~="group/user-message"]');
+      if (bubble && listNodes(selectors.user, bubble).length === 1 &&
+          listNodes(selectors.user, bubble)[0] === node && !listNodes(selectors.answer, bubble).length) {
+        return bubble;
+      }
+    }
+    return node;
+  }
+
+  async function locateUserTurn(record, selectors, container, options) {
+    const located = locateTurnByText(record, selectors, container, options);
+    if (located.turn && record.imageNames?.length) {
+      const area = receiptArea(located.turn.node, selectors);
+      const href = location.href;
+      await sampleImageEvidence(area, record.imageNames, record.imagePixels);
+      if (location.href !== href || !located.turn.node.isConnected || receiptArea(located.turn.node, selectors) !== area ||
+          !evidenceMatches(area, record.imageNames, record.imagePixels)) {
+        return { error: fail('attachment-receipt-mismatch', {
+          possiblySubmitted: true, clickAttempted: true, expectedImageNames: record.imageNames,
+          ...missingImageDetail(area, record.imageNames),
+        }) };
+      }
+    }
+    return located;
+  }
+
+  function locateTurnByText(record, selectors, container, options) {
     const users = listNodes(selectors.user, container);
     if (users.length < record.baseline.userCount) {
       const trimmed = locateTrimmedTurn(record, selectors, container);
@@ -946,7 +1026,7 @@
     const fresh = [];
     for (let index = record.baseline.userCount; index < users.length; index += 1) {
       const node = users[index];
-      const raw = userTextOf(node, record.promptCollapsed);
+      const raw = userTextOf(node, record.promptCollapsed, record.imageNames);
       fresh.push({
         node: node,
         index: index,
@@ -1215,6 +1295,7 @@
       href: canonicalHref(location.href),
       contextHref: record.contextHref || record.baseline.href,
     };
+    if (record.imageNames?.length && record.verified) detail.verifiedImageNames = record.imageNames;
     if (record.navigation) {
       detail.navigation = {
         from: record.navigation.from,
@@ -1297,17 +1378,33 @@
     const users = listNodes(req.selectors.user, container);
     const answers = listNodes(req.selectors.answer, container);
     const draft = cleanText(composerText(composerRoot(input)));
+    const area = editorAttachmentArea(input, req);
+    const hasFiles = Boolean(area && (attachmentRoots(area).length || uploadBlocked(area, uploadPending) ||
+      [...area.querySelectorAll('input[type="file"]')].some((el) => el.files?.length)));
+    // React can mount a text editor several seconds before the upload picker.
+    // Reuse the native bounded, read-only probe loop: each poll checks pause,
+    // takeover and the active task before any file bytes are furnished.
+    if (req.imageNames.length && !state.records.has(req.taskId) && !hasFiles) {
+      const kinds = req.imageNames.map((name) => ({
+        name, mediaType: /\.png$/i.test(name) ? 'image/png' : 'image/jpeg',
+      }));
+      if (!area || !imagePickers(area, kinds).length) {
+        return fail('selector-missing', { which: 'attachment-picker',
+          reason: area ? 'missing-picker' : 'missing-composer', uploadAttempted: false });
+      }
+    }
     const record = state.records.get(req.taskId) || null;
     const composer = {
       kind: kind,
       draftChars: draft.length,
-      draftEmpty: !collapse(draft),
+      draftEmpty: !collapse(draft) && !hasFiles,
+      ...(hasFiles && { hasAttachments: true }),
       enabled: elementEnabled(input),
     };
     // 只读比对：只有调用方带 expectedPrompt 时才多返回一个布尔值；它用与
     // submit 相同的规范化 sameText，绝不写入输入框，也不授权点击。
     if (req.expectedPrompt !== null) {
-      composer.matchesExpectedPrompt = sameText(draft, req.expectedPrompt);
+      composer.matchesExpectedPrompt = !hasFiles && sameText(draft, req.expectedPrompt);
     }
 
     return reply('ready', {
@@ -1390,8 +1487,13 @@
   async function waitForUserTurn(record, selectors, container, options) {
     const deadline = Date.now() + options.submitTimeoutMs;
     while (true) {
-      const located = locateUserTurn(record, selectors, container, options);
-      if (located.error) return { error: located.error };
+      const located = await locateUserTurn(record, selectors, container, options);
+      if (located.error) {
+        if (located.error.error !== 'attachment-receipt-mismatch') return { error: located.error };
+        // Give late thumbnail mounts/decodes the same read-only verification
+        // window as the message text. No action is dispatched a second time.
+        if (Date.now() >= deadline) return { error: located.error };
+      }
       if (located.turn) return { value: located };
       const stop = optionalSignal(selectors, 'stop', null);
       if (stop.error) return { error: stop.error };
@@ -1413,6 +1515,281 @@
     const digest = await promptDigest(draftCollapsed);
     if (!digest) return null;
     return req.knownDraftDigests.indexOf(digest) === -1 ? null : digest;
+  }
+
+  // Limit the search to this editor. A site can also expose an unrecognised
+  // chip, so count unnamed previews as conflicts rather than guessing by count.
+  const attachmentNodes = [
+    '[data-arena-attachment]', '[data-file-name]', '[data-filename]',
+    '[data-testid="attachment-preview"]', '[data-testid="file-thumbnail"]',
+    '.composer-attachment-surface', 'gem-media-attachment', 'uploader-thumbnail', '.image-preview', 'img[src^="blob:"]', 'img[src^="data:image"]',
+    'img[alt$=".png" i]', 'img[alt$=".jpg" i]', 'img[alt$=".jpeg" i]', 'img[alt="Uploaded image"]',
+  ].join(',');
+  const uploadPending = '[data-arena-upload-pending], [data-testid="upload-progress"], [role="progressbar"], progress, [aria-busy="true"]';
+  const uploadFailed = '[data-arena-upload-error], [data-upload-status="error"], [data-upload-status="failed"], [data-testid="upload-error"]';
+
+  function uploadErrorVisible(root) {
+    if (uploadBlocked(root, uploadFailed)) return true;
+    return Array.from(root.querySelectorAll('[role="alert"]')).some((el) => {
+      if (!isVisible(el)) return false;
+      const message = collapse(textOf(el) + ' ' + (el.getAttribute('aria-label') || ''));
+      return Boolean(message && (el.closest(attachmentNodes) ||
+        (/(?:upload|file|image|上传|文件|附件|图片)/i.test(message) &&
+         /(?:fail|error|unable|limit|unsupported|large|couldn.t|cannot|失败|错误|无法|限制|上限|不支持|过大)/i.test(message))));
+    });
+  }
+
+  function renderedQuestion(node, excludedCards) {
+    if (node.nodeType === Node.TEXT_NODE) return node.nodeValue;
+    if (!isElement(node) || excludedCards.has(node)) return '';
+    if (node.tagName === 'BR') return '\n';
+    const style = getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || node.hidden) return '';
+    const text = Array.from(node.childNodes, (child) => renderedQuestion(child, excludedCards)).join('');
+    return style.display === 'block' || style.display === 'flex' || style.display === 'grid'
+      ? '\n' + text + '\n' : text;
+  }
+
+  function attachmentRoots(root) {
+    const nodes = Array.from(root.querySelectorAll(attachmentNodes)).filter(isVisible);
+    return nodes.filter((node) => !nodes.some((other) => other !== node && other.contains(node)));
+  }
+
+  function attachmentLabelMatches(node, name) {
+    const labels = [node, ...node.querySelectorAll('[alt],[title],[aria-label],[data-file-name],[data-filename]')];
+    return labels.some((label) =>
+      ['data-file-name', 'data-filename', 'alt', 'title', 'aria-label'].some((attr) => label.getAttribute(attr) === name)
+    );
+  }
+
+  // Anonymous site thumbnails can still prove the exact images without
+  // requesting any remote resource. Hash every decoded pixel and both
+  // dimensions. Tiles bound transient canvas memory for Retina screenshots.
+  const previewPixels = new WeakMap();
+  async function digestHex(bytes) {
+    const digest = await crypto.subtle.digest('SHA-256', bytes);
+    return Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, '0')).join('');
+  }
+
+  async function pixelSignature(source) {
+    const w = source.naturalWidth || source.width, h = source.naturalHeight || source.height;
+    if (!w || !h || w * h > 40_000_000) return '';
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.min(w, 16384);
+    canvas.height = Math.min(h, Math.max(1, Math.floor(512 * 1024 / canvas.width)));
+    try {
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      const hashes = [String(w), String(h)];
+      for (let y = 0; y < h; y += canvas.height) {
+        const rows = Math.min(canvas.height, h - y);
+        for (let x = 0; x < w; x += canvas.width) {
+          const cols = Math.min(canvas.width, w - x);
+          ctx.clearRect(0, 0, cols, rows);
+          ctx.drawImage(source, x, y, cols, rows, 0, 0, cols, rows);
+          hashes.push(await digestHex(ctx.getImageData(0, 0, cols, rows).data));
+        }
+      }
+      return await digestHex(new TextEncoder().encode(hashes.join(':')));
+    } catch (_) {
+      // Tainted, unloaded or otherwise inaccessible pixels require manual review.
+      return '';
+    } finally {
+      canvas.width = canvas.height = 0;
+    }
+  }
+
+  async function filePixelSignatures(files) {
+    const result = [];
+    for (const file of files) {
+      let bitmap;
+      try {
+        bitmap = await createImageBitmap(file);
+        result.push(await pixelSignature(bitmap));
+      } catch (_) {
+        result.push('');
+      } finally {
+        bitmap?.close();
+      }
+    }
+    return result;
+  }
+
+  function evidenceImage(node) {
+    if (node.tagName === 'IMG') return node;
+    const images = node.querySelectorAll('img');
+    return images.length === 1 ? images[0] : null;
+  }
+
+  function imageMatches(node, name, hash) {
+    if (attachmentLabelMatches(node, name)) return true;
+    const image = evidenceImage(node);
+    const cached = image && previewPixels.get(image);
+    return Boolean(hash && cached && cached.src === image.currentSrc && cached.hash === hash);
+  }
+
+  async function sampleImageEvidence(root, names, pixels) {
+    const nodes = attachmentRoots(root);
+    if (nodes.length !== names.length) return;
+    for (let i = 0; i < nodes.length; i++) {
+      if (!pixels[i] || attachmentLabelMatches(nodes[i], names[i])) continue;
+      const img = evidenceImage(nodes[i]);
+      if (!img?.complete || !img.naturalWidth || !img.currentSrc || previewPixels.get(img)?.src === img.currentSrc) continue;
+      const src = img.currentSrc;
+      const hash = await pixelSignature(img);
+      if (img.currentSrc === src && img.isConnected) previewPixels.set(img, { src, hash });
+    }
+  }
+
+  function evidenceMatches(root, names, pixels = []) {
+    const roots = attachmentRoots(root);
+    return roots.length === names.length && roots.every((node, i) => imageMatches(node, names[i], pixels[i]));
+  }
+
+  function missingImageDetail(root, names) {
+    const roots = attachmentRoots(root);
+    if (!roots.length || roots.length >= names.length) return {};
+    const matched = new Set();
+    for (const node of roots) {
+      const possible = names.filter((name) => attachmentLabelMatches(node, name));
+      if (possible.length !== 1 || matched.has(possible[0])) return {};
+      matched.add(possible[0]);
+    }
+    return { missingImageNames: names.filter((name) => !matched.has(name)) };
+  }
+
+  function editorAttachmentArea(input, req) {
+    const candidates = req.selectors.attachmentComposer || [];
+    for (const css of ['[data-arena-composer]', ...[].concat(candidates)]) {
+      const root = input.closest(css);
+      if (root && !listNodes(req.selectors.user, root).length && !listNodes(req.selectors.answer, root).length) {
+        return root;
+      }
+    }
+    return null;
+  }
+
+  function uploadBlocked(root, selector) {
+    return Array.from(root.querySelectorAll(selector)).some(isVisible);
+  }
+
+  function attachmentError(code, names, uploadAttempted, root) {
+    return fail(code, { clickAttempted: false, phase: 'pre-click', expectedImageNames: names,
+      ...(uploadAttempted === false && { uploadAttempted: false }), ...(root && missingImageDetail(root, names)) });
+  }
+
+  function acceptsImage(input, image) {
+    const accept = input.accept.trim().toLowerCase();
+    if (!accept) return true;
+    const suffix = image.name.split('.').pop().toLowerCase();
+    return accept.split(',').some((value) =>
+      ['image/*', '*/*', image.mediaType, '.' + suffix].includes(value.trim()));
+  }
+
+  function imagePickers(root, images) {
+    const inputs = [...root.querySelectorAll('input[type="file"]')].filter((el) => !el.hasAttribute('capture') && elementEnabled(el) &&
+      (el.multiple || images.length === 1) && images.every((image) => acceptsImage(el, image)));
+    // The web seats may have separate camera, generic file, and photo pickers.
+    // Prefer the most specific matching accept list; ties remain ambiguous.
+    const generalChatGPT = location.origin === CHATGPT_ORIGIN
+      ? inputs.filter((el) => el.multiple && !el.accept.trim()) : [];
+    const photoInputs = inputs.filter((el) => el.accept.trim().toLowerCase() === 'image/*');
+    const mediaInputs = inputs.filter((el) => el.accept.toLowerCase().includes('image/'));
+    return [generalChatGPT, photoInputs, mediaInputs, inputs].find((group) => group.length) || [];
+  }
+
+  async function prepareImages(state, req, editor, root) {
+    const names = req.imageNames;
+    const prior = state.imageDraft;
+    const uploadAttempted = prior?.taskId === req.taskId;
+    if (!root) {
+      const failure = attachmentError('attachment-unsupported', names, uploadAttempted);
+      failure.detail.reason = 'missing-composer';
+      return failure;
+    }
+    if (prior && prior.taskId === req.taskId && prior.root === root && prior.href === location.href &&
+        sameItems(prior.names, names) && prior.ready && evidenceMatches(root, names, prior.pixels) &&
+        !uploadBlocked(root, uploadPending) && !uploadErrorVisible(root)) {
+      return reply('attachments-ready', { detail: { readyImageNames: names, readyImagePixels: state.imageDraft.pixels, clickAttempted: false } });
+    }
+    if (prior || attachmentRoots(root).length || uploadBlocked(root, uploadPending) ||
+        [...root.querySelectorAll('input[type="file"]')].some((el) => el.files?.length)) {
+      return attachmentError('attachment-draft-conflict', names, uploadAttempted);
+    }
+    const candidates = imagePickers(root, req.images);
+    if (candidates.length !== 1) {
+      const failure = attachmentError('attachment-unsupported', names, uploadAttempted);
+      failure.detail.reason = candidates.length ? 'ambiguous-picker' : 'missing-picker';
+      failure.detail.candidateCount = candidates.length;
+      return failure;
+    }
+    if (uploadErrorVisible(root)) return attachmentError('attachment-upload-failed', names, uploadAttempted);
+    const fileInput = candidates[0];
+    const draftText = composerText(composerRoot(editor));
+    try {
+      const files = new DataTransfer();
+      for (const image of req.images) {
+        const binary = atob(image.base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        files.items.add(new File([bytes], image.name, { type: image.mediaType }));
+      }
+      state.imageDraft = { taskId: req.taskId, names, href: location.href, root, fileInput,
+        files: Array.from(files.files), ready: false };
+      fileInput.files = files.files;
+      fileInput.dispatchEvent(new Event('input', { bubbles: true }));
+      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+    } catch (_) {
+      return attachmentError('attachment-upload-failed', names);
+    }
+    state.imageDraft.pixels = await filePixelSignatures(state.imageDraft.files);
+    const deadline = Date.now() + req.options.submitTimeoutMs;
+    do {
+      const gate = conversationGate(req.scope, 'pre-click');
+      if (gate) return gate;
+      if (!editor.isConnected || editorAttachmentArea(editor, req) !== root ||
+          composerText(composerRoot(editor)) !== draftText) return attachmentError('attachment-draft-conflict', names);
+      if (uploadErrorVisible(root)) return attachmentError('attachment-upload-failed', names, true, root);
+      await sampleImageEvidence(root, names, state.imageDraft.pixels);
+      if (root.isConnected && editor.isConnected && state.imageDraft.href === location.href &&
+          composerText(composerRoot(editor)) === draftText && evidenceMatches(root, names, state.imageDraft.pixels) &&
+          !uploadBlocked(root, uploadPending) && !uploadErrorVisible(root)) {
+        state.imageDraft.nodes = attachmentRoots(root);
+        state.imageDraft.ready = true;
+        return reply('attachments-ready', { detail: { readyImageNames: names, readyImagePixels: state.imageDraft.pixels, clickAttempted: false } });
+      }
+      await sleep(req.options.pollMs);
+    } while (Date.now() < deadline);
+    return attachmentError('attachment-not-ready', names, true, root);
+  }
+
+  function checkImageDraft(state, req, editor) {
+    const root = editorAttachmentArea(editor, req);
+    const names = req.imageNames;
+    if (!names.length) {
+      // Preserve a user's pre-existing file draft even in a text-only discussion.
+      if (root && (attachmentRoots(root).length || uploadBlocked(root, uploadPending) ||
+          [...root.querySelectorAll('input[type="file"]')].some((el) => el.files?.length))) {
+        return attachmentError('attachment-draft-conflict', names);
+      }
+      return null;
+    }
+    const prior = state.imageDraft;
+    if (!prior?.ready || prior.taskId !== req.taskId || prior.href !== location.href ||
+        prior.root !== root || !sameItems(prior.names, names) || !evidenceMatches(root, names, prior.pixels)) {
+      return attachmentError('attachment-draft-conflict', names);
+    }
+    // Sites can clear their input after importing File objects. If files still
+    // exist, require identity with our selection, including every other picker.
+    for (const picker of root.querySelectorAll('input[type="file"]')) {
+      if (picker.files?.length && (picker !== prior.fileInput || !sameItems(Array.from(picker.files), prior.files))) {
+        return attachmentError('attachment-draft-conflict', names);
+      }
+    }
+    if (!sameItems(attachmentRoots(root), prior.nodes)) return attachmentError('attachment-draft-conflict', names);
+    if (uploadErrorVisible(root) || uploadBlocked(root, uploadPending)) {
+      return attachmentError('attachment-not-ready', names);
+    }
+    return null;
   }
 
   async function submit(state, message) {
@@ -1439,7 +1816,7 @@
     // 去重：同一 taskId 只提交一次，后续调用只读当前状态。
     const existing = state.records.get(req.taskId);
     if (existing) {
-      if (collapse(existing.prompt) !== collapse(req.prompt)) {
+      if (!sameItems(existing.imageNames || [], req.imageNames) || collapse(existing.prompt) !== collapse(req.prompt)) {
         return fail('task-id-conflict', { taskId: req.taskId });
       }
       if (existing.selectorSignature !== selectorSignature(req.selectors)) {
@@ -1482,7 +1859,7 @@
 
     // 刷新/丢状态后，最后一条用户消息已经等于本轮 prompt：多半是重复发送，失败关闭。
     if (users.length) {
-      const lastUser = collapse(userTextOf(users[users.length - 1]));
+      const lastUser = collapse(userTextOf(users[users.length - 1], req.prompt, req.imageNames));
       if (lastUser && lastUser === promptCollapsed) {
         return fail('prompt-already-sent', { historyUsers: users.length });
       }
@@ -1495,6 +1872,27 @@
     // 真正填入前再核对一次会话地址：上面算摘要/等控件期间用户可能已经换窗口。
     const beforeFill = conversationGate(req.scope, 'pre-fill');
     if (beforeFill) return beforeFill;
+    let preparation;
+    if (req.images) {
+      preparation = await prepareImages(state, req, input, editorAttachmentArea(input, req));
+      if (!preparation.ok) return preparation;
+      // Uploads and pixel checks can take time. Revalidate the complete draft
+      // and page immediately before a write, including user navigation/edits.
+      const changedPage = conversationGate(req.scope, 'pre-fill');
+      if (changedPage) return changedPage;
+      if (!input.isConnected || resolveUnique(req.selectors, 'input', null, { requireVisible: true }).value !== input ||
+          !elementEnabled(input) || input.readOnly || composerText(composerRoot(input)) !== draft ||
+          listNodes(req.selectors.user, container).length !== users.length ||
+          listNodes(req.selectors.answer, container).length !== answers.length) {
+        return attachmentError('attachment-draft-conflict', req.imageNames);
+      }
+    } else if (req.imageNames.length && draftCollapsed !== promptCollapsed) {
+      // After the native scheduler authorizes sending, writing a removed or
+      // changed question would overwrite a user's intervention.
+      return attachmentError('attachment-draft-conflict', req.imageNames);
+    }
+    const fileDraftError = checkImageDraft(state, req, input);
+    if (fileDraftError) return fileDraftError;
     let filled = false;
     if (draftCollapsed !== promptCollapsed) {
       const write = setComposerValue(input, req.prompt);
@@ -1511,8 +1909,12 @@
       }
     }
 
-    const sendRes = await waitForSend(req.selectors, req.options);
+    // Image preparation fills the question and waits without clicking.
+    // Only after that result can Swift re-check pause, takeover and task ID.
+    const sendRes = await waitForSend(req.selectors, req.imageNames.length && !preparation
+      ? { ...req.options, sendEnableMs: 0 } : req.options);
     if (sendRes.error) {
+      if (req.imageNames.length) return attachmentError('attachment-not-ready', req.imageNames);
       if (filled && sendRes.error.error === 'send-pending') sendRes.error.detail.composerFilled = true;
       return sendRes.error;
     }
@@ -1535,6 +1937,13 @@
     // 对话；只要不是本席核验过的地址就停在这里（不点、不建基线、不重发）。
     const beforeClick = conversationGate(req.scope, 'pre-click');
     if (beforeClick) return beforeClick;
+    if (resolveUnique(req.selectors, 'input', null, { requireVisible: true }).value !== input) {
+      return fail('draft-conflict', { phase: 'pre-click', clickAttempted: false });
+    }
+    const changedImages = checkImageDraft(state, req, input);
+    if (changedImages) return changedImages;
+    if (preparation) return preparation;
+    if (req.imageNames.length) req.imagePixels = state.imageDraft.pixels;
 
     // 点击前记录基线：此后只认新节点。
     const baseline = snapshotHistory(req.selectors, container);
@@ -1542,6 +1951,8 @@
       taskId: req.taskId,
       prompt: req.prompt,
       promptCollapsed: promptCollapsed,
+      imageNames: req.imageNames,
+      imagePixels: req.imagePixels,
       selectorSignature: selectorSignature(req.selectors),
       selectors: req.selectors,
       baseline: baseline,
@@ -1579,6 +1990,7 @@
 
     const located = await waitForUserTurn(record, req.selectors, container, req.options);
     if (located.error) {
+      if (located.error.error === 'attachment-receipt-mismatch') return located.error;
       return fail('submit-unconfirmed', {
         cause: located.error.error, possiblySubmitted: true, clickAttempted: true,
       });
@@ -1604,6 +2016,7 @@
       });
     }
 
+    state.imageDraft = null;
     record.verified = true;
     record.verifiedAt = Date.now();
     const stop = optionalSignal(req.selectors, 'stop', null);
@@ -1614,6 +2027,7 @@
       detail: {
         taskId: req.taskId,
         filled: filled,
+        ...(req.imageNames.length && { verifiedImageNames: req.imageNames }),
         draftReplaced: draftReplaced ? 'known-old-prompt' : undefined,
         userTurnIndex: located.value.index,
         userTurnMatches: located.value.matchCount,
@@ -1745,7 +2159,7 @@
     // 已完成的任务保持幂等；但只对完成时所在的那个地址生效。同源换址
     // （首页 → 临时路由 → 正式对话）之后必须在新页面上重新核对本轮用户
     // 消息和对应回答，不能把上一地址的缓存正文直接当作本页结果。
-    if (record.completedText != null && record.completedHref === location.href) {
+    if (!record.imageNames?.length && record.completedText != null && record.completedHref === location.href) {
       return reply('done', {
         text: record.completedText,
         detail: {
@@ -1759,7 +2173,7 @@
       });
     }
 
-    const located = locateUserTurn(record, selectors, container, options);
+    const located = await locateUserTurn(record, selectors, container, options);
     if (located.error) return located.error;
     if (!located.turn) {
       const stop = optionalSignal(selectors, 'stop', null);
@@ -1810,8 +2224,11 @@
     }
     if (sampled.error) return sampled.error;
     if (!located.turn.node.isConnected ||
-        collapse(userTextOf(located.turn.node, record.promptCollapsed)) !== record.promptCollapsed) {
+        collapse(userTextOf(located.turn.node, record.promptCollapsed, record.imageNames)) !== record.promptCollapsed) {
       return unknown('history-changed', {reason: 'user-turn-changed-during-sampling'});
+    }
+    if (record.imageNames?.length && !evidenceMatches(receiptArea(located.turn.node, selectors), record.imageNames, record.imagePixels)) {
+      return fail('attachment-receipt-mismatch', { possiblySubmitted: true, clickAttempted: true });
     }
     if (sampled.done) {
       record.completedText = sampled.text;
@@ -1869,7 +2286,7 @@
     let located = null;
     let waitedMs = 0;
     while (true) {
-      located = locateUserTurn(record, selectors, container, options);
+      located = await locateUserTurn(record, selectors, container, options);
       if (located.error) return { error: located.error };
       waitedMs = Date.now() - startedAt;
       if (located.turn && located.matchCount === 1) break;
@@ -1981,6 +2398,8 @@
       taskId: req.taskId,
       prompt: prompt,
       promptCollapsed: collapse(prompt),
+      imageNames: req.imageNames,
+      imagePixels: req.imagePixels,
       selectorSignature: selectorSignature(req.selectors),
       selectors: req.selectors,
       baseline: {
@@ -2025,7 +2444,7 @@
     const users = listNodes(selectors.user, container);
     if (!users.length) return { pending: true };
     const items = users.map((node, index) => {
-      const raw = userTextOf(node, record.promptCollapsed);
+      const raw = userTextOf(node, record.promptCollapsed, record.imageNames);
       return {
         node: node,
         index: index,
@@ -2127,6 +2546,7 @@
         hint: '页面刷新或换了标签后驱动不保留任务；请打开原页人工接管，不能靠猜。',
       });
     }
+    if (!sameItems(record.imageNames || [], req.imageNames)) return fail('task-id-conflict', { field: 'imageNames' });
     if (record.selectorSignature !== selectorSignature(req.selectors)) {
       return fail('selector-changed', { taskId: req.taskId });
     }
@@ -2273,6 +2693,7 @@
         })),
       reset: () => {
         state.records.clear();
+        state.imageDraft = null;
         return true;
       },
     };

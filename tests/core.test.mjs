@@ -87,6 +87,43 @@ function voteAll(session, stances, texts) {
 // createSession
 // ---------------------------------------------------------------------------
 
+test('opening materials freeze in order and the report distinguishes verified, manual and pending delivery', () => {
+  const image = { id: 'one', kind: 'image', name: '图_a.png', mediaType: 'image/png', byteCount: 150, sha256: 'a'.repeat(64) };
+  const text = { id: 'two', kind: 'text', name: 'sample.md', mediaType: 'text/markdown', byteCount: 13, sha256: 'b'.repeat(64), text: 'FILE CONTENTS' };
+  const secondImage = { ...image, id: 'three', name: 'second.jpg', mediaType: 'image/jpeg' };
+  const files = [image, text, secondImage];
+  let session = createSession(QUESTION, [...PROVIDERS, 'gemini'], { attachments: files });
+  const opening = session.tasks[0].prompt;
+  assert.deepEqual(session.attachments.map((file) => file.id), ['one', 'two', 'three']);
+  assert.equal(Object.hasOwn(session.attachments[1], 'text'), false);
+  assert.match(opening, /图 1 · 图_a.png[\s\S]+FILE CONTENTS[\s\S]+图 2 · second.jpg/u);
+  for (const task of session.tasks) {
+    assert.equal(task.prompt, opening);
+    assert.deepEqual(task.attachmentIDs, ['one', 'two', 'three']);
+  }
+  assert.throws(() => answerFor(session, 'chatgpt', '无回执'), /先核对/u);
+  session = applyAction(session, 'attachmentReceipt', { taskId: session.tasks[0].id, attachmentReceipt: 'verified' });
+  const earlyReport = applyAction(session, 'finish').report;
+  assert.match(earlyReport, /chatgpt：已在原页核对/);
+  assert.match(earlyReport, /claude：待核对/);
+  session = answerFor(session, 'chatgpt', '首席独立回答');
+  session = answerFor(session, 'claude', '第二席独立回答', { attachmentReceipt: 'manual' });
+  session = skipFor(session, 'gemini');
+  assert.equal(session.stage, 'critique');
+  for (const task of session.tasks) {
+    assert.equal(task.attachmentIDs, undefined);
+    assert.equal(task.prompt.includes('FILE CONTENTS'), false);
+  }
+  const final = applyAction(session, 'finish');
+  assert.match(final.report, /claude：已由用户核对/);
+  assert.match(final.report, /gemini：待核对（本席已跳过）/);
+  assert.equal(final.report.includes('图\\_a.png'), true);
+  assert.throws(() => createSession('x'.repeat(100000), PROVIDERS, { attachments: files }), /合计过长/u);
+  assert.throws(() => applyAction(start(), 'attachmentReceipt', {
+    taskId: 'invalid-id', attachmentReceipt: 'manual',
+  }));
+});
+
 test('createSession validates question, provider count, duplicates and canonical ids', () => {
   assert.throws(() => createSession('', PROVIDERS), /non-empty/);
   assert.throws(() => createSession('   ', PROVIDERS), /non-empty/);

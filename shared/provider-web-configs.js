@@ -40,6 +40,7 @@ const ADAPTERS = {
     label: 'ChatGPT',
     allowNavigation: true,
     selectors: {
+      attachmentComposer: ['form'],
       input: [
         'div.ProseMirror[contenteditable="true"]',
         '#prompt-textarea',
@@ -87,6 +88,7 @@ const ADAPTERS = {
     label: 'Gemini',
     allowNavigation: true,
     selectors: {
+      attachmentComposer: ['input-area-v2', '.input-area-container', 'form'],
       input: [
         'rich-textarea .ql-editor[contenteditable="true"]',
         'div.ql-editor[contenteditable="true"]',
@@ -173,6 +175,7 @@ const ADAPTERS = {
     label: 'DeepSeek',
     allowNavigation: true,
     selectors: {
+      attachmentComposer: [':has(> ._020ab5b)', 'form'],
       input: ['textarea[name="search"]', '#chat-input'],
       send: [
         '[role="button"].ds-button--primary.ds-button--circle:not(.ds-button--disabled)',
@@ -217,7 +220,7 @@ export const WEB_SITE_PROVIDER_IDS = Object.freeze(
   PUBLIC_AUTOMATION_PROVIDER_IDS.filter((id) => Object.prototype.hasOwnProperty.call(ADAPTERS, id)),
 );
 
-const SELECTOR_KEYS = ['input', 'send', 'user', 'answer', 'stop', 'done', 'container'];
+const SELECTOR_KEYS = ['input', 'send', 'user', 'answer', 'stop', 'done', 'container', 'attachmentComposer'];
 const REQUIRED_SELECTOR_KEYS = ['input', 'send', 'user', 'answer'];
 
 function adapterFor(provider) {

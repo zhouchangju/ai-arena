@@ -64,7 +64,7 @@
 选择、拖入或粘贴多张图，预览移除；按席检查支持情况，失败的附件可针对失败面板重试，部分自定义站支持纯文本降级。
 
 - **参照版复核**　导入两张图，删一张；造一席图片失败，核对再次填写的对象与图片数量。
-- **自用版取舍**　后续。
+- **自用版取舍**　桌面开场支持多图。单席缺图时交给用户核对。[试用指引](try-it.md#带图或文件提问)
 - **验证**　两席分别支持与不支持图片时清楚显示实际交付；重试不重复附上已成功的图片。
 - **源码**　[multi-panel.js](https://github.com/Manho/Panelize/blob/e6d15b4f1e8222de02c770c6d5d78898252f8301/multi-panel/multi-panel.js) · [text-injection-all-providers.js](https://github.com/Manho/Panelize/blob/e6d15b4f1e8222de02c770c6d5d78898252f8301/content-scripts/text-injection-all-providers.js) · [panel-action-results.js](https://github.com/Manho/Panelize/blob/e6d15b4f1e8222de02c770c6d5d78898252f8301/modules/panel-action-results.js)
 

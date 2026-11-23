@@ -5,6 +5,7 @@ import SwiftUI
 struct ArenaReportReader: View {
     let session: [String: Any]?
     let ballot: [String: Any]?
+    @ObservedObject var model: ArenaModel
     @State private var showCandidate = false
     @State private var showQuestion = false
     @State private var showSources = false
@@ -208,6 +209,7 @@ struct ArenaReportReader: View {
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
 
+            if showQuestion { ArenaSavedMaterials(model: model) }
             Text(verbatim: question)
                 .font(.system(size: 16))
                 .lineSpacing(4)

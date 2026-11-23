@@ -222,6 +222,16 @@ export function createSession(question, providers, options) {
     updatedAt: Date.now(),
   };
 
+  const attachments = options?.attachments ?? [];
+  if (!Array.isArray(attachments)) throw new Error('附件清单无效');
+  const opening = independentPrompt(question, attachments);
+  if (attachments.length) {
+    if (opening.length > 100000) throw new Error('题面与附件正文合计过长，请缩短后再开始');
+    // Only the actual opening prompts keep inline file bodies. The manifest
+    // is small and records the exact file identity independently of answers.
+    session.attachments = attachments.map(({ text, ...metadata }) => metadata);
+  }
+
   for (const provider of session.providers) {
     session.tasks.push(
       makeTask(
@@ -231,7 +241,7 @@ export function createSession(question, providers, options) {
         provider,
         // R02: every seat must receive the exact same opening prompt.
         // Seat identity lives on the task/record, never in this text.
-        independentPrompt(question),
+        opening,
       ),
     );
   }
@@ -305,6 +315,14 @@ export function applyAction(session, action, payload = {}) {
     return next;
   }
 
+  if (action === 'attachmentReceipt') {
+    const task = requireCurrentTask(next, payload.taskId);
+    if (task.status !== 'pending') throw new Error('附件核对任务已经结束');
+    recordAttachmentReceipt(next, task, payload.attachmentReceipt);
+    touch(next, session);
+    return next;
+  }
+
   if (action === 'correct') {
     if (session.stage === 'done') {
       throw new Error('session is done; no further corrections are accepted');
@@ -339,6 +357,15 @@ export function applyAction(session, action, payload = {}) {
 // ---------------------------------------------------------------------------
 // Actions
 // ---------------------------------------------------------------------------
+
+function recordAttachmentReceipt(session, task, receipt) {
+  if (session.stage !== 'independent' || !task.attachmentIDs?.length ||
+      (receipt !== 'verified' && receipt !== 'manual')) {
+    throw new Error('附件核对记录无效');
+  }
+  // Keep a stronger, original-page receipt if a human later takes over.
+  if (task.attachmentReceipt !== 'verified') task.attachmentReceipt = receipt;
+}
 
 function actAnswer(session, payload) {
   const task = requireCurrentTask(session, payload.taskId);
@@ -415,6 +442,12 @@ function actAnswer(session, payload) {
     }
   }
 
+  if (payload.attachmentReceipt !== undefined) {
+    recordAttachmentReceipt(session, task, payload.attachmentReceipt);
+  }
+  if (task.attachmentIDs?.length && !['verified', 'manual'].includes(task.attachmentReceipt)) {
+    throw new Error('请先核对本席收到的全部开场材料');
+  }
   task.status = 'answered';
   task.answer = text;
   // Kept apart from any later correction: the submission time never changes
@@ -933,6 +966,10 @@ function makeTask(session, stage, round, provider, prompt) {
     sourceId: allocateSourceId(session),
   };
 
+  if (stage === 'independent' && session.attachments?.length) {
+    task.attachmentIDs = session.attachments.map((file) => file.id);
+  }
+
   if (notes.length > 0) {
     task.guidanceSeqs = notes.map((note) => note.seq);
     for (const note of notes) {
@@ -1056,11 +1093,23 @@ export function proposalDigest(proposal) {
 // Prompts
 // ---------------------------------------------------------------------------
 
-function independentPrompt(question) {
+function independentPrompt(question, attachments) {
+  const materials = [];
+  let imageNumber = 0;
+  for (const file of attachments) {
+    if (file.kind === 'image') {
+      materials.push(`图 ${++imageNumber} · ${file.name}`);
+    } else if (file.kind === 'text' && typeof file.text === 'string') {
+      materials.push(`文本附件 · ${file.name}（以下为文件正文）\n${file.text}\n【文件正文结束】`);
+    } else {
+      throw new Error('附件格式无效');
+    }
+  }
   return [
     '【原始问题】',
     question,
     '',
+    ...(materials.length ? ['【本场附件】', ...materials, ''] : []),
     '你是本次讨论的独立席位。这是独立作答轮，你看不到其他席位的回答，其他席位也看不到你的回答。',
     '请直接回答上面的问题，并写清：',
     '1. 你的明确判断与主要理由；',
@@ -1411,6 +1460,27 @@ function buildReport(session, reason) {
     lines.push(`> ${line}`);
   }
   lines.push('');
+
+  if (session.attachments?.length) {
+    lines.push('## 开场附件', '');
+    let imageNumber = 0;
+    for (const file of session.attachments) {
+      const method = file.kind === 'image' ? `图 ${++imageNumber} · 原图` : '文本 · 随题面发送';
+      // A Finder filename can itself contain Markdown.
+      const name = file.name.replace(/[\\`*_{}\[\]()<>!|~]/g, '\\$&');
+      lines.push(`- ${name}（${method}，${file.byteCount} 字节）`);
+    }
+    lines.push('', '首轮材料核对', '');
+    for (const provider of session.providers) {
+      const task = history.find((item) => item.stage === 'independent' && item.provider === provider);
+      let status = '待核对';
+      if (task?.attachmentReceipt === 'verified') status = '已在原页核对';
+      else if (task?.attachmentReceipt === 'manual') status = '已由用户核对';
+      if (task?.status === 'skipped') status += '（本席已跳过）';
+      lines.push(`- ${provider}：${status}`);
+    }
+    lines.push('');
+  }
 
   const guidance = orderedGuidance(session);
   if (guidance.length > 0) {

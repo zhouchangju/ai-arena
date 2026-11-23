@@ -261,7 +261,9 @@ struct ArenaRootView: View {
     @State private var seatHint: String?
     @State private var hintTask: Task<Void, Never>?
 
-    @FocusState private var questionFocused: Bool
+    @State private var questionFocused = false
+    @State private var questionFocusRequest = 0
+    @State private var previewAttachment: ArenaDraftAttachment?
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -287,9 +289,6 @@ struct ArenaRootView: View {
             model.prepareHome()
             if model.isRecovering && model.stageKey == "done" && !SmokeRunner.isEnabled {
                 presentDetails(provider: nil, tab: .report)
-            }
-            if !hasStarted {
-                questionFocused = true
             }
             SmokeRunner.shared.begin(model: model)
         }
@@ -555,22 +554,28 @@ struct ArenaRootView: View {
                     .padding(.top, 3)
                     .accessibilityHidden(true)
 
-                TextField(
-                    "你想让它们讨论什么？",
-                    text: $model.question,
-                    axis: .vertical
-                )
-                .textFieldStyle(.plain)
-                .font(.system(size: 15))
-                .lineLimit(3...7)
-                .focused($questionFocused)
-                .accessibilityLabel("讨论问题")
-                .help("⌘↩ 开始讨论")
+                ZStack(alignment: .topLeading) {
+                    if model.question.isEmpty {
+                        Text(model.draftAttachments.isEmpty ? "你想让它们讨论什么？" : "希望各席结合这些附件讨论什么？")
+                            .font(.system(size: 15))
+                            .foregroundStyle(.tertiary)
+                            .accessibilityHidden(true)
+                            .allowsHitTesting(false)
+                    }
+                    ArenaQuestionEditor(
+                        text: $model.question,
+                        focusRequest: questionFocusRequest,
+                        onFocus: { questionFocused = $0 },
+                        onMaterials: acceptMaterials,
+                        onError: { model.errorMessage = $0 },
+                        onStart: startDiscussion
+                    )
+                }
 
                 if model.question.trimmedNonEmpty != nil {
                     Button {
                         model.question = ""
-                        questionFocused = true
+                        questionFocusRequest += 1
                     } label: {
                         Image(systemName: "xmark.circle.fill")
                             .font(.system(size: 14))
@@ -585,10 +590,13 @@ struct ArenaRootView: View {
             }
             .padding(.bottom, 2)
 
+            if !model.draftAttachments.isEmpty { draftMaterials }
+
             Divider().opacity(0.45)
 
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 12) {
+                    addMaterialsButton
                     seatChips
                     roundPicker
                     Spacer(minLength: 8)
@@ -596,6 +604,7 @@ struct ArenaRootView: View {
                 }
                 VStack(alignment: .leading, spacing: 9) {
                     HStack(spacing: 12) {
+                        addMaterialsButton
                         seatChips
                         roundPicker
                     }
@@ -619,6 +628,63 @@ struct ArenaRootView: View {
         )
         .shadow(color: .black.opacity(reduceTransparency ? 0 : 0.05), radius: 8, y: 2)
         .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: questionFocused)
+        .sheet(item: $previewAttachment) { item in
+            ArenaMaterialPreview(item: item) { previewAttachment = nil }
+        }
+    }
+
+    private var addMaterialsButton: some View {
+        Button {
+            let panel = NSOpenPanel()
+            panel.title = "添加附件"
+            panel.prompt = "添加"
+            panel.allowsMultipleSelection = true
+            panel.canChooseDirectories = false
+            panel.allowedContentTypes = ["png", "jpg", "jpeg", "txt", "md", "csv"].compactMap {
+                UTType(filenameExtension: $0)
+            }
+            guard panel.runModal() == .OK else { return }
+            do {
+                // Validate each addition before reading more selected files.
+                var files: [ArenaDraftAttachment] = []
+                for url in panel.urls {
+                    files.append(try ArenaDraftAttachment(fileURL: url))
+                    try ArenaDraftAttachment.validate(model.draftAttachments + files)
+                }
+                _ = acceptMaterials(files)
+            } catch { model.errorMessage = error.localizedDescription }
+        } label: {
+            Label("添加附件", systemImage: "paperclip")
+        }
+        .help("可将图片或文件拖入提问框，也可按 ⌘V 粘贴。支持 PNG、JPEG、TXT、MD、CSV。")
+    }
+
+    private func acceptMaterials(_ files: [ArenaDraftAttachment]) -> Bool {
+        let oldCount = model.draftAttachments.count
+        model.addDraftAttachments(files)
+        return model.draftAttachments.count == oldCount + files.count
+    }
+
+    private var draftMaterials: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ScrollView(.horizontal) {
+                HStack(spacing: 6) {
+                    ForEach(model.draftAttachments) { item in
+                        let preceding = model.draftAttachments.prefix { $0.id != item.id }
+                        let imageNumber = preceding.filter { $0.kind == .image }.count + 1
+                        ArenaDraftAttachmentChip(
+                            item: item,
+                            label: item.kind == .image ? "图 \(imageNumber)" : item.name,
+                            onPreview: { previewAttachment = item },
+                            onRemove: { model.draftAttachments.removeAll { $0.id == item.id } }
+                        )
+                    }
+                }
+            }
+            Text("题面和附件将发送给 " + ArenaSeatCatalog.ordered.filter(selectedProviders.contains)
+                .map(ArenaSeatCatalog.name).joined(separator: "、"))
+                .font(.caption).foregroundStyle(.secondary)
+        }
     }
 
     private var seatChips: some View {
@@ -743,6 +809,13 @@ struct ArenaRootView: View {
             }
 
             Spacer(minLength: 8)
+            if let files = model.session?["attachments"] as? [[String: Any]], !files.isEmpty {
+                Button {
+                    presentDetails(provider: nil, tab: .prompts)
+                } label: { Label("\(files.count)", systemImage: "paperclip") }
+                .help("查看本场附件和逐席送达记录")
+                .accessibilityLabel("查看 \(files.count) 个附件")
+            }
 
             Button {
                 arenaCopyToPasteboard(lockedQuestion)
@@ -859,7 +932,7 @@ struct ArenaRootView: View {
                 VStack(spacing: 0) {
                     readOnlyBanner
                     if ArenaSessionDigest.report(saved) != nil {
-                        ArenaReportReader(session: saved, ballot: model.reportBallot())
+                        ArenaReportReader(session: saved, ballot: model.reportBallot(), model: model)
                             .id(ArenaSessionDigest.id(saved))
                     } else {
                         Text("该场次尚未生成报告，可在详情中查阅已保存的发言。")
@@ -1024,7 +1097,7 @@ struct ArenaRootView: View {
         ArenaBackfillWindowController.shared.close()
         model.newDiscussion()
         model.prepareHome()
-        DispatchQueue.main.async { questionFocused = true }
+        questionFocusRequest += 1
     }
 
     private func continueSaved(_ id: String) {
@@ -1926,6 +1999,7 @@ struct ArenaDetailsWindowView: View {
                     text: questionText,
                     copyLabel: "复制问题"
                 )
+                ArenaSavedMaterials(model: model)
 
                 VStack(alignment: .leading, spacing: 10) {
                     providerPickerRow
@@ -2082,7 +2156,7 @@ struct ArenaDetailsWindowView: View {
     @ViewBuilder
     private var reportView: some View {
         if report != nil {
-            ArenaReportReader(session: model.session, ballot: model.reportBallot())
+            ArenaReportReader(session: model.session, ballot: model.reportBallot(), model: model)
                 .id(sessionIdentity)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if let reason = ArenaSessionDigest.stopReason(session) {
@@ -2209,6 +2283,7 @@ final class ArenaBackfillDraft: ObservableObject {
     @Published var error = ""
     @Published var note: String?
     @Published var noteIsWarning = false
+    @Published var attachmentsConfirmed = false
 
     private(set) var target: ArenaManualTarget?
 
@@ -2219,6 +2294,7 @@ final class ArenaBackfillDraft: ObservableObject {
         stance = ""
         error = ""
         target = model.manualTarget(for: provider)
+        attachmentsConfirmed = false
         if prefill.isPartial {
             note = "以下为流式预览片段，尚未确认完成；请先核对原页，再修改后提交。"
             noteIsWarning = true
@@ -2271,6 +2347,10 @@ struct ArenaBackfillView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            if model.requiresManualAttachmentConfirmation(for: draft.provider) {
+                Toggle("已在本席原页核对本轮问题和全部附件", isOn: $draft.attachmentsConfirmed)
+            }
+
             if let note = draft.note {
                 Text(note)
                     .font(.system(size: 12))
@@ -2316,7 +2396,8 @@ struct ArenaBackfillView: View {
                 Button("提交补录") { submit() }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
-                    .disabled(draft.text.trimmedNonEmpty == nil || draft.target == nil)
+                    .disabled(draft.text.trimmedNonEmpty == nil || draft.target == nil
+                        || (model.requiresManualAttachmentConfirmation(for: draft.provider) && !draft.attachmentsConfirmed))
             }
         }
         .padding(14)
@@ -2333,7 +2414,8 @@ struct ArenaBackfillView: View {
             draft.provider,
             text: text,
             stance: draft.stance.trimmedNonEmpty,
-            expected: target
+            expected: target,
+            attachmentsConfirmed: draft.attachmentsConfirmed
         )
         guard accepted else {
             draft.error = model.errorMessage.trimmedNonEmpty ?? "回答未采用，草稿已保留"
@@ -2411,6 +2493,61 @@ final class ArenaBackfillWindowController: NSObject, NSWindowDelegate {
     }
 }
 
+/// The manifest belongs to the saved opening question. Loading a preview
+/// verifies the archived file first, so a missing/replaced original is visible.
+struct ArenaSavedMaterials: View {
+    @ObservedObject var model: ArenaModel
+    @State private var preview: ArenaDraftAttachment?
+    @State private var previewError: String?
+
+    private var records: [[String: Any]] { model.sessionAttachments }
+
+    var body: some View {
+        if !records.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("开场附件（\(records.count)）").font(.subheadline.weight(.semibold))
+                ForEach(Array(records.indices), id: \.self) { index in
+                    let record = records[index]
+                    let name = record["name"] as? String ?? "附件"
+                    let isText = record["kind"] as? String == "text"
+                    HStack(spacing: 12) {
+                        Button {
+                            do {
+                                let url = try model.attachmentURL(record)
+                                preview = try ArenaDraftAttachment(fileURL: url)
+                                previewError = nil
+                            } catch { previewError = error.localizedDescription }
+                        } label: {
+                            Label("\(index + 1). \(name)" + (isText ? "（以文本发送）" : ""),
+                                  systemImage: isText ? "doc.plaintext" : "photo")
+                        }.buttonStyle(.link)
+                        Button {
+                            do {
+                                let url = try model.attachmentURL(record)
+                                NSWorkspace.shared.activateFileViewerSelecting([url])
+                                previewError = nil
+                            } catch { previewError = error.localizedDescription }
+                        } label: {
+                            Image(systemName: "folder")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("在 Finder 中显示")
+                        .accessibilityLabel("在 Finder 中显示" + name)
+                    }
+                }
+                if let previewError { Text(verbatim: previewError).foregroundStyle(.orange) }
+                ForEach(ArenaSessionDigest.participants(model.session), id: \.self) { provider in
+                    if let summary = model.attachmentDeliverySummary(for: provider) {
+                        Text("\(ArenaSeatCatalog.name(provider)) · \(summary)").foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .font(.callout)
+            .sheet(item: $preview) { item in ArenaMaterialPreview(item: item) { preview = nil } }
+        }
+    }
+}
+
 // MARK: - Markdown 导出
 
 
@@ -2467,6 +2604,24 @@ enum ArenaExporter {
         lines.append("")
         lines.append((session?["question"] as? String) ?? model.question)
         lines.append("")
+        if let attachments = session?["attachments"] as? [[String: Any]], !attachments.isEmpty {
+            lines.append("### 开场附件")
+            lines.append("")
+            for (index, record) in attachments.enumerated() {
+                let name = record["name"] as? String ?? "附件"
+                let kind = record["kind"] as? String == "text" ? "以文本发送" : "图片"
+                let longestRun = name.split(whereSeparator: { $0 != "`" }).map(\.count).max() ?? 0
+                let ticks = String(repeating: "`", count: longestRun + 1)
+                lines.append("\(index + 1). \(ticks) \(name) \(ticks)（\(kind)）")
+            }
+            lines.append("")
+            for provider in providers {
+                if let summary = model.attachmentDeliverySummary(for: provider) {
+                    lines.append("- \(ArenaSeatCatalog.name(provider)) · \(summary)")
+                }
+            }
+            lines.append("")
+        }
         lines.append("## 参与者与状态")
         lines.append("")
         lines.append("| 席位 | 站点 | 状态 |")
@@ -2714,6 +2869,7 @@ final class SmokeRunner {
             exit(0)
         }
         if CommandLine.arguments.contains("--smoke-prepare-recovery") {
+            loadFixtureAttachments(model: model, path: resultPath)
             await runPrepareRecovery(model: model, resultPath: resultPath, timeout: timeout)
             return
         }
@@ -2740,8 +2896,10 @@ final class SmokeRunner {
             exit(0)
         }
 
+        loadFixtureAttachments(model: model, path: resultPath)
         let question = "【冒烟测试】如果只有两个周末，个人笔记工具应先做移动端采集，还是先补桌面检索？请给出判断和一个可验证的理由。"
         model.question = question
+        await captureComposerIfRequested()
         Self.writeStderr("[smoke] panes ready; starting discussion")
         model.start(SmokeRunner.providers)
 
@@ -2783,6 +2941,49 @@ final class SmokeRunner {
         exit(1)
     }
 
+    /// Snapshot only the isolated QA app window, after the actual composer
+    /// has rendered the imported draft and before its dispatch starts.
+    @MainActor
+    private func captureComposerIfRequested() async {
+        guard let path = ProcessInfo.processInfo.environment["ARENA_SMOKE_COMPOSER_CAPTURE"]?.trimmedNonEmpty else { return }
+        try? await Task.sleep(nanoseconds: 800_000_000)
+        do {
+            guard let content = NSApp.windows.first(where: { $0.title == "AI Arena" })?.contentView,
+                  let bitmap = content.bitmapImageRepForCachingDisplay(in: content.bounds) else {
+                throw ArenaEngineError("无法取得验收应用的工作台")
+            }
+            content.layoutSubtreeIfNeeded()
+            content.cacheDisplay(in: content.bounds, to: bitmap)
+            guard let png = bitmap.representation(using: .png, properties: [:]) else {
+                throw ArenaEngineError("无法生成提问区验收截图")
+            }
+            try png.write(to: URL(fileURLWithPath: path), options: .atomic)
+        } catch {
+            Self.writeStderr("[smoke] " + error.localizedDescription)
+            exit(2)
+        }
+    }
+
+    @MainActor
+    private func loadFixtureAttachments(model: ArenaModel, path: String) {
+        guard let dir = ProcessInfo.processInfo.environment["ARENA_SMOKE_ATTACHMENT_DIR"]?.trimmedNonEmpty else { return }
+        do {
+            let urls = try FileManager.default.contentsOfDirectory(at: URL(fileURLWithPath: dir),
+                                                                  includingPropertiesForKeys: nil,
+                                                                  options: .skipsHiddenFiles)
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            let files = try urls.map { try ArenaDraftAttachment(fileURL: $0) }
+            model.addDraftAttachments(files)
+            guard !files.isEmpty, model.draftAttachments.count == files.count else {
+                throw ArenaEngineError(model.errorMessage.trimmedNonEmpty ?? "验收附件为空")
+            }
+        } catch {
+            writeDiagnostics(path: path, reason: "fixture-attachment-import", detail: error.localizedDescription,
+                             model: model, extra: [:])
+            exit(2)
+        }
+    }
+
     /// First half of the isolated continuation check: start a normal
     /// discussion on the fixture pages and stop as soon as two first-round
     /// answers are recorded and the third seat is stuck before send with a
@@ -2791,6 +2992,7 @@ final class SmokeRunner {
     private func runPrepareRecovery(model: ArenaModel, resultPath: String, timeout: Double) async {
         let question = "【恢复验收】如果只有两个周末，个人笔记工具应先做移动端采集，还是先补桌面检索？请给出判断和一个可验证的理由。"
         model.question = question
+        await captureComposerIfRequested()
         Self.writeStderr("[smoke] preparing a two-answered, one-prepared first round")
         model.start(SmokeRunner.providers)
 

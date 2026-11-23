@@ -17,6 +17,7 @@
 
 import CryptoKit
 import Foundation
+import ImageIO
 import JavaScriptCore
 
 // MARK: - Errors
@@ -66,6 +67,128 @@ struct ArenaSiteConfig {
     var homeHref: String { url.absoluteString }
 }
 
+// MARK: - Opening attachments
+
+struct ArenaDraftAttachment: Identifiable {
+    enum Kind: String { case image, text }
+
+    static let maxCount = 8
+    static let maxImageBytes = 8 * 1024 * 1024
+    static let maxTextBytes = 24 * 1024
+    static let maxTotalBytes = 24 * 1024 * 1024
+
+    let id = UUID().uuidString
+    let name: String
+    let kind: Kind
+    let mediaType: String
+    let data: Data
+    let text: String?
+    let sha256: String
+
+    init(fileURL: URL) throws {
+        guard fileURL.isFileURL else { throw ArenaEngineError("请选择本地文件") }
+        let metadata = try fileURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+        guard metadata.isRegularFile == true else { throw ArenaEngineError("请选择普通文件") }
+        let limit = try Self.format(fileURL.lastPathComponent).limit
+        guard let size = metadata.fileSize, size <= limit else {
+            throw ArenaEngineError("文件过大：\(fileURL.lastPathComponent)")
+        }
+        // Bound the read even if another app replaces/grows the file after stat.
+        let handle = try FileHandle(forReadingFrom: fileURL)
+        defer { try? handle.close() }
+        let bytes = try handle.read(upToCount: limit + 1) ?? Data()
+        try self.init(name: fileURL.lastPathComponent, data: bytes)
+    }
+
+    init(name: String, data: Data) throws {
+        guard Self.safeName(name) else { throw ArenaEngineError("附件名称无效，请先重命名") }
+        let format = try Self.format(name)
+        guard !data.isEmpty, data.count <= format.limit else {
+            throw ArenaEngineError("文件为空或超过上限：\(name)")
+        }
+        if format.kind == .text {
+            guard let text = String(data: data, encoding: .utf8), !text.contains("\0") else {
+                throw ArenaEngineError("文本附件须使用 UTF-8 编码：\(name)")
+            }
+            self.text = text
+        } else {
+            guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+                  let sourceType = CGImageSourceGetType(source) as String?,
+                  sourceType == (format.mediaType == "image/png" ? "public.png" : "public.jpeg"),
+                  CGImageSourceGetStatus(source) == .statusComplete,
+                  let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+                  let width = properties[kCGImagePropertyPixelWidth] as? Int,
+                  let height = properties[kCGImagePropertyPixelHeight] as? Int,
+                  width > 0, height > 0, width <= 40_000_000 / height else {
+                throw ArenaEngineError("图片格式无效或超过 4000 万像素：\(name)")
+            }
+            self.text = nil
+        }
+        self.name = name
+        self.kind = format.kind
+        self.mediaType = format.mediaType
+        self.data = data
+        self.sha256 = Self.digest(data)
+    }
+
+    static func validate(_ items: [ArenaDraftAttachment]) throws {
+        guard items.count <= maxCount else { throw ArenaEngineError("每场最多添加 8 个附件") }
+        guard Set(items.map(\.id)).count == items.count else { throw ArenaEngineError("附件记录重复") }
+        guard items.reduce(0, { $0 + $1.data.count }) <= maxTotalBytes else {
+            throw ArenaEngineError("附件总量超过 24 MiB")
+        }
+        guard items.filter({ $0.kind == .text }).reduce(0, { $0 + $1.data.count }) <= maxTextBytes else {
+            throw ArenaEngineError("文本附件合计超过 24 KiB，请缩小材料范围")
+        }
+    }
+
+    fileprivate static func digest(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    fileprivate static func safeName(_ name: String) -> Bool {
+        !name.isEmpty && name.utf8.count <= 255 && name != "." && name != ".." &&
+            name.rangeOfCharacter(from: CharacterSet(charactersIn: "/\\:").union(.controlCharacters).union(.newlines)) == nil
+    }
+
+    private static func format(_ name: String) throws -> (kind: Kind, mediaType: String, limit: Int) {
+        switch (name as NSString).pathExtension.lowercased() {
+        case "png": return (.image, "image/png", maxImageBytes)
+        case "jpeg", "jpg": return (.image, "image/jpeg", maxImageBytes)
+        case "txt": return (.text, "text/plain", maxTextBytes)
+        case "md": return (.text, "text/markdown", maxTextBytes)
+        case "csv": return (.text, "text/csv", maxTextBytes)
+        default: throw ArenaEngineError("当前支持 PNG、JPEG、TXT、MD、CSV：\(name)")
+        }
+    }
+
+    /// Stable names in manifest, on disk and in the website's sent message.
+    /// Distinguish two screenshots with the same Finder name (case-insensitively).
+    static func inputRecords(_ items: [ArenaDraftAttachment]) throws -> [[String: Any]] {
+        try validate(items)
+        var names = Set<String>()
+        return items.map { item in
+            var name = item.name
+            var suffix = 2
+            while !names.insert(name.lowercased()).inserted {
+                let original = item.name as NSString
+                var stem = original.deletingPathExtension
+                let tail = "-\(suffix).\(original.pathExtension)"
+                while (stem + tail).utf8.count > 255 { stem.removeLast() }
+                name = stem + tail
+                suffix += 1
+            }
+            var record: [String: Any] = [
+                "id": item.id, "name": name, "kind": item.kind.rawValue, "mediaType": item.mediaType,
+                "byteCount": item.data.count, "sha256": item.sha256,
+            ]
+            if name != item.name { record["originalName"] = item.name }
+            if let text = item.text { record["text"] = text }
+            return record
+        }
+    }
+}
+
 // MARK: - Delivery intents
 
 /// A persisted statement of what the app intended to send, written *before*
@@ -102,6 +225,11 @@ struct ArenaDeliveryIntent: Codable, Equatable {
     /// The driver verified that it wrote this prompt before the send control
     /// became available. Older records can still prove ownership via a receipt.
     var composerFilled: Bool? = nil
+
+    var attachmentReceipt: String? = nil
+    var imagePreparationStarted: Bool? = nil
+    /// Positional SHA-256 proofs for anonymous page previews. Absent on older saves.
+    var imagePixelDigests: [String]? = nil
 }
 
 // MARK: - Persisted session file
@@ -193,6 +321,60 @@ final class ArenaSessionStore {
     private func fileURL(for id: String) -> URL? {
         guard validID(id) else { return nil }
         return root.appendingPathComponent("\(id).json", isDirectory: false)
+    }
+
+    /// Commit the whole ordered bundle before exposing the new session to dispatch.
+    /// The random staging directory lives beside the destination for an atomic rename.
+    func saveAttachments(_ items: [ArenaDraftAttachment], records: [[String: Any]], sessionID: String) throws {
+        guard !items.isEmpty else { return }
+        guard validID(sessionID), records.count == items.count else { throw ArenaEngineError("场次附件清单无效") }
+        let base = root.resolvingSymlinksInPath().appendingPathComponent("attachments", isDirectory: true)
+        guard base.resolvingSymlinksInPath().path == base.path else {
+            throw ArenaEngineError("附件保存目录异常")
+        }
+        try fileManager.createDirectory(at: base, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let staged = base.appendingPathComponent(".stage-" + UUID().uuidString, isDirectory: true)
+        try fileManager.createDirectory(at: staged, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        defer { try? fileManager.removeItem(at: staged) }
+        for (item, record) in zip(items, records) {
+            guard let name = record["name"] as? String, ArenaDraftAttachment.safeName(name),
+                  record["id"] as? String == item.id else { throw ArenaEngineError("附件清单不匹配") }
+            let folder = staged.appendingPathComponent(item.id, isDirectory: true)
+            try fileManager.createDirectory(at: folder, withIntermediateDirectories: false)
+            try item.data.write(to: folder.appendingPathComponent(name))
+        }
+        try fileManager.moveItem(at: staged, to: base.appendingPathComponent(sessionID, isDirectory: true))
+    }
+
+    func attachmentData(sessionID: String, attachment: [String: Any]) throws -> Data {
+        try verifiedAttachment(sessionID: sessionID, attachment: attachment).bytes
+    }
+
+    func attachmentURL(sessionID: String, attachment: [String: Any]) throws -> URL {
+        try verifiedAttachment(sessionID: sessionID, attachment: attachment).url
+    }
+
+    private func verifiedAttachment(sessionID: String, attachment: [String: Any]) throws -> (url: URL, bytes: Data) {
+        guard validID(sessionID), let id = attachment["id"] as? String,
+              UUID(uuidString: id) != nil, let name = attachment["name"] as? String,
+              ArenaDraftAttachment.safeName(name), let expected = attachment["sha256"] as? String,
+              let count = attachment["byteCount"] as? Int, (1...ArenaDraftAttachment.maxImageBytes).contains(count) else {
+            throw ArenaEngineError("保存的附件清单无效")
+        }
+        let url = root.resolvingSymlinksInPath().appendingPathComponent("attachments")
+            .appendingPathComponent(sessionID).appendingPathComponent(id).appendingPathComponent(name)
+        guard url.resolvingSymlinksInPath().path == url.path,
+              let info = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+              info.isRegularFile == true, info.fileSize == count,
+              let file = try? FileHandle(forReadingFrom: url) else {
+            throw ArenaEngineError("附件丢失或已更改：\(name)")
+        }
+        defer { try? file.close() }
+        let bytes = try file.read(upToCount: count + 1) ?? Data()
+        guard bytes.count == count, ArenaDraftAttachment.digest(bytes) == expected else {
+            throw ArenaEngineError("附件内容已更改：\(name)")
+        }
+        return (url, bytes)
     }
 
     private var currentURL: URL {
@@ -343,9 +525,9 @@ final class ArenaCore {
         do {
             try evaluate(
                 """
-                globalThis.__arenaCreate = function (question, providersJSON, maxRounds) {
+                globalThis.__arenaCreate = function (question, providersJSON, maxRounds, attachmentsJSON) {
                   return JSON.stringify(
-                    createSession(question, JSON.parse(providersJSON), { maxRounds })
+                    createSession(question, JSON.parse(providersJSON), { maxRounds, attachments: JSON.parse(attachmentsJSON) })
                   );
                 };
                 globalThis.__arenaReportBallot = function (historyJSON) {
@@ -370,12 +552,13 @@ final class ArenaCore {
     func createSession(
         question: String,
         providers: [String],
-        maxRounds: Int
+        maxRounds: Int,
+        records: [[String: Any]]
     ) throws -> [String: Any] {
         let providersJSON = try Self.jsonString(providers)
         return try callBridge(
             "__arenaCreate",
-            arguments: [question, providersJSON, maxRounds],
+            arguments: [question, providersJSON, maxRounds, try Self.jsonString(records)],
             label: "createSession"
         )
     }
@@ -531,13 +714,19 @@ final class ArenaEngine {
     func createSession(
         question: String,
         providers: [String],
-        maxRounds: Int
+        maxRounds: Int,
+        attachments: [ArenaDraftAttachment] = []
     ) throws -> [String: Any] {
-        try loadedCore().createSession(
+        let records = try ArenaDraftAttachment.inputRecords(attachments)
+        let session = try loadedCore().createSession(
             question: question,
             providers: providers,
-            maxRounds: maxRounds
+            maxRounds: maxRounds,
+            records: records
         )
+        guard let id = session["id"] as? String else { throw ArenaEngineError("场次编号缺失") }
+        try store.saveAttachments(attachments, records: records, sessionID: id)
+        return session
     }
 
     func reportBallot(history: [[String: Any]]) throws -> [String: Any] {
@@ -767,7 +956,7 @@ final class ArenaEngine {
     private static func normalizeSelectors(_ raw: Any?) -> [String: Any]? {
         guard let dictionary = raw as? [String: Any] else { return nil }
         var result: [String: Any] = [:]
-        for key in ["input", "send", "user", "answer", "stop", "done", "container"] {
+        for key in ["input", "send", "user", "answer", "stop", "done", "container", "attachmentComposer"] {
             guard let value = dictionary[key] else { continue }
             var list: [String] = []
             if let single = value as? String {

@@ -960,6 +960,16 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
             message["prompt"] = prompt
         }
 
+        // Image bytes travel only with an explicit first-round upload preparation.
+        // Polling and reconciliation carry the ordered public filenames alone.
+        for key in ["images", "imageNames", "imagePixels", "prepareImagesOnly"] where source[key] != nil {
+            guard taskID.contains(":independent:"),
+                  (key == "imageNames" || key == "imagePixels" || normalizedType == "arena.web.submit") else {
+                throw SitePaneError.invalidCommand("附件只能随该席首轮问题准备和核对")
+            }
+            message[key] = source[key]
+        }
+
         if let rawDigests = source["knownDraftDigests"] {
             message["knownDraftDigests"] = try Self.normalizedDraftDigests(rawDigests)
         }
@@ -1260,6 +1270,27 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
     }
 
     // MARK: WKUIDelegate
+
+    func webView(_ webView: WKWebView,
+                 runOpenPanelWith parameters: WKOpenPanelParameters,
+                 initiatedByFrame frame: WKFrameInfo,
+                 completionHandler: @escaping ([URL]?) -> Void) {
+        guard let origin = site?.origin, frame.isMainFrame,
+              let frameURL = frame.request.url, Self.originString(frameURL) == origin,
+              let page = webView.url, Self.originString(page) == origin,
+              let window = webView.window, window.attachedSheet == nil else {
+            completionHandler(nil)
+            return
+        }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = parameters.allowsMultipleSelection
+        panel.beginSheetModal(for: window) { response in
+            let stillOnPage = webView.url.map { Self.documentLocationsMatch(page, $0) } == true
+            completionHandler(response == .OK && stillOnPage ? panel.urls : nil)
+        }
+    }
 
     func webView(_ webView: WKWebView,
                  createWebViewWith configuration: WKWebViewConfiguration,
@@ -1606,7 +1637,7 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
     }
 
     private static let selectorKeys: Set<String> = [
-        "input", "send", "user", "answer", "stop", "done", "container",
+        "input", "send", "user", "answer", "stop", "done", "container", "attachmentComposer",
     ]
     private static let requiredSelectorKeys: Set<String> = [
         "input", "send", "user", "answer",

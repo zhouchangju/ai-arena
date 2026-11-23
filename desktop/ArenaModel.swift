@@ -288,6 +288,50 @@ final class ArenaModel: ObservableObject {
     /// The question shown on the start screen.
     @Published var question: String = ""
 
+    @Published var draftAttachments: [ArenaDraftAttachment] = []
+
+    func addDraftAttachments(_ attachments: [ArenaDraftAttachment]) {
+        guard session == nil, !attachments.isEmpty else { return }
+        do {
+            let items = draftAttachments + attachments
+            try ArenaDraftAttachment.validate(items)
+            draftAttachments = items
+            errorMessage = ""
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Only material explicitly attached to this discussion is available here.
+    var sessionAttachments: [[String: Any]] {
+        session?["attachments"] as? [[String: Any]] ?? []
+    }
+
+    func attachmentURL(_ attachment: [String: Any]) throws -> URL {
+        guard let currentID,
+              let stored = sessionAttachments.first(where: {
+                  $0.arenaString("id") == attachment.arenaString("id")
+              }) else { throw ArenaEngineError("找不到本场附件") }
+        return try engine.store.attachmentURL(sessionID: currentID, attachment: stored)
+    }
+
+    func requiresManualAttachmentConfirmation(for provider: String) -> Bool {
+        stageKey == "independent" && !sessionAttachments.isEmpty && pendingTask(for: provider) != nil
+    }
+
+    func attachmentDeliverySummary(for provider: String) -> String? {
+        guard !sessionAttachments.isEmpty else { return nil }
+        let archived = session?["history"] as? [[String: Any]] ?? []
+        let task = archived.first {
+            $0.arenaString("stage") == "independent" && $0.arenaString("provider") == provider
+        } ?? (stageKey == "independent" ? currentTasks.first { $0.arenaString("provider") == provider } : nil)
+        switch task?.arenaString("attachmentReceipt") {
+        case "verified": return "原页已核对全部附件"
+        case "manual": return "已人工核对全部附件"
+        default: return task?.arenaString("status") == "skipped" ? "已跳过，附件送达未核实" : "附件送达待核对"
+        }
+    }
+
     /// Latest session document produced by `arena-core.js`.
     @Published private(set) var session: [String: Any]?
 
@@ -465,7 +509,8 @@ final class ArenaModel: ObservableObject {
             created = try engine.createSession(
                 question: trimmed,
                 providers: providers,
-                maxRounds: maxRounds
+                maxRounds: maxRounds,
+                attachments: draftAttachments
             )
         } catch {
             errorMessage = "无法建立场次：\(error.localizedDescription)"
@@ -473,6 +518,7 @@ final class ArenaModel: ObservableObject {
         }
 
         session = created
+        draftAttachments.removeAll()
         isReadOnly = false
         isRecovering = false
         didContinueSavedDiscussion = false
@@ -649,7 +695,7 @@ final class ArenaModel: ObservableObject {
         }
         // A manual first answer has no driver receipt. Only the explicit resume
         // action authorizes the currently shown conversation for future rounds.
-        if manualProviders.contains(provider), let pane = panes[provider],
+        if sessionAttachments.isEmpty, manualProviders.contains(provider), let pane = panes[provider],
            pane.boundConversationURL == nil, let url = pane.webView.url {
             _ = pane.restoreConversationBinding(url)
         }
@@ -715,7 +761,8 @@ final class ArenaModel: ObservableObject {
         _ provider: String,
         text: String,
         stance: String?,
-        expected: ArenaManualTarget? = nil
+        expected: ArenaManualTarget? = nil,
+        attachmentsConfirmed: Bool = false
     ) -> Bool {
         guard !isReadOnly else {
             errorMessage = "历史回看为只读；新建讨论后才能录入回答"
@@ -762,6 +809,13 @@ final class ArenaModel: ObservableObject {
             "stage": stageKey,
             "round": currentRound,
         ]
+        if requiresManualAttachmentConfirmation(for: provider) {
+            guard attachmentsConfirmed else {
+                errorMessage = "请先在本席原页核对本轮提问与全部附件"
+                return false
+            }
+            payload["attachmentReceipt"] = task.arenaString("attachmentReceipt") ?? "manual"
+        }
         var stanceLabelText: String?
         if stageKey == "vote" {
             let resolved = stance.flatMap(Self.normalizeStance)
@@ -784,6 +838,12 @@ final class ArenaModel: ObservableObject {
             return false
         }
 
+        // The user explicitly checked the opening materials in this pane.
+        // Later automatic rounds must stay in this same conversation.
+        if attachmentsConfirmed, payload["attachmentReceipt"] != nil, let pane = panes[provider],
+           pane.boundConversationURL == nil, let url = pane.currentURL {
+            _ = pane.restoreConversationBinding(url)
+        }
         blockedTasks.remove(taskID)
         previews[provider] = nil
         errorMessage = ""
@@ -915,6 +975,7 @@ final class ArenaModel: ObservableObject {
         session = nil
         currentID = nil
         question = ""
+        draftAttachments.removeAll()
         createdAt = 0
         intents.removeAll()
         manualProviders.removeAll()
@@ -1023,6 +1084,21 @@ final class ArenaModel: ObservableObject {
             return
         }
 
+        if stageKey != "independent", !sessionAttachments.isEmpty, pane.boundConversationURL == nil {
+            blockedTasks.insert(taskID)
+            setState(provider, .needsAction, "无法确认仍在接收首轮附件的对话，请核对原页并手动接管")
+            return
+        }
+        if stageKey == "independent" {
+            let materials = sessionAttachments
+            let ids = materials.compactMap { $0.arenaString("id") }
+            guard materials.count == ids.count, ids == task.arenaStringArray("attachmentIDs"),
+                  materials.allSatisfy({ ["image", "text"].contains($0.arenaString("kind") ?? "") }) else {
+                blockedTasks.insert(taskID)
+                setState(provider, .needsAction, "首轮附件清单不完整，请核对本场记录")
+                return
+            }
+        }
         let canRead = await ensureSubmitted(
             provider: provider,
             task: task,
@@ -1041,6 +1117,127 @@ final class ArenaModel: ObservableObject {
             pane: pane,
             token: token
         )
+    }
+
+    private var openingImages: [[String: Any]] {
+        guard stageKey == "independent" else { return [] }
+        return sessionAttachments.filter { $0.arenaString("kind") == "image" }
+    }
+
+    private var openingImageNames: [String] { openingImages.compactMap { $0.arenaString("name") } }
+
+    /// Reads retain the ordered manifest and verified pixel fingerprints. Only
+    /// the preparation command receives the source file bytes.
+    private func withImageEvidence(_ message: [String: Any]) -> [String: Any] {
+        let names = openingImageNames
+        guard !names.isEmpty else { return message }
+        var scoped = message
+        scoped["imageNames"] = names
+        if let taskID = message.arenaString("taskId"), let pixels = intents[taskID]?.imagePixelDigests {
+            scoped["imagePixels"] = pixels
+        }
+        return scoped
+    }
+
+    nonisolated static func preparedImagePixels(_ raw: Any?, count: Int) throws -> [String]? {
+        guard let raw else { return nil }
+        guard let pixels = raw as? [String], pixels.count == count,
+              pixels.allSatisfy({ hash in
+                  hash.isEmpty || (hash.utf8.count == 64 &&
+                      hash.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) })
+              }) else { throw ArenaEngineError("原页返回的图片像素摘要与附件清单不符") }
+        return pixels
+    }
+
+    private func newIntent(taskID: String, prompt: String) -> ArenaDeliveryIntent {
+        ArenaDeliveryIntent(taskId: taskID, prompt: prompt, stage: stageKey, round: currentRound,
+                            phase: .prepared, preparedAt: Self.nowMillis(), submittedAt: nil, pageURL: nil)
+    }
+
+    /// Persist the upload attempt *before* passing any bytes to the page.
+    /// After a restart the final submit can only use a previously prepared,
+    /// site/task-owned composer. A missing proof requires manual takeover.
+    private func prepareOpeningImages(
+        provider: String, taskID: String, prompt: String, config: ArenaSiteConfig,
+        pane: SitePane, token: UUID, knownDraftDigests: [String]
+    ) async -> Bool {
+        let images = openingImages
+        guard !images.isEmpty else { return true }
+        guard await waitWhilePaused(token), callbackIsCurrent(token: token, taskID: taskID, provider: provider),
+              let currentID else { return false }
+        var intent = intents[taskID] ?? newIntent(taskID: taskID, prompt: prompt)
+        if intent.imagePreparationStarted == true { return true }
+
+        do {
+            var message = engine.driverMessage(kind: "submit", taskID: taskID, prompt: prompt,
+                                              knownDraftDigests: knownDraftDigests, config: config)
+            message["images"] = try images.map { image -> [String: String] in
+                guard let name = image.arenaString("name"), let mediaType = image.arenaString("mediaType") else {
+                    throw ArenaEngineError("本场图片信息不完整")
+                }
+                let data = try engine.store.attachmentData(sessionID: currentID, attachment: image)
+                return ["name": name, "mediaType": mediaType, "base64": data.base64EncodedString()]
+            }
+            let names = openingImageNames
+            message["prepareImagesOnly"] = true
+            intent.imagePreparationStarted = true
+            intents[taskID] = intent
+            guard persist() else {
+                intents[taskID]?.imagePreparationStarted = nil
+                throw ArenaEngineError("未能保存附件投递记录，未开始上传")
+            }
+            setState(provider, .sending, "正在原页添加并核对图片…")
+            let result = try await pane.command(message)
+            guard callbackIsCurrent(token: token, taskID: taskID, provider: provider) else { return false }
+            let detail = result["detail"] as? [String: Any]
+            guard result.arenaString("status") == "attachments-ready",
+                  detail?["readyImageNames"] as? [String] == names else {
+                if detail?.arenaBool("uploadAttempted") == false {
+                    // A driver refusal before handing any file to the website
+                    // permits an explicit retry after the user resolves it.
+                    intents[taskID]?.imagePreparationStarted = nil
+                    persist()
+                }
+                throw ArenaEngineError(attachmentProblem(result, fallback: "attachment-not-ready"))
+            }
+            if let pixels = try Self.preparedImagePixels(detail?["readyImagePixels"], count: names.count) {
+                intents[taskID]?.imagePixelDigests = pixels
+                guard persist() else { throw ArenaEngineError("无法保存图片像素核对记录") }
+            }
+            return true
+        } catch {
+            guard callbackIsCurrent(token: token, taskID: taskID, provider: provider) else { return false }
+            blockedTasks.insert(taskID)
+            setState(provider, .needsAction, "图片待核对：\(Self.short(error.localizedDescription))")
+            return false
+        }
+    }
+
+    private func attachmentProblem(_ response: [String: Any], fallback: String) -> String {
+        let message = Self.friendly(errorCode: response.arenaString("error") ?? fallback)
+        let detail = response["detail"] as? [String: Any]
+        let reported = detail?.arenaStringArray("missingImageNames") ?? []
+        let missing = openingImageNames.filter { reported.contains($0) }
+        return missing.isEmpty ? message : message + "（待核对：" + missing.joined(separator: "、") + "）"
+    }
+
+    /// Called only for a verified user turn. A sent message containing the
+    /// prompt alone cannot establish receipt of separately uploaded images.
+    private func confirmOpeningMaterials(taskID: String, response: [String: Any]) throws {
+        guard stageKey == "independent", !sessionAttachments.isEmpty else { return }
+        let names = openingImageNames
+        let detail = response["detail"] as? [String: Any]
+        guard detail?.arenaBool("userTurnVerified") == true else {
+            throw ArenaEngineError("原页尚未确认含附件的本轮提问")
+        }
+        guard names.isEmpty || detail?["verifiedImageNames"] as? [String] == names else {
+            throw ArenaEngineError(Self.friendly(errorCode: "attachment-receipt-mismatch"))
+        }
+        guard let session, currentTask(taskID)?.arenaString("attachmentReceipt") != "verified" else { return }
+        self.session = try engine.apply(session: session, action: "attachmentReceipt",
+                                       payload: ["taskId": taskID, "attachmentReceipt": "verified"])
+        intents[taskID]?.attachmentReceipt = "verified"
+        guard persist() else { throw ArenaEngineError("附件回执未能保存") }
     }
 
     // MARK: Submit
@@ -1101,6 +1298,10 @@ final class ArenaModel: ObservableObject {
                 previousSessionIDs: historyList.map(\.id).filter { $0 != currentID }
             )
             : []
+        guard await prepareOpeningImages(provider: provider, taskID: taskID, prompt: prompt, config: config,
+                                         pane: pane, token: token, knownDraftDigests: knownDraftDigests) else {
+            return false
+        }
         var attempt = 0
         while attempt < 8 {
             guard await waitWhilePaused(token) else { return false }
@@ -1110,16 +1311,7 @@ final class ArenaModel: ObservableObject {
             }
             guard isCurrentPending(taskID) else { return false }
 
-            var intent = intents[taskID] ?? ArenaDeliveryIntent(
-                taskId: taskID,
-                prompt: prompt,
-                stage: stageKey,
-                round: currentRound,
-                phase: .prepared,
-                preparedAt: Self.nowMillis(),
-                submittedAt: nil,
-                pageURL: nil
-            )
+            var intent = intents[taskID] ?? newIntent(taskID: taskID, prompt: prompt)
             intent.phase = .inflight
             intent.pageURL = pane.boundConversationURL?.absoluteString
             intents[taskID] = intent
@@ -1140,13 +1332,13 @@ final class ArenaModel: ObservableObject {
             let response: [String: Any]
             do {
                 response = try await pane.command(
-                    engine.driverMessage(
+                    withImageEvidence(engine.driverMessage(
                         kind: "submit",
                         taskID: taskID,
                         prompt: intent.prompt,
                         knownDraftDigests: knownDraftDigests,
                         config: config
-                    )
+                    ))
                 )
             } catch {
                 // The click may have happened. Only record the outcome for the
@@ -1187,11 +1379,20 @@ final class ArenaModel: ObservableObject {
 
             // 已核验本轮用户消息后，把本席真实会话的 origin+path 固定下来，
             // 供下一轮发送前的地址核对与持久化恢复。
-            persistVerifiedBinding(pane, from: response, taskID: taskID)
-
             let status = response.arenaString("status") ?? ""
             let turnVerified = (response["detail"] as? [String: Any])?["userTurnVerified"] as? Bool == true
             if status == "submitted" || (status == "pending" && turnVerified) || status == "done" {
+                do {
+                    try confirmOpeningMaterials(taskID: taskID, response: response)
+                } catch {
+                    intents[taskID]?.phase = .uncertain
+                    persist()
+                    blockedTasks.insert(taskID)
+                    setState(provider, .needsAction, "本轮已尝试发送，\(error.localizedDescription)")
+                    return false
+                }
+                persistVerifiedBinding(pane, from: response, taskID: taskID)
+                intent.attachmentReceipt = intents[taskID]?.attachmentReceipt
                 intent.phase = .submitted
                 intent.submittedAt = Self.nowMillis()
                 intent.pageURL = pane.boundConversationURL?.absoluteString ?? intent.pageURL
@@ -1216,6 +1417,17 @@ final class ArenaModel: ObservableObject {
             // reply may already have clicked.
             let explicitlyPreClick = (detail?["clickAttempted"] as? Bool) == false
                 && (detail?["phase"] as? String) == "pre-click"
+
+            // A partial upload, a changed image draft or a missing receipt
+            // cannot authorize another upload, reload or blind click.
+            if code.hasPrefix("attachment-") || (!openingImages.isEmpty && explicitlyPreClick) {
+                intent.phase = explicitlyPreClick ? .prepared : .uncertain
+                intents[taskID] = intent
+                persist()
+                blockedTasks.insert(taskID)
+                setState(provider, .needsAction, attachmentProblem(response, fallback: code))
+                return false
+            }
 
             switch code {
             case "send-pending" where explicitlyPreClick:
@@ -1325,12 +1537,12 @@ final class ArenaModel: ObservableObject {
             setState(provider, .sending, attempt == 0 ? "检查原页…" : "等待原页就绪…")
             do {
                 let response = try await pane.command(
-                    engine.driverMessage(
+                    withImageEvidence(engine.driverMessage(
                         kind: "probe",
                         taskID: taskID,
                         prompt: nil,
                         config: config
-                    )
+                    ))
                 )
                 guard callbackIsCurrent(token: token, taskID: taskID, provider: provider) else {
                     return nil
@@ -1343,17 +1555,13 @@ final class ArenaModel: ObservableObject {
                         || known.arenaString("status") == "done") {
                         // The page still remembers this task id: adopt it and
                         // read only. Never submit a second time.
-                        intents[taskID] = ArenaDeliveryIntent(
-                            taskId: taskID,
-                            prompt: intents[taskID]?.prompt ?? currentTask(taskID)?.arenaString("prompt") ?? "",
-                            stage: stageKey,
-                            round: currentRound,
-                            phase: .submitted,
-                            preparedAt: intents[taskID]?.preparedAt ?? Self.nowMillis(),
-                            submittedAt: Self.nowMillis(),
-                            pageURL: pane.boundConversationURL?.absoluteString,
-                            reloadAttempted: intents[taskID]?.reloadAttempted
+                        var intent = intents[taskID] ?? newIntent(
+                            taskID: taskID, prompt: currentTask(taskID)?.arenaString("prompt") ?? ""
                         )
+                        intent.phase = .submitted
+                        intent.submittedAt = intent.submittedAt ?? Self.nowMillis()
+                        intent.pageURL = pane.boundConversationURL?.absoluteString ?? intent.pageURL
+                        intents[taskID] = intent
                         persist()
                         setState(provider, .generating, "已发送，只读核对中…")
                     }
@@ -1457,24 +1665,39 @@ final class ArenaModel: ObservableObject {
                     prompt: intents[taskID]?.prompt
                 )
                 let response = try await pane.command(
-                    engine.driverMessage(
+                    withImageEvidence(engine.driverMessage(
                         kind: "read",
                         taskID: taskID,
                         prompt: nil,
                         verifiedReadPrompt: recoveryPrompt,
                         config: config
-                    )
+                    ))
                 )
                 // Ignore a late read that belongs to a replaced discussion, a
                 // finished task, or a seat the user took over meanwhile.
                 guard callbackIsCurrent(token: token, taskID: taskID, provider: provider) else {
                     return
                 }
+                let detail = response["detail"] as? [String: Any]
+                if response.arenaString("status") == "done" || detail?.arenaBool("userTurnVerified") == true {
+                    do {
+                        try confirmOpeningMaterials(taskID: taskID, response: response)
+                    } catch {
+                        blockedTasks.insert(taskID)
+                        setState(provider, .needsAction, error.localizedDescription)
+                        return
+                    }
+                }
                 persistVerifiedBinding(pane, from: response, taskID: taskID)
                 consecutiveErrors = 0
                 let status = response.arenaString("status") ?? ""
                 let code = response.arenaString("error") ?? ""
 
+                if code.hasPrefix("attachment-") {
+                    blockedTasks.insert(taskID)
+                    setState(provider, .needsAction, attachmentProblem(response, fallback: code))
+                    return
+                }
                 switch status {
                 case "done":
                     let text = (response.arenaString("text") ?? "")
@@ -1742,7 +1965,7 @@ final class ArenaModel: ObservableObject {
         let probe: [String: Any]
         do {
             probe = try await pane.command(
-                engine.driverMessage(kind: "probe", taskID: taskID, prompt: nil, config: config)
+                withImageEvidence(engine.driverMessage(kind: "probe", taskID: taskID, prompt: nil, config: config))
             )
         } catch {
             // `read` will surface the real error on its own path; this helper
@@ -2011,7 +2234,7 @@ final class ArenaModel: ObservableObject {
         )
         message["expectedPrompt"] = prompt
         do {
-            let response = try await pane.command(message)
+            let response = try await pane.command(withImageEvidence(message))
             guard callbackIsCurrent(token: token, taskID: taskID, provider: provider) else {
                 return nil
             }
@@ -2048,6 +2271,14 @@ final class ArenaModel: ObservableObject {
             "stage": stageKey,
             "round": currentRound,
         ]
+        if stageKey == "independent", !sessionAttachments.isEmpty {
+            guard currentTask(taskID)?.arenaString("attachmentReceipt") == "verified" else {
+                blockedTasks.insert(taskID)
+                setState(provider, .needsAction, "附件送达待核对，回答尚未采用")
+                return
+            }
+            payload["attachmentReceipt"] = "verified"
+        }
         var stanceText: String?
         if stageKey == "vote" {
             guard let stance = Self.parseStance(text) else {
@@ -2216,20 +2447,31 @@ final class ArenaModel: ObservableObject {
                     prompt: intents[taskID]?.prompt
                 )
                 let response = try await pane.command(
-                    engine.driverMessage(
+                    withImageEvidence(engine.driverMessage(
                         kind: "read",
                         taskID: taskID,
                         prompt: nil,
                         verifiedReadPrompt: recoveryPrompt,
                         config: config
-                    )
+                    ))
                 )
                 guard callbackIsCurrent(token: token, taskID: taskID, provider: provider) else {
                     return .stopped
                 }
+                let detail = response["detail"] as? [String: Any]
+                if response.arenaString("status") == "done" || detail?.arenaBool("userTurnVerified") == true {
+                    do {
+                        try confirmOpeningMaterials(taskID: taskID, response: response)
+                    } catch {
+                        return .unconfirmed(error.localizedDescription)
+                    }
+                }
                 persistVerifiedBinding(pane, from: response, taskID: taskID)
                 let status = response.arenaString("status") ?? ""
                 let code = response.arenaString("error") ?? ""
+                if code.hasPrefix("attachment-") {
+                    return .unconfirmed(attachmentProblem(response, fallback: code))
+                }
                 switch status {
                 case "done":
                     let text = (response.arenaString("text") ?? "")
@@ -2647,6 +2889,7 @@ final class ArenaModel: ObservableObject {
         session = saved.session
         currentID = saved.file.id
         question = saved.file.question
+        draftAttachments.removeAll()
         createdAt = saved.file.createdAt
         intents = Dictionary(uniqueKeysWithValues: saved.file.intents.map { ($0.taskId, $0) })
         blockedTasks.removeAll()
@@ -2798,6 +3041,11 @@ final class ArenaModel: ObservableObject {
         case "input-uneditable": return "输入框无法编辑"
         case "input-disabled": return "输入框被禁用"
         case "input-readonly": return "输入框只读"
+        case "attachment-unsupported": return "原页没有可核对的图片上传入口，请在该席原页添加"
+        case "attachment-draft-conflict": return "原页附件草稿与本轮不一致，请在原页核对"
+        case "attachment-upload-failed": return "原页未接收全部图片，请核对并手动补齐"
+        case "attachment-not-ready": return "图片尚未全部就绪，请核对原页后恢复本席或手动补录"
+        case "attachment-receipt-mismatch": return "原页本轮消息的图片与清单不一致，请核对；不会重发"
         case "draft-conflict": return "原页已有未发送草稿，未覆盖"
         case "busy": return "原页正有另一任务"
         case "prompt-already-sent": return "原页已有本轮提问，不再重发"

@@ -133,6 +133,25 @@ struct NativeSeatStateCheck {
         let restoredMissing = ArenaModel.restoredManualState(phase: nil)
         check("a restored task with no intent is still conservative", restoredMissing.kind == .needsAction)
 
+        // Anonymous image previews need the same positional hashes on a read
+        // after relaunch; missing evidence on an older intent stays absent.
+        let hash = String(repeating: "ab", count: 32)
+        do {
+            var intent = ArenaDeliveryIntent(taskId: "sample:independent:gemini", prompt: "q",
+                                            stage: "independent", round: 1, phase: .prepared,
+                                            preparedAt: 1, submittedAt: nil, pageURL: nil)
+            let encoder = JSONEncoder(), decoder = JSONDecoder()
+            let legacy = try decoder.decode(ArenaDeliveryIntent.self, from: encoder.encode(intent))
+            check("legacy intent has no pixel proof", legacy.imagePixelDigests == nil)
+            intent.imagePixelDigests = try ArenaModel.preparedImagePixels([hash, ""], count: 2)
+            let restored = try decoder.decode(ArenaDeliveryIntent.self, from: encoder.encode(intent))
+            check("pixel proofs retain image order and empty slots on restore", restored.imagePixelDigests == [hash, ""])
+            check("malformed pixel proof rejected", (try? ArenaModel.preparedImagePixels(["invalid"], count: 1)) == nil)
+            check("wrong proof count rejected", (try? ArenaModel.preparedImagePixels([hash], count: 2)) == nil)
+        } catch {
+            check("pixel proof persistence", false)
+        }
+
         // --- 4. Slow generation never reads as a completed answer -------------
         for reason in ["completion-signal-missing", "answer-updating", "awaiting-answer", "generating", "other"] {
             let state = ArenaModel.pendingReadState(reason: reason, recoveryUsed: false)

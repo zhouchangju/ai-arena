@@ -97,7 +97,7 @@
 侧栏可选文件、粘贴图片、预览移除；文本文件读作正文，图片单独注入。群聊主界面则提示去原网页上传。
 
 - **参照版复核**　从侧栏粘图、选文本、移除附件，查看实际发送内容；在群聊中核对上传引导。
-- **自用版取舍**　后续·两条入口分别验。
+- **自用版取舍**　桌面开场支持图片和小型文本附件。实际格式、逐席送达与接管见[试用指引](try-it.md#带图或文件提问)。
 - **验证**　粘两图删除一张，再加一份文本；逐席核对实际收到的内容。缺附件的一席不能声称已看图。
 - **源码**　[sidepanel.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/sidepanel.js) · [popup.html](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/popup.html) · [inject-images.js](https://github.com/TianLin0509/ai-arena-extension/blob/00953ebff7ab2b73525c949f56302f06b4db121b/src/inject-images.js)
 
