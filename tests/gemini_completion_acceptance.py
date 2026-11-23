@@ -7,8 +7,8 @@ and then disappeared, and the heading alone stayed unchanged across samples,
 so the generic "stop observed, then gone + stable text" rule treated a heading
 as the answer.
 
-This harness runs the real ``extension/web-driver.js`` in a loopback page and
-takes the selectors/options from the real ``extension/provider-web-configs.js``
+This harness runs the real ``shared/web-driver.js`` in a loopback page and
+takes the selectors/options from the real ``shared/provider-web-configs.js``
 through Node, so the test follows the shipped adapter rather than a copy.
 It simulates the observed sequence:
 
@@ -46,10 +46,10 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from browser_acceptance import find_chromium_executable  # noqa: E402
+from fixtures import find_chromium_executable  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
-DRIVER = ROOT / "extension" / "web-driver.js"
+DRIVER = ROOT / "shared" / "web-driver.js"
 
 HEADING = "明确判断与主要理由"
 FULL_BODY = (
@@ -66,7 +66,7 @@ ADAPTER = json.loads(
             "--input-type=module",
             "-e",
             (
-                "import { webSiteConfig } from './extension/provider-web-configs.js';"
+                "import { webSiteConfig } from './shared/provider-web-configs.js';"
                 "const c = webSiteConfig('gemini');"
                 "process.stdout.write(JSON.stringify({"
                 "selectors: c.selectors, options: c.options, allowNavigation: c.allowNavigation"

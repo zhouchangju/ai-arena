@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Loopback fault-injection for the two G1/G3 recovery paths.
 
-This harness runs the real ``extension/web-driver.js`` in a plain page (no
+This harness runs the real ``shared/web-driver.js`` in a plain page (no
 extension installs, no network) and simulates:
 
 1. A brand-new conversation whose empty composer was restored by the site with
@@ -34,10 +34,10 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from browser_acceptance import find_chromium_executable  # noqa: E402
+from fixtures import find_chromium_executable  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
-DRIVER = ROOT / "extension" / "web-driver.js"
+DRIVER = ROOT / "shared" / "web-driver.js"
 
 PAGE = r"""<!doctype html><meta charset=utf-8>
 <style>

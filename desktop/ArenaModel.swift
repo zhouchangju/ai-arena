@@ -109,6 +109,35 @@ enum ArenaStageNames {
         if stage.isEmpty { return "未开始" }
         return labels[stage] ?? stage
     }
+
+    static func reviewRound(_ session: [String: Any]?) -> String? {
+        guard let session else { return nil }
+        let stage = session.arenaString("stage") ?? ""
+        if stage == "done" {
+            let history = session["history"] as? [[String: Any]] ?? []
+            let rounds = Set(history.filter { $0.arenaString("stage") == "critique" }
+                .compactMap { $0.arenaInt("round") })
+            return rounds.isEmpty ? nil : roundLabel(rounds.count, session: session)
+        }
+        guard ["critique", "proposal", "vote"].contains(stage),
+              let round = session.arenaInt("round") else { return nil }
+        return roundLabel(round, session: session)
+    }
+
+    static func discussionLabel(_ session: [String: Any]) -> String {
+        let stage = label(session.arenaString("stage") ?? "")
+        return [stage, reviewRound(session)].compactMap { $0 }.joined(separator: " · ")
+    }
+
+    static func taskLabel(_ stage: String, round: Int, session: [String: Any]?) -> String {
+        guard stage != "independent" else { return label(stage) }
+        return "\(label(stage)) · \(roundLabel(round, session: session))"
+    }
+
+    private static func roundLabel(_ round: Int, session: [String: Any]?) -> String {
+        let limit = session?.arenaInt("maxRounds") ?? 2
+        return "互评第 \(round) 轮 / 上限 \((1...5).contains(limit) ? limit : 2)"
+    }
 }
 
 /// A durable, session-derived seat outcome. Only saved rows are read, so this
@@ -170,7 +199,7 @@ enum ArenaSeatOutcome {
         }
         if paused {
             if pending != nil || tasks.isEmpty {
-                return ArenaSeatState(kind: .paused, detail: "已暂停 · \(stageLabel(stage)) · 第 \(round) 轮")
+                return ArenaSeatState(kind: .paused, detail: "已暂停 · \(ArenaStageNames.taskLabel(stage, round: round, session: session))")
             }
             // A seat that already answered this stage keeps its real outcome;
             // pause only withholds the next dispatch.
@@ -178,11 +207,11 @@ enum ArenaSeatOutcome {
         if let pending {
             let pendingVersion = pending.arenaInt("version")
             if stage == "vote", let version, pendingVersion == version {
-                return ArenaSeatState(kind: .generating, detail: "等待表态（v\(version) · 第 \(round) 轮）")
+                return ArenaSeatState(kind: .generating, detail: "等待表态（v\(version) · \(ArenaStageNames.reviewRound(session) ?? ArenaStageNames.label(stage))）")
             }
             return ArenaSeatState(
                 kind: .generating,
-                detail: "等待回答（\(stageLabel(stage)) · 第 \(round) 轮）"
+                detail: "等待回答（\(ArenaStageNames.taskLabel(stage, round: round, session: session))）"
             )
         }
 
@@ -204,7 +233,7 @@ enum ArenaSeatOutcome {
             case "skipped":
                 return ArenaSeatState(kind: .skipped, detail: "已跳过本阶段任务（计为缺席）")
             default:
-                return ArenaSeatState(kind: .generating, detail: "等待回答（\(stageLabel(stage)) · 第 \(round) 轮）")
+                return ArenaSeatState(kind: .generating, detail: "等待回答（\(ArenaStageNames.taskLabel(stage, round: round, session: session))）")
             }
         }
 
@@ -226,9 +255,6 @@ enum ArenaSeatOutcome {
         }
     }
 
-    private static func stageLabel(_ stage: String) -> String {
-        ArenaStageNames.label(stage)
-    }
 
     private static func stanceLabel(_ stance: String) -> String {
         switch stance {
@@ -392,7 +418,7 @@ final class ArenaModel: ObservableObject {
     ///
     /// `maxRounds` is the total round budget (1-5, default 3 for a new desktop
     /// session): the first independent/critique/proposal/vote round plus up to
-    /// four targeted follow-ups. A shared extension session keeps the original
+    /// four targeted follow-ups. A legacy session keeps the original
     /// two-round budget because it never passes this option.
     ///
     /// The core session is created first, then every seat's original site is
@@ -2418,22 +2444,7 @@ final class ArenaModel: ObservableObject {
             return
         }
         stageKey = session.arenaString("stage") ?? ""
-        let round = currentRound
-        var label: String
-        switch stageKey {
-        case "independent":
-            label = "独立作答 · 第\(round)轮"
-        case "critique":
-            label = "互评 · 第\(round)轮"
-        case "proposal":
-            label = "起草候选 · 第\(round)轮"
-        case "vote":
-            label = "表态 · 第\(round)轮"
-        case "done":
-            label = "讨论已结束"
-        default:
-            label = "准备中"
-        }
+        var label = ArenaStageNames.discussionLabel(session)
         if isReadOnly {
             label += "（历史回看）"
         }

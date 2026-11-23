@@ -30,7 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-from public_automation_acceptance import PROVIDERS, markup
+from fixtures import PROVIDERS, markup
 from qa_app import stage_qa_app
 
 

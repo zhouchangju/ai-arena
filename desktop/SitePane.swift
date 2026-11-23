@@ -31,7 +31,7 @@
 //  测试模式只接受 http(s) + 回环主机，并且只在该回环 origin 内导航；生产构造
 //  SitePane(provider:) 永远不会把回环地址当成可自动化页面。
 //
-//  命令形状与 extension/web-driver.js 的消息一致：
+//  命令形状与 shared/web-driver.js 的消息一致：
 //    ["type": "arena.web.probe" | "arena.web.submit" | "arena.web.read",
 //     "taskId": "round1.seatA",
 //     "prompt": "仅 submit",                 // 可选，submit 必填
@@ -105,7 +105,7 @@ enum SitePaneError: Error, LocalizedError {
         case .invalidTestOrigin(let value):
             return "测试地址必须是 http(s) 回环地址，收到：\(value)。"
         case .driverScriptMissing:
-            return "应用包中找不到 web-driver.js。请把 extension/web-driver.js 作为资源放进 App Bundle。"
+            return "应用包中找不到 web-driver.js。请把 shared/web-driver.js 作为资源放进 App Bundle。"
         case .driverScriptUnreadable(let detail):
             return "web-driver.js 无法读取：\(detail)"
         case .driverScriptInvalid:
@@ -1789,7 +1789,7 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
             || host.hasSuffix(".apple.com")
     }
 
-    // MARK: Site registry (mirrors extension/provider-web-configs.js)
+    // MARK: Site registry (mirrors shared/provider-web-configs.js)
 
     private struct SiteDescriptor {
         let provider: String
@@ -1895,7 +1895,7 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
         }
     }
 
-    // build.sh packages the registry used by the browser extension.
+    // build.sh packages the shared provider registry.
     private static let bundledAdapters: [String: [String: Any]] = {
         guard let url = Bundle.main.url(forResource: "sites", withExtension: "json"),
               let data = try? Data(contentsOf: url),

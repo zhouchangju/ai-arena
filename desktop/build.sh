@@ -18,13 +18,13 @@ icon="$root/desktop/assets/ArenaIcon.icns"
 if [[ -s "$icon" ]]; then
   cp "$icon" "$resources/ArenaIcon.icns"
 fi
-cp "$root/extension/web-driver.js" "$resources/"
+cp "$root/shared/web-driver.js" "$resources/"
 node --input-type=module - "$root" "$resources" <<'JS'
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 const [root, resources] = process.argv.slice(2);
-const source = name => path.join(root, 'extension', name + '.js');
+const source = name => path.join(root, 'shared', name + '.js');
 const { webSiteConfig } = await import(pathToFileURL(source('provider-web-configs')));
 const sites = Object.fromEntries(['chatgpt', 'gemini', 'deepseek'].map(id => [id, webSiteConfig(id)]));
 fs.writeFileSync(path.join(resources, 'sites.json'), JSON.stringify(sites));

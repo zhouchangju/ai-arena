@@ -7,7 +7,7 @@ the same confirmed conversation sent once immediately. The native app now has
 one bounded automatic repair in its pre-click retry branch, and this test pins
 its two halves:
 
-1. The shipped ``extension/web-driver.js`` probe may carry an optional
+1. The shipped ``shared/web-driver.js`` probe may carry an optional
    ``expectedPrompt`` and then returns ``composer.matchesExpectedPrompt``, using
    the same normalized ``sameText`` helper as submit. The probe stays read-only:
    it never writes the composer, never clicks, and its reply is byte-for-byte
@@ -42,10 +42,10 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from browser_acceptance import find_chromium_executable  # noqa: E402
+from fixtures import find_chromium_executable  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
-DRIVER = ROOT / "extension" / "web-driver.js"
+DRIVER = ROOT / "shared" / "web-driver.js"
 
 PAGE = r"""<!doctype html><meta charset=utf-8>
 <style>

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Read-only record rebuild and native "Show more" suffix checks (G1/G3).
 
-Runs the shipped ``extension/web-driver.js`` unchanged against loopback HTML
+Runs the shipped ``shared/web-driver.js`` unchanged against loopback HTML
 served for the three registered conversation addresses. Every request is
 answered by a Playwright route, so no real site is contacted and no account is
 used.
@@ -59,10 +59,10 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from browser_acceptance import find_chromium_executable  # noqa: E402
+from fixtures import find_chromium_executable  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
-DRIVER = ROOT / "extension" / "web-driver.js"
+DRIVER = ROOT / "shared" / "web-driver.js"
 
 ADAPTERS = json.loads(
     subprocess.run(
@@ -71,7 +71,7 @@ ADAPTERS = json.loads(
             "--input-type=module",
             "-e",
             (
-                "import { webSiteConfig } from './extension/provider-web-configs.js';"
+                "import { webSiteConfig } from './shared/provider-web-configs.js';"
                 "const out = {};"
                 "for (const id of ['chatgpt','gemini','deepseek']) {"
                 "  const c = webSiteConfig(id);"

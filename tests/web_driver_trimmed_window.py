@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline replay for the same-conversation window-trim recovery (G1/G3).
 
-The real ``extension/web-driver.js`` runs unchanged in a plain page whose
+The real ``shared/web-driver.js`` runs unchanged in a plain page whose
 address is a registered ChatGPT conversation URL
 (``https://chatgpt.com/c/<id>``). Every request is answered by a Playwright
 route, so nothing leaves the machine and no account is touched.
@@ -52,10 +52,10 @@ from urllib.parse import urlsplit
 from playwright.sync_api import sync_playwright
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from browser_acceptance import find_chromium_executable  # noqa: E402
+from fixtures import find_chromium_executable  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
-DRIVER = ROOT / "extension" / "web-driver.js"
+DRIVER = ROOT / "shared" / "web-driver.js"
 
 CHATGPT_ORIGIN = "https://chatgpt.com"
 CONVERSATION = CHATGPT_ORIGIN + "/c/68fd3c40-9a4c-8327-8f2e-3b0e6a5c1a77"

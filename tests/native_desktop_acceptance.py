@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-from public_automation_acceptance import PROVIDERS, markup
+from fixtures import PROVIDERS, markup
 from qa_app import QA_BUNDLE_ID, stage_qa_app
 
 
@@ -151,6 +151,10 @@ def main():
     assert session["report"] in exported
     assert all(row["prompt"] in exported for row in history)
     metadata, _, _ = exported.partition("## 题面")
+    assert "- 互评第 1 轮 / 上限 3" in metadata, metadata
+    assert "- 互评第 1 轮 / 上限 3" in session["report"]
+    independent_headings = [line for line in exported.splitlines() if line.startswith("### 独立作答")]
+    assert len(independent_headings) == 3 and all("轮" not in line for line in independent_headings)
     assert metadata.count(session["id"]) == 1, metadata
     assert re.search(
         r"^- 导出时间：\d{4}-\d{2}-\d{2}T[\d:]+[+-]\d{2}:\d{2}(?:（本地时间）)?$",

@@ -10,8 +10,8 @@ AI Arena 使用 SwiftUI 构建工作台，通过 WebKit 在独立席位中加载
 | [SitePane.swift](../desktop/SitePane.swift) | 包装 WKWebView，绑定站点与对话，调用网页驱动并核对本轮回读。原站负责渲染流式正文、图片和网页交互。 |
 | [ArenaModel.swift](../desktop/ArenaModel.swift) | 调度各席任务，处理暂停、发出后待确认、单席接管和重启恢复。 |
 | [ArenaEngine.swift](../desktop/ArenaEngine.swift) | 桥接 JavaScriptCore，装入站点配置，管理本地场次文件。 |
-| [core.js](../extension/core.js) | 共享讨论状态机，构造轮次提示、绑定候选和表态、生成报告。 |
-| [web-driver.js](../extension/web-driver.js) · [provider-web-configs.js](../extension/provider-web-configs.js) | 查找站点编辑器、发送控件、本轮消息和结束信号。桌面构建打包 ChatGPT、Gemini、DeepSeek 的配置。 |
+| [core.js](../shared/core.js) | 共享讨论状态机，构造轮次提示、绑定候选和表态、生成报告。 |
+| [web-driver.js](../shared/web-driver.js) · [provider-web-configs.js](../shared/provider-web-configs.js) | 查找站点编辑器、发送控件、本轮消息和结束信号。桌面构建打包 ChatGPT、Gemini、DeepSeek 的配置。 |
 | [ArenaReportReader.swift](../desktop/ArenaReportReader.swift) · [ArenaMarkdownView.swift](../desktop/ArenaMarkdownView.swift) | 报告窗口、出处导航和 Markdown 阅读。 |
 | [build.sh](../desktop/build.sh) | 打包 Swift 可执行文件、共享 JavaScript 与站点配置，生成本地签名的应用包。 |
 
@@ -63,6 +63,6 @@ Markdown 导出的场次编号只出现一次，时间使用本机时区并带�
 
 ## 早期实现与参考
 
-`extension/` 中的 Manifest V3 工作台使用浏览器标签与 IndexedDB。早期扩展验收记录保存在迭代日志里。桌面应用复用讨论状态机、网页驱动及站点配置。
+早期 Manifest V3 工作台使用浏览器标签与 IndexedDB，源码与验收夹具保存在 Git 标签 extension-final。桌面应用从 `shared/` 打包讨论状态机、网页驱动及站点配置。
 
 [Arena 与 Panelize 源码调研](reference-review.md) · [早期技术设计](https://github.com/zhouchangju/ai-arena/blob/3c81073aefdd9e712e002aa35ad74acf7be00da9/docs/technical-design.md)

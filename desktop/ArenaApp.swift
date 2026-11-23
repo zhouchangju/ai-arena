@@ -308,7 +308,12 @@ struct ArenaRootView: View {
             case .continueHistory(let id):
                 return Alert(
                     title: Text("继续这一场？"),
-                    message: Text("各待处理席位会先等待你核对原页。你可以补录、跳过，或逐席恢复自动。可能已发送的任务只做只读核对。"),
+                    message: Text(
+                        (model.hasRunningDiscussion
+                            ? "当前讨论会停止并保留在历史中。已发送的请求可能仍会在原页生成。"
+                            : "")
+                        + "各待处理席位会先等待你核对原页。你可以补录、跳过，或逐席恢复自动。可能已发送的任务只做只读核对。"
+                    ),
                     primaryButton: .default(Text("继续")) { continueSaved(id) },
                     secondaryButton: .cancel(Text("取消"))
                 )
@@ -680,7 +685,7 @@ struct ArenaRootView: View {
             .controlSize(.regular)
             .fixedSize()
             .disabled(model.session != nil)
-            .help("最多讨论轮次（1–5，默认 3）：第 1 轮从独立作答开始；之后每轮针对未解决分歧做互评、修订候选并重新表态")
+            .help("互评上限（1–5，默认 3）。独立作答结束后开始第 1 轮互评；每轮包括互评、起草或修订候选及表态")
         }
         .fixedSize()
     }
@@ -1083,12 +1088,8 @@ struct ArenaRootView: View {
             return hasStarted ? "准备中" : "未开始"
         }
         let stage = (session["stage"] as? String) ?? ""
-        let round = ArenaValue.int(session["round"]) ?? 1
         let paused = (session["paused"] as? Bool) ?? false
-        var text = ArenaStageNames.label(stage)
-        if stage != "done" && !stage.isEmpty {
-            text += " · 第 \(round) 轮"
-        }
+        var text = ArenaStageNames.discussionLabel(session)
         if let tasks = session["tasks"] as? [[String: Any]], !tasks.isEmpty, stage != "done" {
             let answered = tasks.filter { ($0["status"] as? String) == "answered" }.count
             text += " · 已收到 " + String(answered) + "/" + String(tasks.count)
@@ -1696,9 +1697,7 @@ final class ArenaDetailsWindowController: NSObject, NSWindowDelegate, NSToolbarD
 
     private static func subtitle(for session: [String: Any]?) -> String {
         guard let session else { return "尚未建立场次" }
-        let stage = (session["stage"] as? String) ?? ""
-        let round = ArenaValue.int(session["round"]) ?? 1
-        return "\(ArenaStageNames.label(stage)) · 第 \(round) 轮"
+        return ArenaStageNames.discussionLabel(session)
     }
 
     // MARK: 工具栏
@@ -1980,7 +1979,7 @@ struct ArenaDetailsWindowView: View {
     @ViewBuilder
     private var taskCaption: some View {
         if let task = ArenaSessionDigest.currentTask(session, provider: state.provider) {
-            Text("本席这一轮 · \(ArenaStageNames.label(task.stage)) · 第 \(task.round) 轮"
+            Text("本席这一轮 · \(ArenaStageNames.taskLabel(task.stage, round: task.round, session: model.session))"
                 + (task.sourceId.isEmpty ? "" : " · \(task.sourceId)"))
                 .font(.system(size: 12.5))
                 .foregroundStyle(.secondary)
@@ -2062,7 +2061,7 @@ struct ArenaDetailsWindowView: View {
                     .padding(.bottom, 2)
 
                     ForEach(rows) { row in
-                        ArenaAnswerDisclosure(row: row)
+                        ArenaAnswerDisclosure(row: row, session: model.session)
                     }
                 }
                 .padding(18)
@@ -2133,6 +2132,7 @@ struct ArenaDetailsWindowView: View {
 
 struct ArenaAnswerDisclosure: View {
     let row: ArenaTaskRow
+    let session: [String: Any]?
 
     var body: some View {
         DisclosureGroup {
@@ -2143,7 +2143,7 @@ struct ArenaAnswerDisclosure: View {
             .padding(.top, 8)
         } label: {
             HStack(spacing: 7) {
-                Text("第 \(row.round) 轮 · \(ArenaStageNames.label(row.stage))")
+                Text(ArenaStageNames.taskLabel(row.stage, round: row.round, session: session))
                     .font(.system(size: 13.5, weight: .semibold))
                 Text(ArenaSeatCatalog.name(row.provider))
                     .font(.system(size: 12.5))
@@ -2252,7 +2252,7 @@ struct ArenaBackfillView: View {
                 .fixedSize(horizontal: false, vertical: true)
 
             if let target = draft.target {
-                Text("已固定为 \(ArenaStageNames.label(target.stage)) · 第 \(target.round) 轮\(target.version.map { " · 候选 v\($0)" } ?? "")。保存时若本轮已变化，草稿会保留并报错。")
+                Text("已固定为 \(ArenaStageNames.taskLabel(target.stage, round: target.round, session: model.session))\(target.version.map { " · 候选 v\($0)" } ?? "")。保存时若本轮已变化，草稿会保留并报错。")
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -2448,8 +2448,8 @@ enum ArenaExporter {
         lines.append("- 场次：\(ArenaSessionDigest.id(session) ?? "（未编号）")")
         lines.append("- 导出时间：\(localTimestamp())（本地时间）")
         lines.append("- 阶段：\(ArenaStageNames.label((session?["stage"] as? String) ?? ""))")
-        if let round = ArenaValue.int(session?["round"]) {
-            lines.append("- 轮次：第 \(round) 轮")
+        if let reviewRound = ArenaStageNames.reviewRound(session) {
+            lines.append("- \(reviewRound)")
         }
         if let paused = session?["paused"] as? Bool, paused {
             lines.append("- 暂停：是")
@@ -2480,7 +2480,7 @@ enum ArenaExporter {
             lines.append("### \(ArenaSeatCatalog.name(provider))")
             lines.append("")
             if let task {
-                lines.append("阶段：\(ArenaStageNames.label(task.stage)) · 第 \(task.round) 轮"
+                lines.append("阶段：\(ArenaStageNames.taskLabel(task.stage, round: task.round, session: session))"
                     + (task.sourceId.isEmpty ? "" : " · \(task.sourceId)"))
                 lines.append("")
                 lines.append(fenced(task.prompt))
@@ -2499,7 +2499,7 @@ enum ArenaExporter {
         } else {
             for row in answerRows {
                 let source = row.sourceId.isEmpty ? "" : " · \(row.sourceId)"
-                lines.append("### 第 \(row.round) 轮 · \(ArenaStageNames.label(row.stage)) · \(ArenaSeatCatalog.name(row.provider))\(source)")
+                lines.append("### \(ArenaStageNames.taskLabel(row.stage, round: row.round, session: session)) · \(ArenaSeatCatalog.name(row.provider))\(source)")
                 lines.append("")
                 lines.append("**提示**")
                 lines.append("")

@@ -160,6 +160,17 @@ struct NativeSeatStateCheck {
         check("vote is 表态", ArenaStageNames.label("vote") == "表态")
         check("internal keys are unchanged", ArenaStageNames.label("independent") == "独立作答")
 
+        let independent: [String: Any] = ["stage": "independent", "round": 1, "maxRounds": 3]
+        check("independent stage has no round label", ArenaStageNames.discussionLabel(independent) == "独立作答")
+        let critique: [String: Any] = ["stage": "critique", "round": 1, "maxRounds": 3]
+        check("first critique uses the same round and cap as the report",
+              ArenaStageNames.reviewRound(critique) == "互评第 1 轮 / 上限 3")
+        let earlyFinish: [String: Any] = ["stage": "done", "round": 1, "history": [independent]]
+        check("ending before review omits the round", ArenaStageNames.reviewRound(earlyFinish) == nil)
+        let legacyFinish: [String: Any] = ["stage": "done", "round": 1, "history": [independent, critique, critique]]
+        check("legacy finish counts distinct review rounds and defaults to two",
+              ArenaStageNames.reviewRound(legacyFinish) == "互评第 1 轮 / 上限 2")
+
         if failures == 0 {
             print("native seat state: all checks passed")
             exit(0)

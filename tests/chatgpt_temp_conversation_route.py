@@ -10,7 +10,7 @@ treated any two-segment ``/c/...`` path as a conversation and fixed the
 temporary frontend ID, so the next read was rejected as
 ``conversation-changed``.
 
-This harness runs the unchanged ``extension/web-driver.js`` in a plain page
+This harness runs the unchanged ``shared/web-driver.js`` in a plain page
 whose requests are answered by Playwright routes: no network, no account.
 It covers the route chain the native pane depends on:
 
@@ -43,10 +43,10 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from browser_acceptance import find_chromium_executable  # noqa: E402
+from fixtures import find_chromium_executable  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
-DRIVER = ROOT / "extension" / "web-driver.js"
+DRIVER = ROOT / "shared" / "web-driver.js"
 
 ORIGIN = "https://chatgpt.com"
 HOME = ORIGIN + "/"

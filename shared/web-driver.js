@@ -6,12 +6,9 @@
  * 形态：普通 JS，无构建、无依赖、无任何网络请求；不读写 chrome.storage，不碰账号。
  *       所有任务状态只保存在当前页面内存里，页面刷新即清空（这是故意的，见“未知任务”）。
  *
- * 集成方式（扩展后台 / 工作台）：
- *   await chrome.scripting.executeScript({
- *     target: { tabId, frameIds: [0] },
- *     files: ['web-driver.js'],        // 相对扩展根；本仓库位于 extension/web-driver.js
- *   });
- *   const reply = await chrome.tabs.sendMessage(tabId, {
+ * 集成方式（桌面工作台）：SitePane 将 shared/web-driver.js 注入 WebKit 隔离世界，
+ *   在绑定原页调用驱动消息接口。消息示例：
+ *   {
  *     type: 'arena.web.probe' | 'arena.web.submit' | 'arena.web.read',
  *     taskId: 'round1.seatA',
  *     prompt: '本轮要发送的原文',          // submit 必填
@@ -27,7 +24,7 @@
  *     options: { sampleMs: 250, stableSamples: 3, stableMs: 600, requireDoneMarker: false },
  *     scope: { origin: 'http://localhost:3000', hrefPrefix: 'http://localhost:3000/' },
  *     verifiedReadPrompt: '同一 taskId 持久化过的发送原文（仅 read，可选）',
- *   }, { frameId: 0 });
+ *   }
  *
  * 每个 selector 既可以是字符串，也可以是有序候选数组（先命中的一组生效）。
  * scope.allowNavigation=true 时，允许同源 SPA 换地址（新建页 → 对话页），

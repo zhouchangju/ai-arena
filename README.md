@@ -4,6 +4,8 @@ AI Arena 是一个 **macOS 原生多模型讨论工作台**。输入一次问题
 
 ![报告窗口展示候选建议、发言出处和三席表态](docs/evidence/native-0.4/report.png)
 
+*上图为 0.4.0 报告样例，早于 0.5.0 界面。*
+
 ## 主要功能
 
 - **两席或三席讨论**。各席使用独立的原站网页。工作台安排独立作答、互评、候选起草和逐席确认。
@@ -11,7 +13,7 @@ AI Arena 是一个 **macOS 原生多模型讨论工作台**。输入一次问题
 - **结论可追溯**。报告先显示候选与各席态度，再提供反例、未决分歧和发言出处。全体一致需要各席明确接受同一版本。
 - **本机历史和导出**。可复制报告或导出 Markdown；历史可回看已完成场次，未完成场次在新建、关闭或退出后可从历史选择「继续这一场」。新建、结束或关闭窗口前会确认：结束整场后不能继续，关闭或退出确认后不再发起新的发送。
 
-[查看讨论界面（本地测试样例）](docs/evidence/native-0.3/discussion.png)
+[查看讨论界面（0.3.0 本地测试样例）](docs/evidence/native-0.3/discussion.png)
 
 ## 从源码运行
 
@@ -23,6 +25,8 @@ cd ai-arena
 ./desktop/build.sh
 open "desktop/build/AI Arena.app"
 ```
+
+如果使用 macOS 27 SDK 构建失败，可用 SDKROOT 指向 macOS 26.5 SDK。 [构建命令](desktop/README.md#构建和验收)
 
 首次打开后，在应用内按站点提示登录。选两席或三席，输入问题，点「开始讨论」。完成后从「详情」查看原文和报告，或用「导出」保存为 Markdown。 [试用指引](docs/try-it.md)
 
@@ -39,10 +43,10 @@ open "desktop/build/AI Arena.app"
 
 ## 开发与反馈
 
-`desktop/` 包含 SwiftUI、WebKit 和构建入口。`extension/` 保留早期 Chrome 扩展，桌面构建从这里打包共享的讨论引擎和站点驱动。扩展的工具栏入口复用已打开的工作台标签页；`tabs` 权限下只按本扩展 `workspace.html` 地址做筛选查询，并只读取本席绑定标签页的地址，不读取页面内容。`tests/` 包含引擎测试及桌面版隔离验收。 [开发约定](AGENTS.md)
+`desktop/` 包含 SwiftUI、WebKit 和构建入口。`shared/` 包含讨论引擎与站点驱动。`tests/` 包含引擎测试及桌面版隔离验收。旧 Chrome 扩展可在本地 Git 标签 extension-final 中查看。 [开发约定](AGENTS.md)
 
 反馈站点问题时，请附上应用版本、macOS 版本、站点、界面语言和复现步骤。使用合成题面，移除账号信息、私有对话和登录凭据。 [GitHub Issues](https://github.com/zhouchangju/ai-arena/issues)
 
 ## 许可
 
-本仓库目前尚未声明项目级许可证。TODO（项目所有者）　选择项目许可证。 [扩展内第三方品牌素材说明](extension/assets/providers/NOTICE.md)
+本仓库目前尚未声明项目级许可证。TODO（项目所有者）　选择项目许可证。

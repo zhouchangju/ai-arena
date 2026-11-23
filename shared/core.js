@@ -36,8 +36,7 @@
  * answers are a prerequisite stage before the first cycle and are not counted
  * by the budget. Each cycle starts with critique, then a candidate (or a
  * revised candidate) and a stance on that exact text. The shared engine's
- * default is 2 (`DEFAULT_MAX_ROUNDS`): that is what the browser extension
- * passes and what every session saved before the budget existed is treated as.
+ * default is 2, including for sessions saved before the budget existed.
  * The native desktop app creates a new discussion with an explicit 3, so its
  * visible default is three review cycles unless the user picks another budget
  * (1-5). A session created without an explicit budget keeps the original
@@ -77,8 +76,7 @@ export const MAX_SEATS = 3;
 // Maximum number of review cycles. Independent answers are a prerequisite
 // stage and are not part of the budget. `DEFAULT_MAX_ROUNDS` is the
 // legacy/shared-engine budget: two cycles, one targeted follow-up for explicit
-// opposition only, which is what the browser extension and every session saved
-// before the option keep. The native desktop app passes 3 explicitly for a new
+// opposition only, which sessions saved before the option retain. The native desktop app passes 3 explicitly for a new
 // discussion (its UI label is 互评上限); an explicit budget also follows
 // unresolved conditions. Each cycle starts with critique, then candidate and
 // stance.
@@ -1354,13 +1352,9 @@ function buildReport(session, reason) {
   const lines = ['# AI Arena 讨论结论', ''];
   lines.push('## 状态', '');
   lines.push(`- ${statusLabel(reason)}`);
-  // One budget line only: count the review cycles that actually began, not
-  // `session.round`. A session finished during independent answers has no
-  // critique entry in history and must render 0; a cycle that began with
-  // skipped or still-pending review tasks still counts because its review
-  // stage exists in the archived history.
   const maxRounds = sessionMaxRounds(session);
-  lines.push(`- 互评轮次：${critiqueRoundCount(history)} / ${maxRounds}`);
+  const reviewRounds = critiqueRoundCount(history);
+  if (reviewRounds > 0) lines.push('- ' + reviewRoundLabel(reviewRounds, maxRounds));
   lines.push(`- 候选版本：${version > 0 ? `v${version}` : '无'}`);
   lines.push(`- 参与席位：${session.providers.map((p) => `\`${p}\``).join('、')}`);
   const independentSeats = session.providers.filter((provider) =>
@@ -1386,7 +1380,7 @@ function buildReport(session, reason) {
   lines.push(
     `- 本轮互评席位：${crossReviewSeats.map((p) => `\`${p}\``).join('、') || '无'}（${crossReviewSeats.length}/${session.providers.length}）`,
   );
-  if (session.round >= maxRounds) {
+  if (reviewRounds >= maxRounds) {
     if (reason === 'conditional-agreement') {
       lines.push(
         `- 已到轮数上限（${maxRounds} 轮）：仍有附加条件未解决，这些条件保留在下方原文中，未计为无条件同意。`,
@@ -1401,12 +1395,12 @@ function buildReport(session, reason) {
     const last = history.length > 0 ? history[history.length - 1] : null;
     lines.push(
       last
-        ? `- 提前结束阶段：${STAGE_LABELS[last.stage] ?? last.stage}（第${last.round}轮），该阶段未完成`
+        ? `- 提前结束阶段：${reportStage(last, maxRounds)}，该阶段未完成`
         : '- 提前结束阶段：无',
     );
     if (pending.length > 0) {
       lines.push(
-        `- 未完成席位：${pendingSeatLabels(pending)}；状态仍为 pending（尚未提交），未计为同意，也不代表其他席位缺席。`,
+        `- 未完成席位：${pendingSeatLabels(pending, maxRounds)}；状态仍为 pending（尚未提交），未计为同意，也不代表其他席位缺席。`,
       );
     }
   }
@@ -1427,9 +1421,9 @@ function buildReport(session, reason) {
     );
     for (const note of guidance) {
       lines.push(
-        `- 补充 #${note.seq} · ${formatGuidanceTime(note.createdAt)} · ${STAGE_LABELS[note.stage] ?? note.stage}第${note.round}轮提出：${note.text}`,
+        `- 补充 #${note.seq} · ${formatGuidanceTime(note.createdAt)} · ${reportStage(note, maxRounds)}提出：${note.text}`,
       );
-      lines.push(`  - 随新任务发出：${guidanceDelivery(session, note)}`);
+      lines.push(`  - 随新任务发出：${guidanceDelivery(session, note, maxRounds)}`);
     }
     lines.push('');
   }
@@ -1463,7 +1457,7 @@ function buildReport(session, reason) {
   } else {
     for (const task of independentAnswers) {
       lines.push(
-        `### [${task.sourceId}] \`${task.provider}\` · 第${task.round}轮`,
+        `### [${task.sourceId}] \`${task.provider}\``,
         '',
         reportMaterial(task),
         '',
@@ -1521,7 +1515,7 @@ function buildReport(session, reason) {
   } else {
     for (const task of critiques) {
       lines.push(
-        `### [${task.sourceId}] \`${task.provider}\` · 第${task.round}轮`,
+        `### [${task.sourceId}] \`${task.provider}\` · ${reviewRoundLabel(task.round, maxRounds)}`,
         '',
         reportMaterial(task),
         '',
@@ -1545,12 +1539,12 @@ function buildReport(session, reason) {
   } else {
     for (const task of skipped) {
       lines.push(
-        `- \`${task.provider}\` 在${STAGE_LABELS[task.stage] ?? task.stage}（第${task.round}轮）跳过。`,
+        `- \`${task.provider}\` 在「${reportStage(task, maxRounds)}」跳过。`,
       );
     }
     for (const task of pending) {
       lines.push(
-        `- \`${task.provider}\` 在${STAGE_LABELS[task.stage] ?? task.stage}（第${task.round}轮）尚未提交，状态仍为 pending；不计为同意。`,
+        `- \`${task.provider}\` 在「${reportStage(task, maxRounds)}」尚未提交，状态仍为 pending；不计为同意。`,
       );
     }
   }
@@ -1571,7 +1565,7 @@ function buildReport(session, reason) {
   } else {
     for (const task of sorted) {
       lines.push(
-        `- [${task.sourceId}] \`${task.provider}\` · ${STAGE_LABELS[task.stage] ?? task.stage} · 第${task.round}轮 — ${excerpt(task.answer, 220)}`,
+        `- [${task.sourceId}] \`${task.provider}\` · ${reportStage(task, maxRounds)} — ${excerpt(task.answer, 220)}`,
       );
     }
   }
@@ -1640,7 +1634,7 @@ function orderedGuidance(session) {
 }
 
 /** Name the exact newly issued tasks that carried this condition. */
-function guidanceDelivery(session, note) {
+function guidanceDelivery(session, note, maxRounds) {
   const ids = Array.isArray(note.deliveredTo) ? note.deliveredTo : [];
   const labels = [];
   for (const id of ids) {
@@ -1648,7 +1642,7 @@ function guidanceDelivery(session, note) {
       session.tasks.find((candidate) => candidate.id === id) ||
       session.history.find((candidate) => candidate.id === id);
     if (!task) continue;
-    const label = `${STAGE_LABELS[task.stage] ?? task.stage}（第${task.round}轮）· ${task.provider}`;
+    const label = `（${reportStage(task, maxRounds)}）· ${task.provider}`;
     if (!labels.includes(label)) labels.push(label);
   }
   return labels.length > 0 ? labels.join('；') : '尚未随新任务发出';
@@ -1663,11 +1657,11 @@ function formatGuidanceTime(at) {
   )} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
-function pendingSeatLabels(pending) {
+function pendingSeatLabels(pending, maxRounds) {
   return pending
     .map(
       (task) =>
-        `\`${task.provider}\`（${STAGE_LABELS[task.stage] ?? task.stage} · 第${task.round}轮）`,
+        `\`${task.provider}\`（${reportStage(task, maxRounds)}）`,
     )
     .join('、');
 }
@@ -1701,6 +1695,17 @@ function statusLabel(reason) {
     default:
       return `已结束（${reason}）。`;
   }
+}
+
+function reviewRoundLabel(round, maxRounds) {
+  return `互评第 ${round} 轮 / 上限 ${maxRounds}`;
+}
+
+function reportStage(task, maxRounds) {
+  const stage = STAGE_LABELS[task.stage] ?? task.stage;
+  return task.stage === 'independent'
+    ? stage
+    : stage + ' · ' + reviewRoundLabel(task.round, maxRounds);
 }
 
 /** Review cycles that began, whether their tasks were answered, skipped or left pending. */

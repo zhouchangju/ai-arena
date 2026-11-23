@@ -101,8 +101,10 @@ struct ArenaReportReader: View {
             Label(outcome, systemImage: verifiedConsensus ? "checkmark.circle.fill" : "circle.lefthalf.filled")
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(verifiedConsensus ? Color.green : Color.primary)
-            Divider().frame(height: 15)
-            Text("第 \(ArenaValue.int(session?["round"]) ?? 1) 轮")
+            if let reviewRound = ArenaStageNames.reviewRound(session) {
+                Divider().frame(height: 15)
+                Text(reviewRound)
+            }
             if version > 0 { Text("候选 v\(version)") }
         }
         .font(.system(size: 13))
@@ -175,7 +177,7 @@ struct ArenaReportReader: View {
                         Text(row.sourceId).monospacedDigit().foregroundStyle(.secondary).frame(width: 44, alignment: .leading)
                         Text(ArenaSeatCatalog.name(row.provider))
                         Spacer()
-                        Text("第 \(row.round) 轮 · \(ArenaStageNames.label(row.stage))").foregroundStyle(.secondary)
+                        Text("\(ArenaStageNames.taskLabel(row.stage, round: row.round, session: session))").foregroundStyle(.secondary)
                         Image(systemName: "chevron.right").font(.caption)
                     }
                     .padding(.vertical, 7).contentShape(Rectangle())
@@ -206,7 +208,7 @@ struct ArenaReportReader: View {
                 Button { selectedSource = nil } label: { Label("返回报告", systemImage: "chevron.left") }
                 .buttonStyle(.link)
                 Text("\(ArenaSeatCatalog.name(row.provider)) · \(ArenaStageNames.label(row.stage))").font(.title.weight(.semibold))
-                Text("第 \(row.round) 轮 · \(row.sourceId)").foregroundStyle(.secondary)
+                Text([ArenaStageNames.taskLabel(row.stage, round: row.round, session: session), row.sourceId].joined(separator: " · ")).foregroundStyle(.secondary)
                 Divider()
                 ArenaMarkdownView(text: row.answer ?? "")
             }

@@ -246,7 +246,7 @@
   <p class="kicker">AI Arena · tests only</p>
   <h1>Web Driver 夹具<span class="seat-tag" id="seat-label">A 席</span></h1>
   <p class="lede">
-    本地、确定性的“网页版 AI”替身，用来验证 <code>extension/web-driver.js</code> 的
+    本地、确定性的“网页版 AI”替身，用来验证 <code>shared/web-driver.js</code> 的
     填写、发送、读取、完成判断与各种失败关闭。回答由本地哈希生成，带 <code>[FIXTURE]</code> 标记，
     每轮都有一行可直接解析的 <code>STANCE: agree|conditional|oppose</code> 立场；本页不推断任何人或模型的意图。
   </p>
@@ -320,7 +320,7 @@
     <details>
       <summary>验收步骤</summary>
       <ol>
-        <li>装扩展后在该标签页注入 <code>extension/web-driver.js</code>；工作台用 <code>frameId: 0</code> 发消息。</li>
+        <li>在测试页面注入 <code>shared/web-driver.js</code>，并通过驱动的消息接口检查发送和读取。</li>
         <li><code>arena.web.probe</code> 应返回 <code>ready</code>，并显示当前草稿是否为空。</li>
         <li><code>arena.web.submit</code> 使用上面选择器与一个 taskId；返回 <code>submitted</code> 后轮询 <code>arena.web.read</code>。</li>
         <li>用 slow 观察 <code>pending</code>；用 nostop / nodone 验证两种完成证据；用 nosignal 验证永不误判。</li>
