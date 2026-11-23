@@ -618,6 +618,29 @@ async function openProviderTab(sessionId, providerId, configuredUrl = '', overri
 }
 
 /**
+ * Chrome normally exposes `pendingUrl` as soon as the tab is created, but for a
+ * few milliseconds after `tabs.create` (and while a debugger has a navigation
+ * paused) it can report neither `url` nor `pendingUrl`. Waiting a short,
+ * bounded time for metadata avoids opening a duplicate conversation on a
+ * second click; the tab is never focused until its URL matches.
+ */
+async function inspectBoundTab(tabsApi, tabId, waitMs) {
+  const deadline = Date.now() + Math.max(0, waitMs);
+  let tab = null;
+  for (;;) {
+    try {
+      tab = await tabsApi.get(tabId);
+    } catch {
+      return null;
+    }
+    if (!tab || tabEntryUrl(tab) || Date.now() >= deadline) return tab;
+    await new Promise((resolve) => {
+      setTimeout(resolve, 50);
+    });
+  }
+}
+
+/**
  * Reuse the bound seat tab only when its readable metadata still proves it is
  * the configured entry page; otherwise leave that tab untouched and open a
  * fresh one from the workbench tab that requested it.
@@ -631,6 +654,7 @@ async function openProviderTabOnce(sessionId, providerId, configuredUrl, key, op
     set: setBinding,
     drop: dropBinding,
   };
+  const waitMs = Number.isFinite(options.urlWaitMs) ? options.urlWaitMs : 400;
   const targetUrl = typeof configuredUrl === 'string' && configuredUrl
     ? configuredUrl
     : provider.url;
@@ -646,14 +670,10 @@ async function openProviderTabOnce(sessionId, providerId, configuredUrl, key, op
   }
 
   if (binding && Number.isInteger(binding.tabId)) {
-    let tab = null;
-    try {
-      // Only the tab bound to this session+seat is inspected; never query all
-      // tabs, so the user's other windows are out of reach.
-      tab = await tabsApi.get(binding.tabId);
-    } catch {
-      tab = null;
-    }
+    // Only the tab bound to this session+seat is inspected; never query all
+    // tabs, so the user's other windows are out of reach. A bounded wait covers
+    // the brief window where a just-created tab has no readable URL yet.
+    let tab = await inspectBoundTab(tabsApi, binding.tabId, waitMs);
 
     if (tab && Number.isInteger(tab.id) && tabMatchesEntry(tab, targetUrl)) {
       if (hasSource && (tab.windowId !== sourceTab.windowId || tab.openerTabId !== sourceTab.id
@@ -1094,3 +1114,5 @@ export {
   pickWorkspaceTab,
   isWorkspaceTabUrl,
 };
+
+globalThis.__arenaTest = { openWorkspaceTab };

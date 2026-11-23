@@ -152,10 +152,25 @@ def main() -> int:
             ui = ba.WorkspaceUI(page, providers, runtime)
 
             # ---------------------------------------------------------------
-            # Setup: answer exactly one of two seats.
+            # Setup: one live answered seat. Create through the documented
+            # runtime contract so this narrow check does not depend on the
+            # start screen's public-seat permission prompt.
             # ---------------------------------------------------------------
             print("\n[1] One live answered seat")
-            session_id, _ = ui.create_debate(QUESTION, ["chatgpt", "claude"])
+            created = runtime.ok({
+                "type": "create",
+                "question": QUESTION,
+                "providers": ["chatgpt", "claude"],
+            })
+            session = created["session"]
+            session_id = str(session["id"])
+            page.goto(
+                f"chrome-extension://{extension_id}/{ui_path.lstrip('/')}#s={session_id}",
+                wait_until="domcontentloaded",
+                timeout=20000,
+            )
+            page.reload(wait_until="domcontentloaded")
+            page.locator("article.seat-card").first.wait_for()
             session = runtime.get(session_id)
             seat_a = next(task for task in session["tasks"] if task["provider"] == "chatgpt")
             ui.answer_task(session_id, seat_a, ORIGINAL)

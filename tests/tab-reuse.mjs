@@ -166,7 +166,12 @@ function harness() {
   const tabsWrap = createTabsApi();
   const bindings = createBindings();
   const windows = { updates: [], async update(id, info) { this.updates.push({ id, info }); } };
-  const deps = { tabs: tabsWrap.api, bindings: bindings.store, windows };
+  const deps = {
+    tabs: tabsWrap.api,
+    bindings: bindings.store,
+    windows,
+    urlWaitMs: 0,
+  };
   const open = (provider, url, module = worker) =>
     module.openProviderTab('session-1', provider, url, deps);
   return { ...tabsWrap, bindings, windows, deps, open };
@@ -422,6 +427,20 @@ test('both seats on one shared fixture origin stay on their own seat', async () 
   assert.equal(h.tabs.get(a).url, ENTRY_B, 'repurposed tab untouched');
   assert.equal(h.creates.length, 3);
   assert.equal(h.creates[2].url, ENTRY_A);
+});
+
+test('briefly unreadable metadata is awaited instead of duplicated', async () => {
+  const h = harness();
+  const first = await h.open('local-a', ENTRY_A);
+  h.blankUrl(first);
+  // Chrome exposes url/pendingUrl a few milliseconds later.
+  setTimeout(() => h.navigate(first, ENTRY_A), 80);
+  const again = await worker.openProviderTab('session-1', 'local-a', ENTRY_A, {
+    ...h.deps,
+    urlWaitMs: 400,
+  });
+  assert.equal(again, first);
+  assert.equal(h.creates.length, 1, 'waited for metadata instead of opening a duplicate');
 });
 
 test('unreadable or in-flight-redirect metadata never reuses a tab', async () => {

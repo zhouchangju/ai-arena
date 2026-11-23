@@ -468,9 +468,10 @@
       ].join('\n');
     }
 
-    // Independent and critique prompts keep the original sample behavior,
-    // including support/unclear counterexamples that must never be read as
-    // agreement. Only the exact vote marker above may count as a stance.
+    // Independent and critique prompts keep the sample's randomized stance
+    // line. Only the exact vote marker above is written as a strict
+    // automation vote; other STANCE values must be validated separately and
+    // never inferred as agreement.
     var stance = STANCES[seed % STANCES.length];
     return [
       label,

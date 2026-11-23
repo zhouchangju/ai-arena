@@ -51,71 +51,79 @@ body::after {
 
 /* ------------------------------ 导航玻璃 ------------------------------ */
 
-/* 关键不是多一层白，而是三件事：低不透明度的底色、被模糊的真实背景、
- * 一圈机加工般的亮边。底色低到能看见后面的玻璃带，正文仍落在足够暗的墨色上。 */
+/* 关键不是多一层白，而是三件事：低不透明度的底色、被折射的真实背景、
+ * 一圈机加工般的亮边。导航面板里放的是同一张光场的“透镜副本”：位置略偏、
+ * 预先柔化，所以玻璃带在边框处会和外面错开一点，像真的被玻璃推了一下。
+ * 这是 CSS 能做到的最接近折射的做法，也不依赖 backdrop-filter 的实现差异。 */
 .sidebar {
   position: sticky;
   border: 0;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.24) 0%, rgba(255, 255, 255, 0.05) 46%,
-      rgba(255, 255, 255, 0.14) 100%),
-    radial-gradient(130% 74% at 8% -4%, rgba(255, 255, 255, 0.4), rgba(255, 255, 255, 0) 62%);
+  background: rgba(246, 250, 255, 0.32);
   box-shadow:
+    0 0 0 1px rgba(52, 78, 132, 0.1),
     0 34px 74px -38px rgba(19, 36, 82, 0.58),
-    0 2px 6px rgba(19, 36, 82, 0.06),
-    inset 0 1px 0 rgba(255, 255, 255, 0.96),
-    inset 1px 0 0 rgba(255, 255, 255, 0.6),
-    inset -1px 0 0 rgba(86, 110, 162, 0.22),
-    inset 0 -1px 0 rgba(66, 92, 148, 0.16);
-  backdrop-filter: blur(26px) saturate(1.7) brightness(1.02);
-  -webkit-backdrop-filter: blur(26px) saturate(1.7) brightness(1.02);
+    0 2px 6px rgba(19, 36, 82, 0.06);
+  /* 折射由面板内的透镜副本完成；真正的 backdrop-filter 会把固定背景
+   * 拉进面板的坐标系，反而让副本错位，所以这里显式关掉。 */
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 
-/* 1px 的斜向亮边：上缘冷白，右缘偏钴蓝，下缘略暗，像磨过的棱。 */
+/* 透镜副本：与 body 的光场同一张图，按视口尺寸铺开，再整体偏移 10×6px。
+ * 面板的 overflow 负责裁切，所以边缘处能看见玻璃把背景“推了一下”。 */
 .sidebar::before {
   position: absolute;
-  z-index: 3;
-  inset: 0;
-  padding: 1px;
-  border-radius: inherit;
-  background: linear-gradient(148deg,
-    rgba(255, 255, 255, 0.98) 0%,
-    rgba(255, 255, 255, 0.28) 26%,
-    rgba(255, 255, 255, 0.08) 48%,
-    rgba(96, 126, 186, 0.38) 78%,
-    rgba(255, 255, 255, 0.82) 100%);
+  z-index: 0;
+  top: -10px;
+  left: -6px;
+  width: 100vw;
+  height: 100vh;
+  background-image: url("assets/field-light-soft.webp");
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: cover;
   content: "";
   pointer-events: none;
-  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-  -webkit-mask-composite: xor;
-  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-  mask-composite: exclude;
 }
 
-/* 玻璃内部的一次折光：贴着右缘的一条冷色反光，不出边。 */
+/* 玻璃本体：很薄的一层色、两道很窄的斜向反光、以及磨过的 1px 棱。 */
 .sidebar::after {
   position: absolute;
-  z-index: 0;
-  inset: 1px;
+  z-index: 2;
+  inset: 0;
   border-radius: inherit;
   background:
-    linear-gradient(96deg, rgba(255, 255, 255, 0.34) 0%, rgba(255, 255, 255, 0) 22%),
-    radial-gradient(60% 44% at 102% 42%, rgba(150, 186, 246, 0.26), transparent 72%),
-    radial-gradient(70% 40% at 50% 104%, rgba(126, 150, 214, 0.16), transparent 70%);
+    linear-gradient(114deg, rgba(255, 255, 255, 0) 28%, rgba(255, 255, 255, 0.13) 41%,
+      rgba(255, 255, 255, 0.02) 46%, rgba(255, 255, 255, 0) 52%),
+    linear-gradient(114deg, rgba(255, 255, 255, 0) 58%, rgba(255, 255, 255, 0.07) 66%,
+      rgba(255, 255, 255, 0) 71%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.08) 0%, rgba(248, 252, 255, 0.02) 42%,
+      rgba(196, 220, 250, 0.12) 100%),
+    radial-gradient(120% 24% at 50% 104%, rgba(255, 255, 255, 0.42), rgba(255, 255, 255, 0) 72%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.96),
+    inset 1px 0 0 rgba(255, 255, 255, 0.68),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.42),
+    inset -1px 0 0 rgba(84, 92, 164, 0.32),
+    inset 0 -1px 0 rgba(54, 80, 136, 0.26),
+    inset 0 -90px 70px -80px rgba(86, 116, 178, 0.3);
   content: "";
   pointer-events: none;
 }
 
-.sidebar > * {
+/* 历史抽屉在桌面用 display: contents，子节点才是真正的弹性项，
+ * 所以两层都要抬到玻璃层之上。 */
+.sidebar > *,
+.sidebar .history-nav-panel > * {
   position: relative;
-  z-index: 1;
+  z-index: 3;
 }
 
 /* 新讨论键：一枚薄玻璃片，亮边在上，键帽有一点内凹。 */
 .new-session {
   border: 1px solid rgba(255, 255, 255, 0.66);
   background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.62), rgba(255, 255, 255, 0.24));
+    linear-gradient(180deg, rgba(255, 255, 255, 0.56), rgba(255, 255, 255, 0.2));
   box-shadow:
     0 1px 0 rgba(255, 255, 255, 0.9) inset,
     0 -1px 0 rgba(84, 108, 158, 0.12) inset,
@@ -131,9 +139,9 @@ body::after {
 /* 搜索框：沉进玻璃里的凹槽，不是另一块白纸。 */
 .search input {
   border: 1px solid rgba(255, 255, 255, 0.5);
-  background: rgba(255, 255, 255, 0.26);
+  background: rgba(255, 255, 255, 0.2);
   box-shadow:
-    inset 0 1px 2px rgba(30, 50, 100, 0.1),
+    inset 0 1px 2px rgba(30, 50, 100, 0.12),
     inset 0 -1px 0 rgba(255, 255, 255, 0.55);
 }
 
@@ -165,62 +173,75 @@ body::after {
 
 /* 原来的“判”字换成两枚交叠镜片：两席对话、一个焦点。图形沿用本地 SVG。 */
 .seal {
-  border: 1px solid rgba(255, 255, 255, 0.52);
+  border: 1px solid rgba(255, 255, 255, 0.56);
   background:
-    url("assets/arena-mark.svg") center / 23px 23px no-repeat,
-    radial-gradient(120% 100% at 24% 10%, rgba(255, 255, 255, 0.42), transparent 54%),
-    linear-gradient(154deg, #6f8fe4 0%, #2c4a94 44%, #453d9b 78%, #6b5fc6 100%);
+    url("assets/arena-mark.svg") center / 25px 25px no-repeat,
+    radial-gradient(132% 104% at 22% 8%, rgba(226, 240, 255, 0.5), transparent 52%),
+    linear-gradient(152deg, #5b7bd2 0%, #24407e 46%, #382f7d 76%, #56499f 100%);
   box-shadow:
     0 10px 22px -12px rgba(22, 42, 104, 0.85),
-    inset 0 1px 0 rgba(255, 255, 255, 0.55),
-    inset 0 -10px 18px rgba(10, 22, 60, 0.42),
-    inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+    inset 0 1px 0 rgba(255, 255, 255, 0.6),
+    inset 1px 0 0 rgba(255, 255, 255, 0.28),
+    inset -1px 0 0 rgba(8, 18, 46, 0.32),
+    inset 0 -10px 18px rgba(10, 22, 60, 0.44),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.1);
   color: transparent;
   font-size: 0;
 }
 
 .stamp {
-  border: 1px solid rgba(255, 255, 255, 0.52);
+  border: 1px solid rgba(255, 255, 255, 0.56);
   background:
-    url("assets/arena-mark.svg") center / 20px 20px no-repeat,
-    radial-gradient(120% 100% at 24% 10%, rgba(255, 255, 255, 0.4), transparent 54%),
-    linear-gradient(154deg, #6f8fe4 0%, #2c4a94 44%, #453d9b 78%, #6b5fc6 100%);
+    url("assets/arena-mark.svg") center / 21px 21px no-repeat,
+    radial-gradient(132% 104% at 22% 8%, rgba(226, 240, 255, 0.46), transparent 52%),
+    linear-gradient(152deg, #5b7bd2 0%, #24407e 46%, #382f7d 76%, #56499f 100%);
   box-shadow:
     0 8px 18px -12px rgba(22, 42, 104, 0.85),
-    inset 0 1px 0 rgba(255, 255, 255, 0.5),
-    inset 0 -8px 16px rgba(10, 22, 60, 0.4),
-    inset 0 0 0 1px rgba(255, 255, 255, 0.1);
+    inset 0 1px 0 rgba(255, 255, 255, 0.55),
+    inset 1px 0 0 rgba(255, 255, 255, 0.24),
+    inset -1px 0 0 rgba(8, 18, 46, 0.3),
+    inset 0 -8px 16px rgba(10, 22, 60, 0.42),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.08);
   color: transparent;
   font-size: 0;
 }
 
 /* ------------------------------ 首页徽记 ------------------------------ */
 
-/* 右上的小型玻璃雕塑：两条带子交叠成一只镜片。只在桌面断点出现，
- * 落在标题之外，不与文字抢道。
- * 图形是 Cycles 实拍渲染（.git/glass/sculpt/hero_loops.py），一张透明 webp，
- * 玻璃本体的折射、色散和长条高光都在像素里，不是渐变占位。 */
+/* 右上是一只真正互锁的玻璃环：两圈扭转的厚玻璃在交叠处互相折射。
+ * 图形是本机离线渲染的透明 WebP（assets/hero-loops-light.webp /
+ * hero-loops-dark.webp），亮银、冰蓝与一点紫都在像素里；亮面与暗面各一张。
+ * 只在桌面断点出现，徽记占据右侧留白，不与标题抢道。 */
 .home-hero {
   position: relative;
+}
+
+@media (min-width: 981px) {
+  /* 首页标题区留出徽记的高度，避免玻璃环被下面的问题卡遮住。 */
+  .home-hero {
+    padding-bottom: 58px;
+  }
 }
 
 .home-hero::after {
   position: absolute;
   top: 50%;
-  right: -6px;
-  width: clamp(140px, 13vw, 185px);
-  aspect-ratio: 640 / 560;
-  background: url("assets/hero-loops.webp") center / contain no-repeat;
+  right: 2px;
+  width: auto;
+  height: calc(100% - 12px);
+  max-height: 132px;
+  aspect-ratio: 343 / 371;
+  background: url("assets/hero-loops-light.webp") center / contain no-repeat;
   content: "";
-  filter: drop-shadow(0 18px 30px rgba(26, 50, 108, 0.26));
+  filter: drop-shadow(0 14px 20px rgba(26, 50, 108, 0.28)) saturate(1.16) contrast(1.08) brightness(0.99);
   pointer-events: none;
   transform: translateY(-50%);
 }
 
-@media (max-width: 1180px) {
+@media (max-width: 1180px) and (min-width: 981px) {
   .home-hero::after {
-    right: 0;
-    width: clamp(132px, 15vw, 160px);
+    right: -2px;
+    max-height: 116px;
   }
 }
 
@@ -261,35 +282,34 @@ body::after {
 
   /* 深色下玻璃更薄：黑底本身压得住正文，反而能多露一点底下的光。 */
   .sidebar {
-    background:
-      linear-gradient(180deg, rgba(24, 34, 60, 0.46) 0%, rgba(10, 16, 32, 0.3) 48%,
-        rgba(22, 30, 54, 0.42) 100%),
-      radial-gradient(130% 74% at 8% -4%, rgba(120, 150, 255, 0.14), transparent 62%);
+    background: rgba(8, 12, 24, 0.55);
     box-shadow:
+      0 0 0 1px rgba(0, 0, 0, 0.55),
       0 34px 80px -34px rgba(0, 0, 0, 0.8),
-      0 2px 8px rgba(0, 0, 0, 0.35),
-      inset 0 1px 0 rgba(255, 255, 255, 0.14),
-      inset 1px 0 0 rgba(255, 255, 255, 0.07),
-      inset -1px 0 0 rgba(0, 0, 0, 0.5),
-      inset 0 -1px 0 rgba(0, 0, 0, 0.45);
-    backdrop-filter: blur(24px) saturate(1.5) brightness(1.04);
-    -webkit-backdrop-filter: blur(24px) saturate(1.5) brightness(1.04);
+      0 2px 8px rgba(0, 0, 0, 0.35);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
   }
 
   .sidebar::before {
-    background: linear-gradient(148deg,
-      rgba(220, 235, 255, 0.5) 0%,
-      rgba(220, 235, 255, 0.1) 26%,
-      rgba(255, 255, 255, 0.03) 48%,
-      rgba(0, 0, 0, 0.45) 80%,
-      rgba(180, 205, 255, 0.36) 100%);
+    background-image: url("assets/field-dark-soft.webp");
   }
 
   .sidebar::after {
     background:
-      linear-gradient(96deg, rgba(255, 255, 255, 0.1) 0%, rgba(255, 255, 255, 0) 24%),
-      radial-gradient(60% 44% at 102% 42%, rgba(90, 126, 220, 0.28), transparent 72%),
-      radial-gradient(70% 40% at 50% 104%, rgba(96, 120, 210, 0.14), transparent 70%);
+      linear-gradient(114deg, rgba(255, 255, 255, 0) 28%, rgba(255, 255, 255, 0.07) 41%,
+        rgba(255, 255, 255, 0) 48%),
+      linear-gradient(114deg, rgba(255, 255, 255, 0) 58%, rgba(255, 255, 255, 0.05) 66%,
+        rgba(255, 255, 255, 0) 72%),
+      linear-gradient(180deg, rgba(22, 32, 58, 0.42) 0%, rgba(8, 13, 26, 0.24) 46%,
+        rgba(16, 24, 46, 0.4) 100%);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.14),
+      inset 1px 0 0 rgba(255, 255, 255, 0.08),
+      inset 0 0 0 1px rgba(255, 255, 255, 0.05),
+      inset -1px 0 0 rgba(0, 0, 0, 0.55),
+      inset 0 -1px 0 rgba(0, 0, 0, 0.5),
+      inset 0 -90px 70px -80px rgba(90, 120, 210, 0.22);
   }
 
   .new-session {
@@ -333,27 +353,30 @@ body::after {
 
   .seal,
   .stamp {
-    border-color: rgba(190, 214, 255, 0.3);
+    border-color: rgba(190, 214, 255, 0.32);
     background:
-      url("assets/arena-mark.svg") center / 23px 23px no-repeat,
-      radial-gradient(120% 100% at 24% 10%, rgba(220, 236, 255, 0.26), transparent 56%),
-      linear-gradient(154deg, #546fbe 0%, #1c3068 46%, #352f7c 80%, #4d449c 100%);
+      url("assets/arena-mark.svg") center / 25px 25px no-repeat,
+      radial-gradient(132% 104% at 22% 8%, rgba(220, 236, 255, 0.28), transparent 54%),
+      linear-gradient(152deg, #4a63b4 0%, #172c60 46%, #2d2770 78%, #443a8e 100%);
     box-shadow:
       0 10px 24px -14px rgba(0, 0, 0, 0.9),
-      inset 0 1px 0 rgba(255, 255, 255, 0.28),
+      inset 0 1px 0 rgba(255, 255, 255, 0.3),
+      inset 1px 0 0 rgba(255, 255, 255, 0.12),
+      inset -1px 0 0 rgba(0, 0, 0, 0.45),
       inset 0 -10px 18px rgba(0, 0, 0, 0.5),
       inset 0 0 0 1px rgba(190, 214, 255, 0.08);
   }
 
   .stamp {
     background:
-      url("assets/arena-mark.svg") center / 20px 20px no-repeat,
-      radial-gradient(120% 100% at 24% 10%, rgba(220, 236, 255, 0.24), transparent 56%),
-      linear-gradient(154deg, #546fbe 0%, #1c3068 46%, #352f7c 80%, #4d449c 100%);
+      url("assets/arena-mark.svg") center / 21px 21px no-repeat,
+      radial-gradient(132% 104% at 22% 8%, rgba(220, 236, 255, 0.26), transparent 54%),
+      linear-gradient(152deg, #4a63b4 0%, #172c60 46%, #2d2770 78%, #443a8e 100%);
   }
 
   .home-hero::after {
-    filter: drop-shadow(0 20px 32px rgba(0, 0, 0, 0.5));
+    background-image: url("assets/hero-loops-dark.webp");
+    filter: drop-shadow(0 16px 26px rgba(0, 0, 0, 0.5));
   }
 
   .topbar {
@@ -375,6 +398,12 @@ body::after {
     display: none;
   }
 
+  /* 窄屏导航由 history-nav.css 接管，透镜副本在这里没有意义。 */
+  .sidebar::before,
+  .sidebar::after {
+    display: none;
+  }
+
   body {
     background-position: 62% 42%;
   }
@@ -392,12 +421,7 @@ body::after {
   }
 
   .sidebar {
-    box-shadow:
-      0 22px 48px -32px rgba(19, 36, 82, 0.5),
-      inset 0 1px 0 rgba(255, 255, 255, 0.95),
-      inset 1px 0 0 rgba(255, 255, 255, 0.55),
-      inset -1px 0 0 rgba(86, 110, 162, 0.2),
-      inset 0 -1px 0 rgba(66, 92, 148, 0.14);
+    box-shadow: 0 22px 48px -32px rgba(19, 36, 82, 0.5);
   }
 }
 
@@ -416,12 +440,9 @@ body::after {
     -webkit-backdrop-filter: none;
   }
 
+  .sidebar::before,
   .sidebar::after {
     display: none;
-  }
-
-  .sidebar::before {
-    opacity: 0.4;
   }
 
   .new-session,

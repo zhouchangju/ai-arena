@@ -34,7 +34,8 @@
   --ink: #141a2e;
   --ink-soft: #333c56;
   --muted: #59637d;
-  --faint: #626c86;
+  --faint: #59627b;
+  --sidebar-quiet: #4c566e;
 
   --line: rgba(26, 40, 86, 0.12);
   --line-strong: rgba(26, 40, 86, 0.22);
@@ -234,7 +235,7 @@ textarea {
 }
 
 .brand-sub {
-  color: var(--muted);
+  color: var(--sidebar-quiet);
   font-size: 9.5px;
   font-weight: 600;
   letter-spacing: 0.15em;
@@ -289,7 +290,7 @@ textarea {
   align-items: center;
   justify-content: space-between;
   padding: 4px 4px 0;
-  color: var(--muted);
+  color: var(--sidebar-quiet);
   font-size: 10.5px;
   font-weight: 600;
   letter-spacing: 0.13em;
@@ -391,17 +392,17 @@ textarea {
 .history-meta {
   display: flex;
   gap: 8px;
-  color: var(--muted);
+  color: var(--sidebar-quiet);
   font-size: 10.5px;
 }
 
 .history-item.is-active .history-meta {
-  color: var(--muted);
+  color: var(--sidebar-quiet);
 }
 
 .sidebar-empty {
   padding: 18px 8px;
-  color: var(--muted);
+  color: var(--sidebar-quiet);
   font-size: 12px;
   line-height: 1.7;
 }
@@ -429,13 +430,18 @@ textarea {
 .sidebar-foot {
   padding: 13px 4px 0;
   border-top: 1px solid var(--line);
-  color: var(--muted);
+  color: var(--sidebar-quiet);
   font-size: 10.5px;
   line-height: 1.7;
 }
 
 .sidebar-foot p {
   margin: 0 0 4px;
+}
+
+/* 窄屏历史抽屉会覆盖正文，玻璃底要提高不透明度，避免文字互相穿透。 */
+.sidebar.is-history-compact.is-history-open .history-nav-panel {
+  background: rgba(255, 255, 255, 0.97);
 }
 
 .main {
@@ -859,10 +865,11 @@ textarea {
   gap: 12px;
   margin-top: 13px;
   padding: 12px 14px;
-  border: 1px solid rgba(122, 90, 18, 0.16);
+  border: 1px solid rgba(122, 90, 18, 0.14);
+  border-left: 3px solid rgba(122, 90, 18, 0.55);
   border-radius: 12px;
-  background: var(--amber-wash);
-  color: #6a4d0f;
+  background: rgba(122, 90, 18, 0.05);
+  color: var(--ink-soft);
   font-size: 12px;
   line-height: 1.7;
 }
@@ -875,7 +882,7 @@ textarea {
 }
 
 .manual-note span {
-  color: #6d531c;
+  color: var(--ink-soft);
 }
 
 .inline-error {
@@ -1130,11 +1137,11 @@ textarea {
 
 /* 侧栏里的入口保持玻璃质感，而不是另一块深色按钮。 */
 .btn-on-dark {
-  border-color: var(--line-strong);
-  background: rgba(255, 255, 255, 0.68);
+  border-color: rgba(42, 78, 168, 0.24);
+  background: rgba(255, 255, 255, 0.78);
   box-shadow:
-    0 2px 6px rgba(24, 38, 84, 0.06),
-    inset 0 1px 0 rgba(255, 255, 255, 0.8);
+    0 1px 2px rgba(24, 38, 84, 0.07),
+    inset 0 1px 0 rgba(255, 255, 255, 0.85);
   color: var(--accent-deep);
 }
 
@@ -1273,6 +1280,7 @@ textarea {
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.7),
     0 10px 24px -20px rgba(24, 38, 84, 0.5);
+  backdrop-filter: blur(18px) saturate(1.35);
 }
 
 .session-toolbar .btn {
@@ -1413,20 +1421,24 @@ textarea {
   gap: 16px;
   margin-top: 18px;
   padding: 11px 14px;
-  border: 1px solid rgba(122, 90, 18, 0.18);
+  border: 1px solid var(--line);
+  border-left: 3px solid rgba(122, 90, 18, 0.6);
   border-radius: 12px;
-  background: var(--amber-wash);
-  color: #6a4d0f;
+  background: rgba(255, 255, 255, 0.6);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7);
+  color: var(--ink-soft);
   font-size: 12.5px;
+  backdrop-filter: blur(16px) saturate(1.25);
 }
 
 .pause-banner strong {
   margin-right: 8px;
+  color: var(--amber);
   font-size: 12.5px;
 }
 
 .pause-banner span {
-  color: #6d531c;
+  color: var(--ink-soft);
   line-height: 1.6;
 }
 
@@ -2073,33 +2085,39 @@ textarea {
 }
 
 .stance-btn.is-active {
-  border-color: rgba(255, 255, 255, 0.9);
+  border-color: rgba(26, 40, 86, 0.2);
   background: #ffffff;
   box-shadow:
     0 1px 3px rgba(24, 38, 84, 0.14),
-    inset 0 1px 0 #ffffff;
+    inset 0 -2px 0 rgba(42, 78, 168, 0.55);
   color: var(--ink);
   font-weight: 600;
 }
 
 .stance-btn.is-active[data-stance="agree"] {
-  border-color: rgba(40, 98, 74, 0.24);
-  background: #f4fbf6;
-  box-shadow: 0 1px 3px rgba(24, 38, 84, 0.1);
+  border-color: rgba(40, 98, 74, 0.34);
+  background: #ffffff;
+  box-shadow:
+    0 1px 3px rgba(24, 38, 84, 0.12),
+    inset 0 -2px 0 rgba(40, 98, 74, 0.6);
   color: var(--green);
 }
 
 .stance-btn.is-active[data-stance="conditional"] {
-  border-color: rgba(122, 90, 18, 0.24);
-  background: #fdf7e8;
-  box-shadow: 0 1px 3px rgba(24, 38, 84, 0.1);
+  border-color: rgba(122, 90, 18, 0.34);
+  background: #ffffff;
+  box-shadow:
+    0 1px 3px rgba(24, 38, 84, 0.12),
+    inset 0 -2px 0 rgba(122, 90, 18, 0.6);
   color: var(--amber);
 }
 
 .stance-btn.is-active[data-stance="oppose"] {
-  border-color: rgba(156, 53, 56, 0.24);
-  background: #fdf1f0;
-  box-shadow: 0 1px 3px rgba(24, 38, 84, 0.1);
+  border-color: rgba(156, 53, 56, 0.34);
+  background: #ffffff;
+  box-shadow:
+    0 1px 3px rgba(24, 38, 84, 0.12),
+    inset 0 -2px 0 rgba(156, 53, 56, 0.6);
   color: #8a3a3d;
 }
 
@@ -2417,9 +2435,9 @@ textarea {
 .report-conditions {
   margin-top: 12px;
   padding: 11px 14px;
-  border-left: 2px solid rgba(122, 90, 18, 0.4);
+  border-left: 2px solid rgba(122, 90, 18, 0.55);
   border-radius: 0 10px 10px 0;
-  background: var(--amber-wash);
+  background: rgba(122, 90, 18, 0.05);
 }
 
 .report-conditions-title {
@@ -2443,7 +2461,7 @@ textarea {
 }
 
 .report-details-summary:focus-visible {
-  outline: 2px solid rgba(42, 78, 168, 0.5);
+  outline: 3px solid var(--accent);
   outline-offset: 3px;
   border-radius: 4px;
 }
@@ -2996,6 +3014,7 @@ noscript {
     --ink-soft: #ced7e9;
     --muted: #a6b0c6;
     --faint: #939db4;
+    --sidebar-quiet: #a6b0c6;
 
     --line: rgba(255, 255, 255, 0.11);
     --line-strong: rgba(255, 255, 255, 0.2);
@@ -3175,15 +3194,78 @@ noscript {
     color: var(--accent-deep);
   }
 
-  .manual-note,
-  .pause-banner {
-    border-color: rgba(226, 194, 124, 0.22);
-    color: var(--amber);
+  .manual-note {
+    border-color: rgba(226, 194, 124, 0.2);
+    border-left-color: rgba(226, 194, 124, 0.7);
+    background: rgba(226, 194, 124, 0.07);
+    color: var(--ink-soft);
   }
 
-  .manual-note span,
+  .manual-note span {
+    color: var(--ink-soft);
+  }
+
+  .pause-banner {
+    border-color: var(--line);
+    border-left-color: rgba(226, 194, 124, 0.7);
+    background: rgba(255, 255, 255, 0.05);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+    color: var(--ink-soft);
+  }
+
   .pause-banner span {
-    color: #d9bd86;
+    color: var(--ink-soft);
+  }
+
+  .report-conditions {
+    border-left-color: rgba(226, 194, 124, 0.7);
+    background: rgba(226, 194, 124, 0.07);
+  }
+
+  .auto-notice.is-warn {
+    background: rgba(226, 194, 124, 0.07);
+  }
+
+  .auto-notice.is-error {
+    background: rgba(150, 52, 58, 0.12);
+  }
+
+  /* 兼容后加载的动作折叠与窄屏历史开关，避免深色下留下浅色小片。 */
+  .task-more .task-more-summary,
+  .task-more[open].task-more > .task-more-summary {
+    border-color: rgba(255, 255, 255, 0.14);
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--muted);
+  }
+
+  .task-more .task-more-summary:hover,
+  .task-more[open].task-more > .task-more-summary:hover {
+    border-color: rgba(127, 156, 245, 0.4);
+    background: rgba(255, 255, 255, 0.11);
+    color: var(--ink);
+  }
+
+  .sidebar .history-nav-toggle {
+    border-color: rgba(255, 255, 255, 0.14);
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0.04));
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.1);
+    color: var(--ink);
+  }
+
+  .sidebar .history-nav-toggle:hover {
+    border-color: rgba(127, 156, 245, 0.4);
+    background: rgba(255, 255, 255, 0.11);
+    color: var(--ink);
+  }
+
+  .sidebar .history-nav-toggle[aria-expanded="true"] {
+    border-color: rgba(127, 156, 245, 0.42);
+    background: rgba(127, 156, 245, 0.18);
+    color: var(--accent-deep);
+  }
+
+  .sidebar.is-history-compact.is-history-open .history-nav-panel {
+    background: rgba(18, 26, 46, 0.97);
   }
 
   .seat-card.is-skipped {
@@ -3330,15 +3412,15 @@ noscript {
   }
 
   .btn-on-dark {
-    border-color: rgba(255, 255, 255, 0.14);
-    background: rgba(255, 255, 255, 0.06);
-    color: var(--ink-soft);
+    border-color: rgba(127, 156, 245, 0.34);
+    background: rgba(127, 156, 245, 0.12);
+    color: var(--accent-deep);
   }
 
   .btn-on-dark:hover:not(:disabled) {
-    border-color: rgba(127, 156, 245, 0.4);
-    background: rgba(255, 255, 255, 0.11);
-    color: var(--accent-deep);
+    border-color: rgba(127, 156, 245, 0.55);
+    background: rgba(127, 156, 245, 0.2);
+    color: #dfe8ff;
   }
 
   .stance-group {
@@ -3352,26 +3434,37 @@ noscript {
 
   .stance-btn.is-active {
     border-color: rgba(255, 255, 255, 0.18);
-    background: rgba(255, 255, 255, 0.12);
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+    background: rgba(255, 255, 255, 0.1);
+    box-shadow:
+      0 1px 3px rgba(0, 0, 0, 0.35),
+      inset 0 -2px 0 rgba(127, 156, 245, 0.7);
     color: var(--ink);
   }
 
   .stance-btn.is-active[data-stance="agree"] {
     border-color: rgba(134, 199, 164, 0.32);
-    background: rgba(52, 128, 92, 0.24);
+    background: rgba(52, 128, 92, 0.16);
+    box-shadow:
+      0 1px 3px rgba(0, 0, 0, 0.35),
+      inset 0 -2px 0 rgba(134, 199, 164, 0.7);
     color: #a8e0bf;
   }
 
   .stance-btn.is-active[data-stance="conditional"] {
     border-color: rgba(226, 194, 124, 0.32);
-    background: rgba(150, 112, 30, 0.24);
+    background: rgba(226, 194, 124, 0.09);
+    box-shadow:
+      0 1px 3px rgba(0, 0, 0, 0.35),
+      inset 0 -2px 0 rgba(226, 194, 124, 0.7);
     color: #f0d79c;
   }
 
   .stance-btn.is-active[data-stance="oppose"] {
     border-color: rgba(240, 154, 157, 0.32);
-    background: rgba(150, 52, 58, 0.26);
+    background: rgba(150, 52, 58, 0.16);
+    box-shadow:
+      0 1px 3px rgba(0, 0, 0, 0.35),
+      inset 0 -2px 0 rgba(240, 154, 157, 0.66);
     color: #f7b6b8;
   }
 
@@ -3432,7 +3525,13 @@ noscript {
   .all-terminal-note,
   .provider-grid,
   .history-item,
-  .timeline-item {
+  .timeline-item,
+  .pause-banner {
+    background: var(--surface-solid);
+    backdrop-filter: none;
+  }
+
+  .sidebar.is-history-compact.is-history-open .history-nav-panel {
     background: var(--surface-solid);
     backdrop-filter: none;
   }
@@ -3464,7 +3563,13 @@ noscript {
   .home-guide,
   .provider-grid,
   .history-item,
-  .timeline-item {
+  .timeline-item,
+  .pause-banner {
+    background: var(--surface-solid);
+    backdrop-filter: none;
+  }
+
+  .sidebar.is-history-compact.is-history-open .history-nav-panel {
     background: var(--surface-solid);
     backdrop-filter: none;
   }
@@ -3488,6 +3593,7 @@ noscript {
     --line-strong: rgba(255, 255, 255, 0.5);
     --muted: #c3ccdd;
     --faint: #b4bece;
+    --sidebar-quiet: #c3ccdd;
   }
 }
 
@@ -3645,12 +3751,12 @@ noscript {
 
 .auto-notice.is-warn {
   border-left-color: var(--amber);
-  background: var(--amber-wash);
+  background: rgba(122, 90, 18, 0.06);
 }
 
 .auto-notice.is-error {
   border-left-color: var(--danger);
-  background: var(--danger-wash);
+  background: rgba(156, 53, 56, 0.06);
 }
 
 /* 席卡上的自动进度：发送确认、流式正文与接管入口。 */

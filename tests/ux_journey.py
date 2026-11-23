@@ -211,15 +211,18 @@ def main() -> int:
 
             # Exercise the copy-only action here; guidance_acceptance verifies the compound handoff.
             first_seat = page.locator("article.seat-card.is-next")
-            first_seat.locator("details.task-more summary").click()
-            page.bring_to_front()
-            first_seat.get_by_role("button", name="复制提示", exact=True).click()
-            ba.wait_until(
-                lambda: "粘回" in next_step.inner_text(timeout=4000),
-                "next step paste prompt",
-            )
-            check("After copying, the next step asks for the pasted answer", True)
-            shot(page, out, "04b_next_step_paste")
+            if first_seat.count():
+                first_seat.locator("details.task-more summary").click()
+                page.bring_to_front()
+                first_seat.get_by_role("button", name="复制提示", exact=True).click()
+                ba.wait_until(
+                    lambda: "粘回" in next_step.inner_text(timeout=4000),
+                    "next step paste prompt",
+                )
+                check("After copying, the next step asks for the pasted answer", True)
+                shot(page, out, "04b_next_step_paste")
+            else:
+                check("After copying, the next step asks for the pasted answer", False, "no next-step strip in this build")
 
             # ---------- 4. first answer: pending remainder stays legible ----------
             session = runtime.get(session_id)
@@ -335,6 +338,7 @@ def main() -> int:
                   selected == ["chatgpt", "claude", "gemini"], str(selected))
             shot(page, out, "14b_home_third_seat")
             page.set_viewport_size({"width": 420, "height": 800})
+            page.wait_for_timeout(600)
             overflow = page.evaluate("() => document.documentElement.scrollWidth - document.documentElement.clientWidth")
             check("Narrow home has no horizontal overflow", overflow <= 0, f"overflow={overflow}px")
             shot(page, out, "15_home_narrow")
@@ -370,6 +374,7 @@ def main() -> int:
             # ---------- 9. dark color scheme ----------
             print(f"\n[{args.label}] dark")
             page.set_viewport_size({"width": 1280, "height": 800})
+            page.wait_for_timeout(400)
             page.emulate_media(color_scheme="dark")
             page.reload(wait_until="domcontentloaded")
             ba.wait_until(lambda: page.locator("body").inner_text(timeout=3000).strip(), "dark render")
@@ -453,6 +458,7 @@ def main() -> int:
             save_buttons = conn.get_by_role("button", name=re.compile("保存"))
             check("Connections screen exposes per-seat save controls", save_buttons.count() >= 2, f"{save_buttons.count()} save buttons")
             conn.set_viewport_size({"width": 420, "height": 800})
+            conn.wait_for_timeout(500)
             overflow = conn.evaluate("() => document.documentElement.scrollWidth - document.documentElement.clientWidth")
             check("Narrow connections screen has no horizontal overflow", overflow <= 0, f"overflow={overflow}px")
             shot(conn, out, "21_connections_narrow")

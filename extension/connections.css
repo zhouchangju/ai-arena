@@ -25,7 +25,7 @@
   --ink: #141a2e;
   --ink-soft: #333c56;
   --muted: #59637d;
-  --ink-faint: #626c86;
+  --ink-faint: #59627b;
 
   --line: rgba(26, 40, 86, 0.12);
   --line-strong: rgba(26, 40, 86, 0.22);
@@ -629,6 +629,7 @@ code {
   font-size: 12.5px;
   font-weight: 600;
   line-height: 1.4;
+  text-decoration: none;
   white-space: nowrap;
   cursor: pointer;
   transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease,
@@ -647,7 +648,7 @@ code {
 }
 
 .btn:focus-visible {
-  outline: 3px solid rgba(42, 78, 168, 0.52);
+  outline: 3px solid var(--accent);
   outline-offset: 2px;
 }
 
@@ -929,6 +930,28 @@ code {
     box-shadow:
       var(--shadow-float),
       inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  }
+
+  .notice {
+    border-color: rgba(226, 194, 124, 0.22);
+    background: var(--warn-soft);
+    color: var(--amber);
+  }
+
+  .notice-copy p {
+    color: #d9bd86;
+  }
+
+  .feedback[data-kind="ok"] {
+    color: var(--ok);
+  }
+
+  .feedback[data-kind="warn"] {
+    color: var(--warn);
+  }
+
+  .feedback[data-kind="error"] {
+    color: var(--error);
   }
 
   .stamp {

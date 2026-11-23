@@ -2264,7 +2264,8 @@ async function pumpSeat(id, session, provider, resolved) {
   const config = resolved && resolved.config;
   if (!config) {
     const problem = (resolved && resolved.problem) || '该席位没有可用的网页配置';
-    await noteSeat(id, provider, task, 'idle', `${problem}，可人工处理`);
+    const detail = /可人工处理/.test(problem) ? problem : `${problem}，可人工处理`;
+    await noteSeat(id, provider, task, 'idle', detail);
     return;
   }
 
@@ -2739,9 +2740,14 @@ function scheduleNextPoll() {
     pollTimer = null;
     try {
       const store = await loadStore();
-      const active = Object.values(store.runs).some(
-        (run) => run.enabled && !run.completed,
-      );
+      const active = Object.values(store.runs).some((run) => {
+        if (!run.enabled || run.completed) return false;
+        const seats = Object.values(run.seats || {});
+        // A run whose every seat is paused or taken over needs an explicit
+        // start/config change; keep the service worker free until then.
+        if (seats.length === 0) return true;
+        return seats.some((seat) => seat && !seat.paused && !seat.takenOver);
+      });
       if (active) kickPump();
     } catch {
       /* alarms remain the durable fallback */

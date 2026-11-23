@@ -15,7 +15,7 @@ import { latestAnsweredProposal, proposalDigest } from './core.js';
  * ------------------------------------------------------------------------- */
 
 const MIN_SEATS = 2;
-const MAX_SEATS = 3;
+const MAX_SEATS = 2;
 
 const STAGES = [
   {
@@ -715,7 +715,7 @@ function requestPublicSeatPermissions(providers) {
       granted: false,
       ids,
       origins,
-      error: new Error('当前环境不能请求网页权限；请从 Chrome 的扩展页打开工作台。'),
+      error: new Error('当前环境不能请求网页权限；请从 Chrome 扩展页打开本页。'),
     });
   }
   return new Promise((resolve) => {
@@ -1691,7 +1691,7 @@ function homeSeatStatusText() {
 
 function homeSeatModeSummary() {
   const selected = state.compose.providers;
-  if (!selected.length) return `选 ${MIN_SEATS} 或 ${MAX_SEATS} 个不同的 AI 就能开始。`;
+  if (!selected.length) return `选 ${MIN_SEATS} 位不同的 AI 就能开始。`;
 
   const parts = selected.map((id, index) =>
     `${seatLetter(index)} ${providerName(id)}：${homeSeatModeText(id)}`);
@@ -1797,7 +1797,7 @@ function renderHome() {
     id: 'question-input',
     class: 'question-input',
     rows: 3,
-    placeholder: '我只有两个周末，个人笔记工具先做手机版，还是先把搜索做好？',
+    placeholder: '写清你要判断的问题、已有条件与时间限制。',
     spellcheck: false,
     autocomplete: 'off',
     dataset: { focusKey: 'question' },
@@ -1914,7 +1914,7 @@ function renderHome() {
           h('span', { class: 'kbd-hint', text: '⌘ / Ctrl + Enter 开始' }))),
       h('div', { class: 'home-seats' },
         h('div', { class: 'home-seat-head' },
-          h('h2', { class: 'home-seat-title', text: '选择两个或三个 AI' }),
+          h('h2', { class: 'home-seat-title', text: '选择两位 AI' }),
           refs.selectionCount),
         providerGrid,
         refs.seatStatus,
@@ -2057,7 +2057,7 @@ function previewNameText() {
   const names = state.compose.providers.map(providerName);
   if (names.length > 1) return `${names.slice(0, -1).join('、')} 与 ${names[names.length - 1]}`;
   if (names.length === 1) return `${names[0]} 与另一席`;
-  return `${MIN_SEATS} 到 ${MAX_SEATS} 席`;
+  return `${MIN_SEATS} 位 AI`;
 }
 
 function toggleProvider(id) {
@@ -2135,7 +2135,7 @@ async function startSession() {
   }
   if (providers.length < MIN_SEATS) {
     showHomeError(providers.length === 0
-      ? `先选 ${MIN_SEATS} 或 ${MAX_SEATS} 个不同的 AI。`
+      ? `先选 ${MIN_SEATS} 位不同的 AI。`
       : `再选一位才能开始；最多 ${MAX_SEATS} 席。`);
     return;
   }
@@ -2483,7 +2483,13 @@ function renderSession() {
   const wrap = h('div', { class: 'wrap session' });
   wrap.append(renderSessionHeader(session), renderStepper(session));
 
-  if (automationSeats(session).length) {
+  const autoSeats = automationSeats(session);
+  const autoRun = automationRun(session);
+  const showAutomation = autoSeats.length > 0 && (
+    session.stage !== 'done'
+    || Boolean(autoRun && (autoRun.enabled || autoRun.completed || autoRun.stoppedAt))
+  );
+  if (showAutomation) {
     wrap.append(renderAutomationPanel(session));
   } else {
     stopAutomationPolling();
@@ -3618,7 +3624,7 @@ function renderAnswerBlock(session, task, isNext) {
       task.answeredAt > 0 ? h('span', {
         class: 'answer-label',
         text: formatAbsolute(task.answeredAt),
-        title: '工作台收到完整回答的时间',
+        title: '这里收到完整回答的时间',
       }) : null);
     if (task.stance) head.append(stanceChip(task.stance));
     if (isCorrectedAnswer(task)) head.append(revisionChip());
@@ -4195,7 +4201,7 @@ async function copyText(text) {
   const value = String(text ?? '');
   try {
     if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
-      await navigator.clipboard.writeText(value);
+      await writeClipboardWithTimeout(value);
       return;
     }
   } catch {
@@ -4216,6 +4222,33 @@ async function copyText(text) {
     helper.remove();
   }
   if (!copied) throw new Error('浏览器拒绝了复制操作。');
+}
+
+/* 剪贴板权限弹窗可能一直不回应；超时后退回 execCommand，避免一次点击
+ * 因为复制挂起而连原页都不打开。 */
+function writeClipboardWithTimeout(value, limit = 1500) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error('剪贴板接口没有响应'));
+    }, limit);
+    Promise.resolve(navigator.clipboard.writeText(value)).then(
+      () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }
 
 /* ------------------------------ 结论与历史 ------------------------------ */
@@ -5038,7 +5071,7 @@ async function boot() {
   renderHistoryList();
 
   if (!runtimeAvailable()) {
-    showGlobalError('没有检测到扩展后台。请从 Chrome 的扩展页打开，不要直接打开本地文件。');
+    showGlobalError('没有检测到扩展后台。请从 Chrome 扩展页打开，不要直接打开本地文件。');
     renderHome();
     return;
   }

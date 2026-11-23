@@ -43,6 +43,7 @@ const SAMPLE = {
 
 const DRAFT_KEY = 'aiArena.connections.drafts.v1';
 const CALL_TIMEOUT_MS = 20000;
+const PERMISSION_TIMEOUT_MS = 120000;
 const MAX_SELECTOR_CHARS = 400;
 const LOCAL_HOSTS = new Set(['127.0.0.1', 'localhost']);
 
@@ -51,21 +52,25 @@ const STATUS_LABELS = {
   completed: '完成',
   complete: '完成',
   finished: '完成',
-  answered: '已作答',
+  answered: '已写入',
   ok: '完成',
   success: '完成',
   ready: '就绪',
-  submitted: '已提交',
+  submitted: '已发送',
   dispatching: '发送中',
+  verifying: '确认发送中',
+  streaming: '生成中',
   pending: '进行中',
   running: '进行中',
-  streaming: '进行中',
   generating: '进行中',
   queued: '排队中',
   waiting: '等待中',
   probing: '检查中',
   idle: '待开始',
   paused: '已暂停',
+  stale: '需核对',
+  'session-paused': '讨论已暂停',
+  unconfigured: '未配置',
   detached: '已停止',
   error: '失败',
   failed: '失败',
@@ -356,20 +361,34 @@ function permissionsAvailable() {
 function requestOriginPermission(pattern) {
   return new Promise((resolve, reject) => {
     if (!permissionsAvailable()) {
-      reject(new Error('当前环境不能请求网页权限。请从 Chrome 的扩展页打开本页。'));
+      reject(new Error('当前环境不能请求网页权限。请从 Chrome 扩展页打开本页。'));
       return;
     }
+
+    let settled = false;
+    let timer = null;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      fn(value);
+    };
+
+    timer = setTimeout(() => {
+      finish(reject, new Error('浏览器没有返回权限结果。请再点一次「保存本席」。'));
+    }, PERMISSION_TIMEOUT_MS);
+
     try {
       chrome.permissions.request({ origins: [pattern] }, (granted) => {
         const lastError = chrome.runtime && chrome.runtime.lastError;
         if (lastError) {
-          reject(new Error(lastError.message || '浏览器没有响应权限请求。'));
+          finish(reject, new Error(lastError.message || '浏览器没有响应权限请求。'));
           return;
         }
-        resolve(Boolean(granted));
+        finish(resolve, Boolean(granted));
       });
     } catch (error) {
-      reject(error);
+      finish(reject, error);
     }
   });
 }
