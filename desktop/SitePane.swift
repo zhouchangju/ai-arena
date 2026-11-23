@@ -1410,6 +1410,12 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
                 throw SitePaneError.invalidPrompt("prompt 含 NUL")
             }
             message["prompt"] = prompt
+            if source["freshConversationOnly"] as? Bool == true {
+                guard boundConversationURL == nil else {
+                    throw SitePaneError.invalidCommand("裁判必须使用新会话")
+                }
+                message["freshConversationOnly"] = true
+            }
         }
 
         // Image bytes travel only with an explicit first-round upload preparation.

@@ -746,6 +746,7 @@
       imageNames: attachments.names,
       images: attachments.images,
       imagePixels: attachments.pixels || [],
+      freshConversationOnly: message.freshConversationOnly === true,
     };
   }
 
@@ -1832,6 +1833,9 @@
     const draftCollapsed = collapse(draft);
     const users = listNodes(req.selectors.user, container);
     const answers = listNodes(req.selectors.answer, container);
+    if (req.freshConversationOnly && (!newConversationHome(req.scope) || users.length || answers.length)) {
+      return fail('fresh-conversation-required');
+    }
     let draftDigest = null;
     let draftReplaced = false;
     if (draftCollapsed && draftCollapsed !== promptCollapsed) {
@@ -1937,6 +1941,10 @@
     // 对话；只要不是本席核验过的地址就停在这里（不点、不建基线、不重发）。
     const beforeClick = conversationGate(req.scope, 'pre-click');
     if (beforeClick) return beforeClick;
+    if (req.freshConversationOnly && (!newConversationHome(req.scope) ||
+        listNodes(req.selectors.user, container).length || listNodes(req.selectors.answer, container).length)) {
+      return fail('fresh-conversation-required');
+    }
     if (resolveUnique(req.selectors, 'input', null, { requireVisible: true }).value !== input) {
       return fail('draft-conflict', { phase: 'pre-click', clickAttempted: false });
     }

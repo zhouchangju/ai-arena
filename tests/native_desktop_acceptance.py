@@ -21,6 +21,7 @@ def main():
     parser.add_argument("--app", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--takeover", action="store_true")
+    parser.add_argument("--evaluation", action="store_true")
     args = parser.parse_args()
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -50,16 +51,32 @@ def main():
                 return
             page = markup(PROVIDERS.index(seat)).decode()
             page = page.replace("row.text+=tail;", "if(stage==='vote')row.text+=' 上轮示例：立场：反对。';row.text+=tail;")
+            if args.evaluation:
+                page = page.replace(
+                    "const seq=window.turns.length;",
+                    r"""const seq=window.turns.length;
+                    const start=prompt.indexOf('{"evaluationID":');
+                    const end=prompt.indexOf('以下为评审材料：',start);
+                    if(start>=0&&end>start){
+                        const verdict=JSON.parse(prompt.slice(start,end).trim());
+                        verdict.comparisons.forEach(pair=>pair.reason='回环裁判举证');
+                        row.text=JSON.stringify(verdict);row.complete=true;row.judge=true;
+                        answer.textContent=row.text;stop.remove();
+                        article.insertAdjacentHTML('beforeend','<button data-testid="copy-turn-action-button">复制</button>');
+                        fetch('/observed',{method:'POST',body:JSON.stringify({site:location.pathname.slice(1),judge:true,seq,answer:row.text})});
+                        return;
+                    }""",
+                )
             # Observe the messages that actually reached this provider surface.
             page = page.replace(
                 "window.turns.push(row);",
                 "window.turns.push(row);"
-                "fetch('/observed',{method:'POST',body:JSON.stringify({site:location.pathname.slice(1),prompt})});",
+                "fetch('/observed',{method:'POST',body:JSON.stringify({site:location.pathname.slice(1),judge:prompt.includes('你是独立裁判。'),prompt})});",
             )
             page = page.replace(
                 "answer.textContent=row.text;",
                 "answer.textContent=row.text;"
-                "if(row.complete)fetch('/observed',{method:'POST',body:JSON.stringify({site:location.pathname.slice(1),answer:row.text})});",
+                "if(row.complete&&!row.judge)fetch('/observed',{method:'POST',body:JSON.stringify({site:location.pathname.slice(1),answer:row.text})});",
             )
             content = (page + f'<img src="/pixel/{seat}" alt="夹具图片">').encode()
             self.send_response(200)
@@ -104,7 +121,8 @@ def main():
             executable = qa.executable
             with (out / "app.log").open("w") as log:
                 flags = ["--smoke-test"] + (["--smoke-takeover"] if args.takeover else [])
-                proc = subprocess.Popen([executable, *flags], env=env, stdout=log, stderr=log)
+                evaluation_flags = ["--smoke-evaluation"] if args.evaluation else []
+                proc = subprocess.Popen([executable, *flags, *evaluation_flags], env=env, stdout=log, stderr=log)
                 try:
                     proc.wait(timeout=150)
                 finally:
@@ -116,7 +134,7 @@ def main():
                 restoring.set()
                 restored = out / "restored.json"
                 subprocess.run(
-                    [executable, "--smoke-test", "--smoke-restore"],
+                    [executable, "--smoke-test", "--smoke-restore", *evaluation_flags],
                     env={**env, "ARENA_SMOKE_RESULT": str(restored)},
                     stdout=log, stderr=log, timeout=65, check=True,
                 )
@@ -133,6 +151,19 @@ def main():
     raw = json.loads(result.read_text())
     session = raw.get("session", raw)
     history = session.get("history", [])
+    judge_events = [event for event in events if event.get("judge")]
+    events = [event for event in events if not event.get("judge")]
+    if args.evaluation:
+        assert len(judge_events) == 4 and all(event["site"] == "chatgpt" for event in judge_events)
+        assert [event["seq"] for event in judge_events if "answer" in event] == [1, 1]
+        prompts = [event["prompt"] for event in judge_events if "prompt" in event]
+        examples = [json.loads(prompt[prompt.index('{"evaluationID":'):prompt.index('以下为评审材料：')])
+                    for prompt in prompts]
+        assert [len(example["comparisons"]) for example in examples] == [3, 1]
+        assert [(pair["left"], pair["right"]) for pair in examples[1]["comparisons"]] == [("B", "A")]
+        assert examples[0]["evaluationID"] != examples[1]["evaluationID"]
+    else:
+        assert not judge_events
     assert session.get("stage") == "done", raw
     assert len(history) == 10 and all(x["status"] == "answered" for x in history)
     assert len(events) == (18 if args.takeover else 20), len(events)
@@ -166,7 +197,7 @@ def main():
     for site in PROVIDERS:
         row = next(line for line in seat_table.splitlines() if line.startswith(f"| `{site}` |"))
         assert "同意" in row and "只读回看" not in row, row
-    print(f"PASS: 3 provider views; {len(events)//2} exactly matched automatic sends and replies; same-version votes, restore, QA-isolated session cookie persisted across both launches and Markdown; takeover={args.takeover}")
+    print(f"PASS: 3 provider views; {len(events)//2} exactly matched automatic sends and replies; same-version votes, restore, QA-isolated session cookie persisted across both launches and Markdown; takeover={args.takeover}, evaluation={args.evaluation}")
 
 
 if __name__ == "__main__":

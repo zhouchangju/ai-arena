@@ -305,6 +305,25 @@ def main() -> int:
             results["duplicate_question_is_ambiguous_not_last_answer"] = True
             page.close()
             ctx.close()
+
+            for timing in ("before-fill", "during-fill"):
+                ctx, page = new_page(browser)
+                page.evaluate("""timing => {
+                    const seed = () => {
+                        document.querySelector('#log').insertAdjacentHTML(
+                            'beforeend', '<article data-message-author-role="user">已有私人对话</article>'
+                        );
+                    };
+                    if (timing === 'before-fill') seed();
+                    else document.querySelector('#prompt-textarea').addEventListener('input', seed, {once: true});
+                }""", timing)
+                judge = message("arena.web.submit", "evaluation:r1:independent:chatgpt", PROMPT, HOME)
+                judge["freshConversationOnly"] = True
+                refused = handle(page, judge)
+                assert refused["error"] == "fresh-conversation-required", refused
+                assert page.evaluate("window.sends") == 0
+                results[f"judge_refuses_existing_history_{timing}"] = True
+                ctx.close()
         finally:
             browser.close()
 

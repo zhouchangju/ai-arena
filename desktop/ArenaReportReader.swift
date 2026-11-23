@@ -89,6 +89,12 @@ struct ArenaReportReader: View {
                         Label("发言与出处（\(currentSources.count)）", systemImage: "books.vertical")
                     }
                 }
+                if session?["stage"] as? String == "done",
+                   let id = ArenaSessionDigest.id(session), ArenaSessionDigest.evaluationCandidates(session).count >= 2 {
+                    ArenaEvaluationSection(sessionID: id, chatGPTParticipated: participants.contains("chatgpt"), model: model) { source in
+                        selectedSource = currentSources.first { $0.sourceId == source }
+                    }
+                }
                 if let original = ArenaSessionDigest.report(session) {
                     VStack(alignment: .leading, spacing: 0) {
                         Button {

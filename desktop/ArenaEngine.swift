@@ -426,6 +426,26 @@ final class ArenaSessionStore {
         return pointer.id
     }
 
+    func loadEvaluation(sessionID: String) throws -> ArenaEvaluation? {
+        guard let url = evaluationURL(sessionID: sessionID) else { throw EvaluationInputError("场次编号无效") }
+        guard fileManager.fileExists(atPath: url.path) else { return nil }
+        return try decoder.decode(ArenaEvaluation.self, from: Data(contentsOf: url))
+    }
+
+    func saveEvaluation(_ evaluation: ArenaEvaluation, sessionID: String) throws {
+        guard let url = evaluationURL(sessionID: sessionID), load(id: sessionID) != nil else {
+            throw EvaluationInputError("找不到已保存的场次")
+        }
+        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try encoder.encode(evaluation).write(to: url, options: .atomic)
+    }
+
+    private func evaluationURL(sessionID: String) -> URL? {
+        guard validID(sessionID) else { return nil }
+        return root.appendingPathComponent("evaluations", isDirectory: true)
+            .appendingPathComponent("\(sessionID).json", isDirectory: false)
+    }
+
     func setCurrent(_ id: String?) {
         if let id, validID(id) {
             guard let data = try? encoder.encode(CurrentPointer(id: id)) else { return }

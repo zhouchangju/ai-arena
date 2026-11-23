@@ -1616,6 +1616,16 @@ enum ArenaSessionDigest {
         rows(session).filter { $0.answer?.trimmedNonEmpty != nil }
     }
 
+    static func evaluationCandidates(_ session: [String: Any]?) -> [ArenaEvaluationDraft.Candidate] {
+        let answers = answerRows(session)
+        return participants(session).compactMap { provider in
+            guard let row = answers.first(where: {
+                $0.stage == "independent" && $0.status == "answered" && $0.provider == provider
+            }), let answer = row.answer, !row.sourceId.isEmpty else { return nil }
+            return ArenaEvaluationDraft.Candidate(provider: provider, source: row.sourceId, answer: answer)
+        }
+    }
+
     static func report(_ session: [String: Any]?) -> String? {
         (session?["report"] as? String)?.trimmedNonEmpty
     }
@@ -2979,6 +2989,12 @@ final class SmokeRunner {
             }
             // Exercise the same serializer as the native Save panel.
             do {
+                if CommandLine.arguments.contains("--smoke-evaluation") {
+                    guard let id = session.arenaString("id"),
+                          let evaluation = try model.evaluation(sessionID: id),
+                          evaluation.comparisons.count == 3, evaluation.checks.count == 1,
+                          evaluation.ranks == nil else { throw ArenaEngineError("未恢复评估及复判") }
+                }
                 try ArenaExporter.makeMarkdown(model: model).write(
                     to: URL(fileURLWithPath: resultPath).deletingLastPathComponent().appendingPathComponent("export.md"),
                     atomically: true, encoding: .utf8)
@@ -3017,6 +3033,24 @@ final class SmokeRunner {
             }
             if (model.session?["stage"] as? String) == "done" {
                 guard let session = model.session else { break }
+                if CommandLine.arguments.contains("--smoke-evaluation"), let id = session.arenaString("id") {
+                    do {
+                        guard try model.evaluation(sessionID: id) == nil else {
+                            throw ArenaEngineError("未触发前已有评估")
+                        }
+                        let evaluation = try await model.runEvaluation(sessionID: id)
+                        guard let pair = evaluation.comparisons.first, evaluation.ranks?.count == 3 else {
+                            throw ArenaEngineError("初判缺少三席排名")
+                        }
+                        let checked = try await model.runEvaluation(sessionID: id, reversing: pair.id)
+                        guard checked.comparisons.count == 3, checked.checks.count == 1, checked.ranks == nil else {
+                            throw ArenaEngineError("复判冲突没有被保留")
+                        }
+                    } catch {
+                        Self.writeStderr("[smoke] evaluation: \(error.localizedDescription)")
+                        exit(11)
+                    }
+                }
                 Self.write(session, to: resultPath)
                 Self.writeStderr("[smoke] stage done; session written to \(resultPath)")
                 exit(0)

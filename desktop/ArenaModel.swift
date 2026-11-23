@@ -368,6 +368,7 @@ final class ArenaModel: ObservableObject {
     @Published private(set) var isReadOnly: Bool = false
     @Published private(set) var isRecovering: Bool = false
     @Published private(set) var recoveryNotice: String = ""
+    @Published private(set) var evaluatingSessionID: String?
 
     /// True only when this launch used `--continue-saved-discussion <id>` and
     /// the saved discussion passed every safety check, so the dispatcher was
@@ -3240,6 +3241,145 @@ final class ArenaModel: ObservableObject {
         currentID = id
         refreshHistoryList()
         return true
+    }
+
+    func evaluation(sessionID: String) throws -> ArenaEvaluation? {
+        try engine.store.loadEvaluation(sessionID: sessionID)
+    }
+
+    func saveEvaluation(_ evaluation: ArenaEvaluation, sessionID: String) throws {
+        guard session?.arenaString("id") == sessionID, stageKey == "done" else {
+            throw EvaluationInputError("场次已切换，请重新打开本场报告")
+        }
+        try engine.store.saveEvaluation(evaluation, sessionID: sessionID)
+    }
+
+    private func evaluationAttachments(sessionID: String) throws -> (images: [[String: String]], texts: [String: String]) {
+        guard session?.arenaString("id") == sessionID else { throw EvaluationInputError("场次已切换") }
+        var images: [[String: String]] = []
+        var texts: [String: String] = [:]
+        for (index, attachment) in sessionAttachments.enumerated() {
+            guard let name = attachment.arenaString("name") else { throw EvaluationInputError("附件缺少名称") }
+            let data = try engine.store.attachmentData(sessionID: sessionID, attachment: attachment)
+            if attachment.arenaString("kind") == "image" {
+                guard let mediaType = attachment.arenaString("mediaType") else {
+                    throw EvaluationInputError("图片缺少格式")
+                }
+                images.append(["name": name, "mediaType": mediaType, "base64": data.base64EncodedString()])
+            } else {
+                guard let text = String(data: data, encoding: .utf8) else {
+                    throw EvaluationInputError("无法读取附件原文")
+                }
+                texts["附件 \(index + 1) · \(name)"] = text
+            }
+        }
+        return (images, texts)
+    }
+
+    func runEvaluation(sessionID: String, reversing pairID: String? = nil) async throws -> ArenaEvaluation {
+        guard evaluatingSessionID == nil else { throw EvaluationInputError("已有评估正在进行") }
+        guard let session, session.arenaString("id") == sessionID, stageKey == "done",
+              let question = session.arenaString("question") else { throw EvaluationInputError("请打开已结束的场次") }
+        let candidates = ArenaSessionDigest.evaluationCandidates(session)
+        guard candidates.count >= 2, Set(candidates.map(\.source)).count == candidates.count else {
+            throw EvaluationInputError("本场需要至少两份可核对出处的独立作答")
+        }
+        var saved = try evaluation(sessionID: sessionID)
+        let attachments = try evaluationAttachments(sessionID: sessionID)
+        let names = attachments.images.compactMap { $0["name"] }
+        let draft: ArenaEvaluationDraft
+        if let pairID {
+            guard let saved, saved.checks[pairID] == nil,
+                  let pair = saved.comparisons.first(where: { $0.id == pairID }) else {
+                throw EvaluationInputError("找不到待复判的对阵")
+            }
+            draft = ArenaEvaluationDraft(question: question, evaluation: saved, reversing: pair,
+                                         images: names, texts: attachments.texts, candidates: candidates)
+        } else {
+            guard saved == nil else { throw EvaluationInputError("本场已有评估结果") }
+            draft = ArenaEvaluationDraft(question: question, candidates: candidates, images: names, texts: attachments.texts)
+        }
+        let prompt = draft.prompt
+        guard prompt.utf16.count <= 100_000 else { throw EvaluationInputError("本场评估材料超过网页单次发送上限") }
+        evaluatingSessionID = sessionID
+        defer { evaluatingSessionID = nil }
+
+        let config = try engine.config(for: "chatgpt")
+        let pane = makePane(for: "chatgpt")
+        pane.webView.frame = CGRect(x: 0, y: 0, width: 1040, height: 740)
+        pane.isAutomaticWorkActive = { true }
+        defer { pane.webView.stopLoading() }
+        pane.openHome()
+
+        let taskID = "evaluation-\(draft.id.uuidString):r1:independent:chatgpt"
+        var send = engine.driverMessage(kind: "submit", taskID: taskID, prompt: prompt, config: config)
+        send["freshConversationOnly"] = true
+        var read = engine.driverMessage(kind: "read", taskID: taskID, prompt: nil,
+                                        verifiedReadPrompt: prompt, config: config)
+        if !names.isEmpty {
+            var prepare = send
+            prepare["images"] = attachments.images
+            prepare["prepareImagesOnly"] = true
+            let ready = try await pane.command(prepare)
+            let detail = ready["detail"] as? [String: Any]
+            guard ready.arenaString("status") == "attachments-ready",
+                  detail?["readyImageNames"] as? [String] == names else {
+                throw EvaluationInputError("ChatGPT 未能在裁判页备齐图片")
+            }
+            let pixels = try Self.preparedImagePixels(detail?["readyImagePixels"], count: names.count)
+            send["imageNames"] = names
+            read["imageNames"] = names
+            send["imagePixels"] = pixels
+            read["imagePixels"] = pixels
+        }
+        try Task.checkCancellation()
+        guard self.session?.arenaString("id") == sessionID else { throw EvaluationInputError("场次已切换") }
+        // Exactly one send command per click. A lost receipt never leads to a second click.
+        let submitted: [String: Any]
+        do {
+            submitted = try await pane.command(send)
+        } catch let error as SitePaneError {
+            if error.isConversationChanged {
+                throw EvaluationInputError("裁判页未停在 ChatGPT 新会话，评估未发送")
+            }
+            throw EvaluationInputError("无法确认裁判请求：\(error.localizedDescription)")
+        }
+        let code = submitted.arenaString("error")
+        guard submitted.arenaString("status") == "submitted" || code == "submit-unconfirmed" else {
+            throw EvaluationInputError(code == "fresh-conversation-required"
+                ? "裁判页已有对话，评估未发送"
+                : "裁判请求受阻：\(Self.friendly(errorCode: code ?? "unknown"))")
+        }
+        _ = pane.bindVerifiedConversation(from: submitted)
+
+        let deadline = Date().addingTimeInterval(180)
+        while Date() < deadline {
+            try Task.checkCancellation()
+            guard self.session?.arenaString("id") == sessionID else { throw EvaluationInputError("场次已切换") }
+            let response = try await pane.command(read)
+            _ = pane.bindVerifiedConversation(from: response)
+            if response.arenaString("status") == "done", let text = response.arenaString("text") {
+                let detail = response["detail"] as? [String: Any]
+                guard names.isEmpty || detail?["verifiedImageNames"] as? [String] == names else {
+                    throw EvaluationInputError("裁判页未确认收齐图片")
+                }
+                let comparisons = try draft.parse(text)
+                if let pairID, var prior = saved, let comparison = comparisons.first {
+                    prior.checks[pairID] = comparison
+                    saved = prior
+                } else {
+                    saved = ArenaEvaluation(id: draft.id, entries: draft.entries, judge: "ChatGPT 网页", comparisons: comparisons)
+                }
+                guard let saved else { throw EvaluationInputError("裁判没有返回可保存的对阵") }
+                try saveEvaluation(saved, sessionID: sessionID)
+                return saved
+            }
+            if response.arenaString("status") == "error", let error = response.arenaString("error") {
+                throw EvaluationInputError("裁判回复无法核对：\(Self.friendly(errorCode: error))")
+            }
+            try await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+        throw EvaluationInputError("等待裁判回复超时。本次未重发，你可以在 ChatGPT 网页核对原会话。")
     }
 
     func reviewMaterials() -> [String: [[String: String]]] {
