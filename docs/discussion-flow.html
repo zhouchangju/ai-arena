@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Arena · 多 AI 讨论流程</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: #fff;
+      --ink: #262626;
+      --muted: #666;
+      --rule: #e5e5e5;
+      --accent: #007aff;
+      --link: #005dbb;
+      --tint: #edf5ff;
+      --surface: #f5f5f7;
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
+      color: var(--ink);
+      background: var(--paper);
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    main { width: min(100% - 48px, 1280px); margin: 40px auto; }
+    header { border-bottom: 1px solid var(--rule); padding-bottom: 20px; }
+    .eyebrow { color: var(--muted); font-size: 12px; font-weight: 600; letter-spacing: .12em; margin: 0; }
+    h1 { font-size: clamp(28px, 4vw, 40px); letter-spacing: -.045em; line-height: 1.16; margin: 8px 0 12px; }
+    p { line-height: 1.65; }
+    .dek { color: var(--muted); margin: 0; }
+    figure { margin: 0; overflow-x: auto; }
+    figure:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+    svg { display: block; width: 100%; min-width: 800px; }
+    .edge { fill: none; stroke: var(--muted); stroke-width: 1.6; marker-end: url(#arrow); }
+    .loop { stroke-dasharray: 5 4; }
+    .step { fill: var(--paper); stroke: var(--ink); stroke-width: 1.1; }
+    .terminal { fill: var(--surface); stroke: var(--muted); }
+    .focus { fill: var(--tint); stroke: var(--accent); stroke-width: 1.6; }
+    .name { fill: var(--ink); font-size: 24px; font-weight: 650; }
+    .sub { fill: var(--muted); font-size: 16px; }
+    .label { fill: var(--ink); font-size: 16px; font-weight: 600; }
+    .notes { display: grid; grid-template-columns: 1.25fr 1fr; gap: 32px; border-top: 1px solid var(--rule); padding-top: 20px; }
+    .notes h2 { font-size: 20px; margin: 0 0 8px; }
+    .notes p, .notes ol { font-size: 15px; margin: 0 0 8px; }
+    .notes li { line-height: 1.65; }
+    .notes ol { padding-left: 24px; }
+    footer { border-top: 1px solid var(--rule); margin-top: 20px; padding-top: 16px; font-size: 14px; color: var(--muted); }
+    a { color: var(--link); }
+    @media (max-width: 640px) {
+      main { width: calc(100% - 32px); margin-block: 24px; }
+      .notes { grid-template-columns: 1fr; gap: 20px; }
+    }
+    @media print {
+      main { width: 100%; margin: 0; }
+      svg { min-width: 0; }
+      figure { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <p class="eyebrow">AI ARENA / macOS</p>
+    <h1>多 AI 讨论怎么推进？</h1>
+    <p class="dek">模型作答、互相质疑、起草和表态。工作台负责转交材料、管理轮次，并按各席的有效表态与参与记录生成报告。</p>
+  </header>
+  <figure tabindex="0" aria-label="讨论流程图，窄屏可横向滚动">
+    <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="discussion-flow-title discussion-flow-desc">
+      <title id="discussion-flow-title">AI Arena 多 AI 讨论流程</title>
+      <desc id="discussion-flow-desc">选定席位后依次独立作答、交叉互评、起草候选并确认同一版本，工作台根据表态、参与和出处决定继续互评、报告全体一致或保留当前结果。</desc>
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0 0 8 4 0 8Z" fill="#666"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0 0 8 4 0 8Z" fill="#007aff"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0 0 8 4 0 8Z" fill="#005dbb"/></marker>
+      </defs>
+      <rect width="1280" height="720" fill="#fff"/>
+
+      <path class="edge" d="M540 96 V124"/>
+      <path class="edge" d="M540 192 V220"/>
+      <path class="edge" d="M540 288 V316"/>
+      <path class="edge" d="M540 384 V412"/>
+      <path class="edge" d="M540 480 V504"/>
+      <path class="edge loop" d="M380 544 H244 A8 8 0 0 1 236 536 V260 A8 8 0 0 1 244 252 H360"/>
+      <path class="edge" d="M700 544 H940"/>
+      <path class="edge" d="M540 584 V612"/>
+
+      <g>
+        <rect x="36" y="324" width="192" height="92" rx="4" fill="#fff"/>
+        <text class="label" x="220" y="344" text-anchor="end">还有互评轮次</text>
+        <text class="sub" x="220" y="368" text-anchor="end">有反对，或票齐且有条件</text>
+        <text class="sub" x="220" y="392" text-anchor="end">带着当前候选回到互评</text>
+        <rect x="740" y="508" width="168" height="28" rx="4" fill="#fff"/>
+        <text class="label" x="824" y="528" text-anchor="middle">满足全部一致条件</text>
+        <rect x="548" y="588" width="148" height="20" rx="4" fill="#fff"/>
+        <text class="label" x="556" y="604">其余结束情形</text>
+      </g>
+
+      <g text-anchor="middle">
+        <rect class="terminal" x="360" y="28" width="360" height="68" rx="20"/>
+        <text class="name" x="540" y="56">提交问题并选席</text>
+        <text class="sub" x="540" y="80">从 ChatGPT、Gemini、DeepSeek 选 2–3 席</text>
+
+        <rect class="step" x="360" y="124" width="360" height="68" rx="8"/>
+        <text class="name" x="540" y="152">各席独立作答</text>
+        <text class="sub" x="540" y="176">分别收到同一题面，此时彼此的答案不可见</text>
+
+        <rect class="step" x="360" y="220" width="360" height="68" rx="8"/>
+        <text class="name" x="540" y="248">交叉互评</text>
+        <text class="sub" x="540" y="272">交换已保存的原文 · 提出反例 · 回应与修正</text>
+
+        <rect class="step" x="360" y="316" width="360" height="68" rx="8"/>
+        <text class="name" x="540" y="344">一席起草或修订候选</text>
+        <text class="sub" x="540" y="368">保留条件、争点与出处 · 修订后生成新版本</text>
+
+        <rect class="step" x="360" y="412" width="360" height="68" rx="8"/>
+        <text class="name" x="540" y="440">各席对同一候选表态</text>
+        <text class="sub" x="540" y="464">明确同意、有条件同意或反对，并给理由</text>
+
+        <polygon class="focus" points="540,504 700,544 540,584 380,544"/>
+        <text class="name" x="540" y="552">继续还是结束？</text>
+
+        <rect class="focus" x="940" y="508" width="304" height="72" rx="20"/>
+        <text class="name" x="1092" y="540">全体一致报告</text>
+        <text class="sub" x="1092" y="564">保留最终版本、逐席表态和出处</text>
+
+        <rect class="terminal" x="360" y="612" width="360" height="64" rx="20"/>
+        <text class="name" x="540" y="640">按当前结果出报告</text>
+        <text class="sub" x="540" y="664">有条件一致、未决分歧、部分完成或草稿</text>
+      </g>
+
+      <line x1="36" x2="1244" y1="688" y2="688" stroke="#e5e5e5"/>
+      <g class="sub">
+        <rect x="40" y="696" width="24" height="12" rx="6" fill="#f5f5f7" stroke="#666"/>
+        <text x="76" y="708">开场或结果</text>
+        <rect x="232" y="696" width="24" height="12" rx="4" fill="#fff" stroke="#262626"/>
+        <text x="268" y="708">讨论步骤</text>
+        <polygon points="424,696 436,702 424,708 412,702" fill="#edf5ff" stroke="#007aff"/>
+        <text x="448" y="708">推进判定</text>
+        <path d="M604 704 H632" stroke="#666" stroke-dasharray="5 4"/>
+        <text x="644" y="708">下一轮互评</text>
+      </g>
+    </svg>
+  </figure>
+  <div class="notes">
+    <section aria-labelledby="agreement">
+      <h2 id="agreement">什么情况下算全体一致？</h2>
+      <ol>
+        <li>开场选定的每一席都有独立回答，并完成了最后一轮互评。</li>
+        <li>每一席都对同一版本的完整正文明确、无条件同意。修订后重新表态，旧票留在历史。</li>
+        <li>候选至少有一条能定位到本场发言的出处，例如 <code>[S3]</code>。出处用于回看原文。</li>
+      </ol>
+      <p>新建桌面场默认最多 3 轮互评，可设 1–5 轮。独立作答在互评前完成。存在明确反对时，可以在预算内继续互评，即使票未收齐。只有附加条件时，票齐才会续评。</p>
+    </section>
+    <section aria-labelledby="recovery">
+      <h2 id="recovery">单席卡住时怎么办？</h2>
+      <p>工作台先保存实际提示和发送意图，再到原站投递；确认回答完成后才交给讨论引擎。发送状态不明或从历史续跑时，先核对绑定的原对话。也可以手动补录或跳过该席。缺席、沉默和无效票均不计为同意。</p>
+      <p>用户可以提前结束。若没有可用答复、没有互评材料，或可接替的席位也未交出候选，讨论会提前收尾并保留已收到的材料和停止原因。报告可按出处回看并导出 Markdown。</p>
+    </section>
+  </div>
+  <footer>
+    对照实现　<a href="../shared/core.js">讨论状态机</a> · <a href="../desktop/ArenaModel.swift">桌面派发与恢复</a> · <a href="technical-design.md">技术设计</a>
+  </footer>
+</main>
+</body>
+</html>
