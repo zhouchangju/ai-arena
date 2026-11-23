@@ -502,26 +502,24 @@ struct ArenaRootView: View {
     private func headerActions(compact: Bool) -> some View {
         HStack(spacing: 8) {
             historyMenu(compact: compact)
-            if compact {
-                iconToolButton("查看当前提示、历史原文、报告与原始记录", icon: "sidebar.right") {
-                    presentDetails(provider: nil, tab: .prompts)
+            if hasStarted {
+                if compact {
+                    iconToolButton("查看当前提示、历史原文、报告与原始记录", icon: "sidebar.right") {
+                        presentDetails(provider: nil, tab: .prompts)
+                    }
+                    iconToolButton("以 Markdown 保存本场记录", icon: "square.and.arrow.up") {
+                        ArenaExporter.export(model: model, feedback: feedback)
+                    }
+                } else {
+                    toolButton("详情", icon: "sidebar.right") {
+                        presentDetails(provider: nil, tab: .prompts)
+                    }
+                    .help("查看当前提示、历史原文、报告与原始记录")
+                    toolButton("导出", icon: "square.and.arrow.up") {
+                        ArenaExporter.export(model: model, feedback: feedback)
+                    }
+                    .help("以 Markdown 保存本场记录")
                 }
-                .disabled(model.session == nil)
-                iconToolButton("以 Markdown 保存本场记录", icon: "square.and.arrow.up") {
-                    ArenaExporter.export(model: model, feedback: feedback)
-                }
-                .disabled(model.session == nil)
-            } else {
-                toolButton("详情", icon: "sidebar.right") {
-                    presentDetails(provider: nil, tab: .prompts)
-                }
-                .disabled(model.session == nil)
-                .help("查看当前提示、历史原文、报告与原始记录")
-                toolButton("导出", icon: "square.and.arrow.up") {
-                    ArenaExporter.export(model: model, feedback: feedback)
-                }
-                .disabled(model.session == nil)
-                .help("以 Markdown 保存本场记录")
             }
         }
     }
@@ -948,25 +946,43 @@ struct ArenaRootView: View {
         HStack(spacing: 8) {
             stagePill
             Spacer(minLength: 8)
-            toolButton(
-                isPaused ? "继续" : "暂停",
-                icon: isPaused ? "play.fill" : "pause.fill",
-                large: true,
-                action: pauseOrResume
-            )
-            .disabled(!isRunning)
-            .help(isPaused ? "继续派发后续轮次" : "暂停后续派发，保留当前进度")
-            if guidanceAvailable {
-                toolButton("补充条件", icon: "text.badge.plus", large: true) {
-                    openGuidanceComposer()
+            if isRunning {
+                toolButton(
+                    isPaused ? "继续" : "暂停",
+                    icon: isPaused ? "play.fill" : "pause.fill",
+                    large: true,
+                    action: pauseOrResume
+                )
+                .help(isPaused ? "继续派发后续轮次" : "暂停后续派发，保留当前进度")
+                if guidanceAvailable {
+                    toolButton("补充条件", icon: "text.badge.plus", large: true) {
+                        openGuidanceComposer()
+                    }
+                    .help("先暂停讨论，再把条件写入之后新建的提示；不会改写或重发已发出的任务")
                 }
-                .help("先暂停讨论，再把条件写入之后新建的提示；不会改写或重发已发出的任务")
+                toolButton("结束", icon: "stop.fill", large: true) {
+                    confirmation = .finish
+                }
+                .help("结束整场讨论并生成当前报告（已发送的请求可能仍会生成）")
             }
-            toolButton("结束", icon: "stop.fill", large: true) {
-                confirmation = .finish
+            if hasSavedReport {
+                Button {
+                    presentDetails(provider: nil, tab: .report)
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "doc.text")
+                            .font(.system(size: 12.5, weight: .semibold))
+                        Text("查看报告")
+                            .font(.system(size: 14, weight: .medium))
+                    }
+                    .padding(.horizontal, 2)
+                    .frame(minHeight: 32)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .help("打开本场报告")
             }
-            .disabled(!isRunning)
-            .help("结束整场讨论并生成当前报告（已发送的请求可能仍会生成）")
             toolButton("新建", icon: "square.and.pencil", large: true) {
                 if model.hasRunningDiscussion {
                     confirmation = .newDiscussion
@@ -1315,6 +1331,11 @@ struct ArenaRootView: View {
         (model.session?["paused"] as? Bool) ?? false
     }
 
+    /// A report saved for the current session (completed or read-only history).
+    private var hasSavedReport: Bool {
+        ArenaSessionDigest.report(model.session) != nil
+    }
+
     private var guidanceAvailable: Bool {
         if case .available = model.guidanceAvailability { return true }
         return false
@@ -1471,6 +1492,19 @@ struct ArenaSeatCard: View {
 
     private var statusColor: Color { ArenaSeatStatus.color(status.kind) }
 
+    /// The idle and generic generating details repeat the badge word verbatim.
+    /// Specific delivery, recovery and failure reasons stay visible.
+    private var showsStatusDetail: Bool {
+        switch status.kind {
+        case .idle:
+            return status.detail != "待开始"
+        case .generating:
+            return status.detail != "正在生成…"
+        default:
+            return true
+        }
+    }
+
     /// Persistent static saved mark for the current answered task. The parent
     /// only forwards a token while its task is still the current answered one;
     /// history clears tokens, so its static appearance is unchanged.
@@ -1530,16 +1564,18 @@ struct ArenaSeatCard: View {
                     .accessibilityLabel("查看本席当前提示")
                     menu
                 }
-                Text(status.detail)
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(status.kind == .needsAction ? nil : 1)
-                    .truncationMode(.tail)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .help(status.detail)
-                    .padding(.leading, 16)
-                    .padding(.trailing, 4)
-                    .accessibilityLabel("\(ArenaSeatCatalog.name(provider)) 状态：\(status.detail)")
+                if showsStatusDetail {
+                    Text(status.detail)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(status.kind == .needsAction ? nil : 1)
+                        .truncationMode(.tail)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .help(status.detail)
+                        .padding(.leading, 16)
+                        .padding(.trailing, 4)
+                        .accessibilityLabel("\(ArenaSeatCatalog.name(provider)) 状态：\(status.detail)")
+                }
                 if let localAction {
                     HStack(spacing: 6) {
                         Button {
@@ -3091,18 +3127,20 @@ struct ArenaBackfillView: View {
                 .frame(minHeight: 190)
 
             HStack(spacing: 8) {
-                Text("表态")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                Picker("", selection: $draft.stance) {
-                    Text("未指定").tag("")
-                    Text("同意").tag("agree")
-                    Text("有条件同意").tag("conditional")
-                    Text("反对").tag("oppose")
+                if draft.target?.stage == "vote" {
+                    Text("表态")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                    Picker("", selection: $draft.stance) {
+                        Text("未指定").tag("")
+                        Text("同意").tag("agree")
+                        Text("有条件同意").tag("conditional")
+                        Text("反对").tag("oppose")
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 300)
                 }
-                .labelsHidden()
-                .pickerStyle(.segmented)
-                .frame(maxWidth: 300)
                 Spacer()
                 Button("提交补录") { submit() }
                     .buttonStyle(.borderedProminent)
