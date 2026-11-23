@@ -1284,6 +1284,47 @@ function concernBlock(task) {
   ].join('\n');
 }
 
+// Recover what each saved review actually received, including in older sessions
+// without separate source metadata. Rebuild the prompt from frozen records so
+// that citations quoted inside an answer cannot be mistaken for input sources.
+export function reviewMaterials(session) {
+  const independent = answeredHistory(session, 'independent');
+  const missing = session.providers.filter((provider) => !latestByProvider(independent, provider));
+  const reviews = session.history.filter((task) => task.stage === 'critique');
+  if (session.stage === 'critique') reviews.push(...session.tasks);
+  const result = Object.create(null);
+
+  for (const task of reviews) {
+    const round = task.round ?? session.round;
+    let prompt;
+    let materials;
+    if (round === 1) {
+      const own = latestByProvider(independent, task.provider);
+      materials = independent.filter((source) => source.provider !== task.provider);
+      prompt = critiquePrompt(session.question, task.provider, own, materials, missing);
+    } else {
+      const proposal = latestAnsweredProposal(session.history.filter((source) => source.round < round));
+      if (!proposal) continue;
+      const digest = proposalDigest(proposal);
+      const concerns = answeredHistory(session, 'vote').filter(
+        (source) =>
+          source.round === round - 1 &&
+          source.version === proposal.version &&
+          source.proposalDigest === digest &&
+          (source.stance === 'oppose' || (source.stance === 'conditional' && session.followConditions === true)),
+      );
+      materials = [proposal, ...concerns];
+      prompt = targetedCritiquePrompt(session.question, task.provider, proposal, concerns);
+    }
+    const notes = (session.guidance ?? []).filter((note) => task.guidanceSeqs?.includes(note.seq));
+    if (notes.length > 0) prompt = appendGuidance(prompt, notes);
+    if (task.prompt === prompt) {
+      result[task.id] = materials.map(({ provider, sourceId, stage }) => ({ provider, sourceId, stage }));
+    }
+  }
+  return result;
+}
+
 function sourceBlock(task) {
   // R03/R05: frozen peer and candidate text is embedded in full. Truncating
   // the middle silently drops the one objection that may decide the issue.

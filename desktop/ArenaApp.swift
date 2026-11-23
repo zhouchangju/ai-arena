@@ -2185,6 +2185,8 @@ struct ArenaDetailsWindowView: View {
         if rows.isEmpty {
             emptyState("还没有已保存的原文。")
         } else {
+            let hasReviews = rows.contains { $0.stage == "critique" }
+            let reviewMaterials = hasReviews ? model.reviewMaterials() : [:]
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
                     HStack(spacing: 8) {
@@ -2198,8 +2200,18 @@ struct ArenaDetailsWindowView: View {
                     }
                     .padding(.bottom, 2)
 
+                    if hasReviews {
+                        Text("本场互评没有逐项胜负判定")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
+                    }
+
                     ForEach(rows) { row in
-                        ArenaAnswerDisclosure(row: row, session: model.session)
+                        ArenaAnswerDisclosure(
+                            row: row,
+                            session: model.session,
+                            reviewMaterials: reviewMaterials[row.id]
+                        )
                     }
                 }
                 .padding(18)
@@ -2271,6 +2283,22 @@ struct ArenaDetailsWindowView: View {
 struct ArenaAnswerDisclosure: View {
     let row: ArenaTaskRow
     let session: [String: Any]?
+    let reviewMaterials: [[String: String]]?
+
+    private var reviewSummary: String {
+        guard let reviewMaterials else { return "评审材料无法核对" }
+        if reviewMaterials.isEmpty { return "无其他席位作答 · 自我反驳" }
+        return reviewMaterials.compactMap { material -> String? in
+            guard let provider = material["provider"], let source = material["sourceId"] else { return nil }
+            let name = ArenaSeatCatalog.name(provider)
+            switch material["stage"] {
+            case "independent": return "\(name) 的作答（\(source)）"
+            case "proposal": return "\(name) 起草的候选（\(source)）"
+            case "vote": return "\(name) 的异议或条件（\(source)）"
+            default: return nil
+            }
+        }.joined(separator: "、")
+    }
 
     var body: some View {
         DisclosureGroup {
@@ -2281,16 +2309,26 @@ struct ArenaAnswerDisclosure: View {
             .padding(.top, 8)
         } label: {
             HStack(spacing: 7) {
-                Text(ArenaStageNames.taskLabel(row.stage, round: row.round, session: session))
-                    .font(.system(size: 13.5, weight: .semibold))
-                Text(ArenaSeatCatalog.name(row.provider))
-                    .font(.system(size: 12.5))
-                    .foregroundStyle(.secondary)
-                if !row.sourceId.isEmpty {
-                    Text(row.sourceId)
-                        .font(.system(size: 11.5, design: .monospaced))
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1)
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 7) {
+                        Text(ArenaStageNames.taskLabel(row.stage, round: row.round, session: session))
+                            .font(.system(size: 13.5, weight: .semibold))
+                        Text(ArenaSeatCatalog.name(row.provider))
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(.secondary)
+                        if !row.sourceId.isEmpty {
+                            Text(row.sourceId)
+                                .font(.system(size: 11.5, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(1)
+                        }
+                    }
+                    if row.stage == "critique" {
+                        Text(reviewSummary)
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 Spacer(minLength: 8)
                 Button("复制原文") {

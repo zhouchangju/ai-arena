@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createSession, applyAction, proposalDigest, reportBallot } from '../shared/core.js';
+import { createSession, applyAction, proposalDigest, reportBallot, reviewMaterials } from '../shared/core.js';
 
 const QUESTION = '我的笔记工具值不值得先做移动端？我只有两个周末。';
 const PROVIDERS = ['chatgpt', 'claude'];
@@ -37,6 +37,27 @@ function skipFor(session, provider) {
   const task = pendingTask(session, provider);
   return applyAction(session, 'skip', { taskId: task.id });
 }
+
+test('review history identifies both frozen opponents and rejects a mismatched prompt', () => {
+  let session = createSession(QUESTION, ['chatgpt', 'gemini', 'deepseek']);
+  session = answerFor(session, 'chatgpt', '首答里提到 [S99]，它不是评审来源。');
+  session = answerFor(session, 'gemini', '第二席首答。');
+  session = answerFor(session, 'deepseek', '第三席首答。');
+  const review = pendingTask(session, 'chatgpt');
+  session = answerFor(session, 'chatgpt', '互评原文。');
+  assert.deepEqual(reviewMaterials(session)[review.id], [
+    { provider: 'gemini', sourceId: 'S2', stage: 'independent' },
+    { provider: 'deepseek', sourceId: 'S3', stage: 'independent' },
+  ]);
+  session.tasks.find(({ id }) => id === review.id).prompt += '未知格式';
+  assert.equal(reviewMaterials(session)[review.id], undefined);
+});
+
+test('review with a skipped opponent records no peer material', () => {
+  let session = answerFor(start(), 'chatgpt', '独立回答。');
+  session = skipFor(session, 'claude');
+  assert.deepEqual(reviewMaterials(session)[pendingTask(session, 'chatgpt').id], []);
+});
 
 /** Drive a fresh session to the first vote stage with distinct answers. */
 function toVote(
@@ -867,6 +888,7 @@ test('guidance added while paused reaches only newly issued prompts', () => {
   for (const task of session.tasks) {
     assert.ok(task.prompt.includes(GUIDE));
     assert.deepEqual(task.guidanceSeqs, [1]);
+    assert.equal(reviewMaterials(session)[task.id].length, 1);
   }
   assert.deepEqual(
     session.guidance[0].deliveredTo.slice().sort(),
@@ -1403,6 +1425,10 @@ test('explicit opposition runs one targeted critique round and then stops unreso
   assert.match(chatgptTask.prompt, /定向质询/);
   assert.match(claudeTask.prompt, /你上一轮明确选择了反对/);
   assert.match(chatgptTask.prompt, /\[S/);
+  assert.deepEqual(reviewMaterials(session)[chatgptTask.id], [
+    { provider: 'chatgpt', sourceId: 'S5', stage: 'proposal' },
+    { provider: 'claude', sourceId: 'S7', stage: 'vote' },
+  ]);
 
   session = answerFor(session, 'chatgpt', 'ROUND2_CHATGPT 回应反对。');
   session = answerFor(session, 'claude', 'ROUND2_CLAUDE 仍保留反对。');

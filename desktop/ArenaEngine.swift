@@ -542,6 +542,9 @@ final class ArenaCore {
                     votes: proposal ? votes.map(({ id, provider, stance }) => ({ id, provider, stance })) : []
                   });
                 };
+                globalThis.__arenaReviewMaterials = function (sessionJSON) {
+                  return JSON.stringify(reviewMaterials(JSON.parse(sessionJSON)));
+                };
                 globalThis.__arenaApply = function (sessionJSON, action, payloadJSON) {
                   return JSON.stringify(
                     applyAction(JSON.parse(sessionJSON), action, JSON.parse(payloadJSON))
@@ -584,6 +587,10 @@ final class ArenaCore {
 
     func reportBallot(history: [[String: Any]]) throws -> [String: Any] {
         try callBridge("__arenaReportBallot", arguments: [Self.jsonString(history)], label: "reportBallot")
+    }
+
+    func reviewMaterials(session: [String: Any]) throws -> [String: Any] {
+        try callBridge("__arenaReviewMaterials", arguments: [Self.jsonString(session)], label: "reviewMaterials")
     }
 
     // MARK: Private
@@ -736,6 +743,10 @@ final class ArenaEngine {
 
     func reportBallot(history: [[String: Any]]) throws -> [String: Any] {
         try loadedCore().reportBallot(history: history)
+    }
+
+    func reviewMaterials(session: [String: Any]) throws -> [String: Any] {
+        try loadedCore().reviewMaterials(session: session)
     }
 
     func apply(

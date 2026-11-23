@@ -90,10 +90,23 @@ struct ArenaReportReader: View {
                     }
                 }
                 if let original = ArenaSessionDigest.report(session) {
-                    DisclosureGroup(isExpanded: $showArchive) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        Button {
+                            showArchive.toggle()
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: showArchive ? "chevron.down" : "chevron.right")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                    .accessibilityHidden(true)
+                                Label("完整报告", systemImage: "doc.richtext")
+                            }
+                            .frame(maxWidth: .infinity, minHeight: 32, alignment: .leading)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityValue(showArchive ? "已展开" : "已收起")
                         if showArchive { markdown(original).padding(.top, 12) }
-                    } label: {
-                        Label("完整报告", systemImage: "doc.richtext")
                     }
                 }
             }

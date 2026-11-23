@@ -3242,6 +3242,11 @@ final class ArenaModel: ObservableObject {
         return true
     }
 
+    func reviewMaterials() -> [String: [[String: String]]] {
+        guard let session else { return [:] }
+        return (try? engine.reviewMaterials(session: session)) as? [String: [[String: String]]] ?? [:]
+    }
+
     func reportBallot() -> [String: Any]? {
         guard let history = session?["history"] as? [[String: Any]] else { return nil }
         // The per-turn prompts can contain the entire debate. Only ballot
