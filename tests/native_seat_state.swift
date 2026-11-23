@@ -174,6 +174,44 @@ struct NativeSeatStateCheck {
         let empty = ArenaModel.backfillPrefill(currentAnswer: "   ", preview: nil)
         check("an empty current round starts blank", empty.text.isEmpty && !empty.isPartial)
 
+        // --- 5b. A seat-local label only promises what the intent proves ------
+        check("a submitted intent may offer only a read-only check",
+              ArenaModel.seatLocalActionKind(
+                  intentPhase: .submitted, hasCompletePreview: false, canBackfill: true
+              ) == .readOnlyCheck)
+        check("an inflight intent may offer only a read-only check",
+              ArenaModel.seatLocalActionKind(
+                  intentPhase: .inflight, hasCompletePreview: false, canBackfill: true
+              ) == .readOnlyCheck)
+        check("an uncertain intent may offer only a read-only check",
+              ArenaModel.seatLocalActionKind(
+                  intentPhase: .uncertain, hasCompletePreview: false, canBackfill: true
+              ) == .readOnlyCheck)
+        check("a prepared intent is never labelled read-only",
+              ArenaModel.seatLocalActionKind(
+                  intentPhase: .prepared, hasCompletePreview: false, canBackfill: true
+              ) == nil)
+        check("a task without an intent offers no local shortcut",
+              ArenaModel.seatLocalActionKind(
+                  intentPhase: nil, hasCompletePreview: false, canBackfill: true
+              ) == nil)
+        check("a complete refused answer prefers a confirmed backfill",
+              ArenaModel.seatLocalActionKind(
+                  intentPhase: .submitted, hasCompletePreview: true, canBackfill: true
+              ) == .verifyAndBackfill)
+        check("a prepared task never opens an empty backfill instead",
+              ArenaModel.seatLocalActionKind(
+                  intentPhase: .prepared, hasCompletePreview: false, canBackfill: true
+              ) == nil)
+        check("no read-only action is faked without a safe fallback",
+              ArenaModel.seatLocalActionKind(
+                  intentPhase: .prepared, hasCompletePreview: false, canBackfill: false
+              ) == nil)
+        check("a refused answer without backfill offers nothing",
+              ArenaModel.seatLocalActionKind(
+                  intentPhase: .submitted, hasCompletePreview: true, canBackfill: false
+              ) == nil)
+
         // --- 6. Unified stage wording -----------------------------------------
         check("critique is 互评", ArenaStageNames.label("critique") == "互评")
         check("vote is 表态", ArenaStageNames.label("vote") == "表态")

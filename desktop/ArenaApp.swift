@@ -1145,6 +1145,24 @@ struct ArenaRootView: View {
                 onResume: { model.resumeSeat(provider) },
                 onReturnToBound: { model.returnToBoundConversationAndResume(provider) },
                 onBackfill: { presentBackfill(provider) },
+                localAction: model.localAction(for: provider),
+                onLocalAction: { action in
+                    // Re-derive the whole action at click time: kind, pending
+                    // target and eligibility. A task can return to `.prepared`
+                    // after rendering (e.g. a pre-click drift), so a stale
+                    // read-only label must never reach the send-capable resume
+                    // path. A visible mismatch banner also suppresses it.
+                    guard model.localAction(for: provider) == action else {
+                        model.errorMessage = "本席任务已变化，请核对后再操作"
+                        return
+                    }
+                    switch action.kind {
+                    case .readOnlyCheck:
+                        model.resumeSeat(provider)
+                    case .verifyAndBackfill:
+                        presentBackfill(provider)
+                    }
+                },
                 skipTarget: model.manualTarget(for: provider),
                 onSkip: { target in
                     guard target == model.manualTarget(for: provider) else {
@@ -1376,6 +1394,8 @@ struct ArenaSeatCard: View {
     let onResume: () -> Void
     let onReturnToBound: () -> Void
     let onBackfill: () -> Void
+    let localAction: ArenaSeatLocalAction?
+    let onLocalAction: (ArenaSeatLocalAction) -> Void
     let skipTarget: ArenaManualTarget?
     let onSkip: (ArenaManualTarget) -> Void
 
@@ -1465,6 +1485,30 @@ struct ArenaSeatCard: View {
                     .padding(.leading, 16)
                     .padding(.trailing, 4)
                     .accessibilityLabel("\(ArenaSeatCatalog.name(provider)) 状态：\(status.detail)")
+                if let localAction {
+                    HStack(spacing: 6) {
+                        Button {
+                            onLocalAction(localAction)
+                        } label: {
+                            Label(
+                                ArenaSeatStatus.localActionLabel(localAction.kind),
+                                systemImage: ArenaSeatStatus.localActionSymbol(localAction.kind)
+                            )
+                            .font(.system(size: 11.5, weight: .semibold))
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.regular)
+                        .help(ArenaSeatStatus.localActionHelp(localAction.kind))
+                        .accessibilityLabel(
+                            "\(ArenaSeatCatalog.name(provider))：\(ArenaSeatStatus.localActionLabel(localAction.kind))"
+                        )
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.leading, 16)
+                    .padding(.trailing, 4)
+                    .padding(.top, 2)
+                    .padding(.bottom, 3)
+                }
             }
             .padding(.horizontal, 9)
             .padding(.vertical, 4)
@@ -1727,6 +1771,29 @@ enum ArenaSeatStatus {
         case .skipped: return "已跳过"
         case .paused: return "已暂停"
         case .done: return "已结束"
+        }
+    }
+
+    static func localActionLabel(_ kind: ArenaSeatLocalAction.Kind) -> String {
+        switch kind {
+        case .readOnlyCheck: return "只读核对"
+        case .verifyAndBackfill: return "核对并补录"
+        }
+    }
+
+    static func localActionSymbol(_ kind: ArenaSeatLocalAction.Kind) -> String {
+        switch kind {
+        case .readOnlyCheck: return "checkmark.shield"
+        case .verifyAndBackfill: return "square.and.pencil"
+        }
+    }
+
+    static func localActionHelp(_ kind: ArenaSeatLocalAction.Kind) -> String {
+        switch kind {
+        case .readOnlyCheck:
+            return "只读取本轮原页的提问与回答，不会重发"
+        case .verifyAndBackfill:
+            return "打开非模态补录面板；请先核对原页，表态需明确立场，带附件时需确认已核对"
         }
     }
 

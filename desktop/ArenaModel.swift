@@ -98,6 +98,27 @@ struct ArenaSeatControls: Equatable {
     static let none = ArenaSeatControls()
 }
 
+/// One seat-local recovery step for a blocked seat. The kind is chosen from
+/// structured model facts only; the Chinese `detail` sentence is never parsed.
+/// `target` pins the round the button was rendered for, and the click handler
+/// refuses to act when the pending task has moved on.
+struct ArenaSeatLocalAction: Equatable {
+    enum Kind: String, Equatable {
+        /// The persisted delivery intent proves the resume path can only read:
+        /// `.submitted` continues the read, `.inflight` / `.uncertain` re-check
+        /// with the read-only `read` command. It never labels a task that the
+        /// resume path might submit.
+        case readOnlyCheck
+        /// A complete answer was already refused (e.g. a vote without an
+        /// explicit stance), so re-reading would return the same refusal. Opens
+        /// the existing non-modal backfill panel, which never sends to the site.
+        case verifyAndBackfill
+    }
+
+    var kind: Kind
+    var target: ArenaManualTarget
+}
+
 /// Preview text for a seat. A streamed fragment and a complete answer that was
 /// not accepted are different things and must be labelled differently.
 struct ArenaPreview: Equatable {
@@ -983,6 +1004,62 @@ final class ArenaModel: ObservableObject {
             .last(where: { $0.arenaString("provider") == provider })?
             .arenaString("answer")
         return Self.backfillPrefill(currentAnswer: answer, preview: previews[provider])
+    }
+
+    /// The one local action a blocked seat card may offer, or `nil`.
+    ///
+    /// This is deliberately narrower than the seat menu: it appears only for a
+    /// blocked, non-manual, non-paused seat in a running discussion, and only
+    /// when the persisted intent proves the action is safe. Manual takeover,
+    /// paused, done, read-only history and every other seat keep their existing
+    /// menus and behaviour.
+    ///
+    /// A visible conversation-mismatch banner already owns the next step (return
+    /// to the saved conversation); the seat card must not add a competing CTA.
+    func localAction(for provider: String) -> ArenaSeatLocalAction? {
+        guard !isReadOnly, !isPaused, stageKey != "done",
+              currentProviders.contains(provider),
+              !manualProviders.contains(provider),
+              let target = manualTarget(for: provider),
+              blockedTasks.contains(target.taskID) else {
+            return nil
+        }
+        if let pane = panes[provider], pane.boundConversationURL != nil,
+           pane.conversationMismatch() != nil {
+            return nil
+        }
+        let controls = controls(for: provider)
+        guard controls.canResume else { return nil }
+        guard let kind = Self.seatLocalActionKind(
+            intentPhase: intents[target.taskID]?.phase,
+            hasCompletePreview: previews[provider]?.isComplete == true,
+            canBackfill: controls.canBackfill
+        ) else {
+            return nil
+        }
+        return ArenaSeatLocalAction(kind: kind, target: target)
+    }
+
+    /// Pure safety rule for `localAction(for:)`. `.readOnlyCheck` is returned
+    /// only for intent phases whose resume path cannot submit. A complete answer
+    /// the engine refused gets the confirmed backfill action because reading
+    /// again returns the same refusal. A `.prepared` or missing intent has no
+    /// truthful local action: the existing seat menu keeps takeover, backfill
+    /// and skip, and a read-only label would be false.
+    nonisolated static func seatLocalActionKind(
+        intentPhase: ArenaDeliveryIntent.Phase?,
+        hasCompletePreview: Bool,
+        canBackfill: Bool
+    ) -> ArenaSeatLocalAction.Kind? {
+        if hasCompletePreview {
+            return canBackfill ? .verifyAndBackfill : nil
+        }
+        switch intentPhase {
+        case .submitted, .inflight, .uncertain:
+            return .readOnlyCheck
+        case .prepared, .none:
+            return nil
+        }
     }
 
     /// Skip this seat's current task. A late answer is not accepted into the
