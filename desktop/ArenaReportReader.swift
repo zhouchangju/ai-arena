@@ -53,48 +53,54 @@ struct ArenaReportReader: View {
             if let row = selectedSource {
                 sourceReader(row)
             } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 19) {
-                        Text("讨论报告")
-                            .font(.system(size: 24, weight: .semibold))
-                            .accessibilityAddTraits(.isHeader)
-                        if let question { questionSection(question) }
-                        if !currentSources.isEmpty {
-                            decisionLine
-                            if let proposal, let answer = proposal.answer {
-                                candidateExcerpt(answer, author: proposal)
-                            } else {
-                                Text("本场尚无可核对的候选结论。可在下方查看已保存的材料。")
-                                    .foregroundStyle(.secondary)
-                            }
-                            if !participants.isEmpty { positions }
-                            if let answer = proposal?.answer {
-                                DisclosureGroup("候选全文", isExpanded: $showCandidate) {
-                                    if showCandidate { markdown(answer).padding(.top, 12) }
-                                }
-                            }
-                            DisclosureGroup(isExpanded: $showSources) {
-                                if showSources { sourceList }
-                            } label: {
-                                Label("发言与出处（\(currentSources.count)）", systemImage: "books.vertical")
-                            }
-                        }
-                        if let original = ArenaSessionDigest.report(session) {
-                            DisclosureGroup(isExpanded: $showArchive) {
-                                if showArchive { markdown(original).padding(.top, 12) }
-                            } label: {
-                                Label("完整报告", systemImage: "doc.richtext")
-                            }
-                        }
-                    }
-                    .frame(maxWidth: 720, alignment: .leading)
-                    .padding(.horizontal, 24)
-                    .padding(.vertical, 22)
-                    .frame(maxWidth: .infinity)
+                GeometryReader { viewport in
+                    reportPage(compact: viewport.size.width < 620 || viewport.size.height < 430)
                 }
             }
         }
         .background(Color(nsColor: .textBackgroundColor))
+    }
+
+    private func reportPage(compact: Bool) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: compact ? 10 : 19) {
+                Text("讨论报告")
+                    .font(.system(size: compact ? 20 : 24, weight: .semibold))
+                    .accessibilityAddTraits(.isHeader)
+                if let question { questionSection(question) }
+                if !currentSources.isEmpty {
+                    decisionLine
+                    if let proposal, let answer = proposal.answer {
+                        candidateExcerpt(answer, author: proposal, compact: compact)
+                    } else {
+                        Text("本场尚无可核对的候选结论。可在下方查看已保存的材料。")
+                            .foregroundStyle(.secondary)
+                    }
+                    if !participants.isEmpty { positions(compact: compact) }
+                    if let answer = proposal?.answer {
+                        DisclosureGroup("候选全文", isExpanded: $showCandidate) {
+                            if showCandidate { markdown(answer).padding(.top, 12) }
+                        }
+                    }
+                    DisclosureGroup(isExpanded: $showSources) {
+                        if showSources { sourceList }
+                    } label: {
+                        Label("发言与出处（\(currentSources.count)）", systemImage: "books.vertical")
+                    }
+                }
+                if let original = ArenaSessionDigest.report(session) {
+                    DisclosureGroup(isExpanded: $showArchive) {
+                        if showArchive { markdown(original).padding(.top, 12) }
+                    } label: {
+                        Label("完整报告", systemImage: "doc.richtext")
+                    }
+                }
+            }
+            .frame(maxWidth: 720, alignment: .leading)
+            .padding(.horizontal, compact ? 16 : 24)
+            .padding(.vertical, compact ? 12 : 22)
+            .frame(maxWidth: .infinity)
+        }
     }
 
     private var decisionLine: some View {
@@ -112,8 +118,8 @@ struct ArenaReportReader: View {
         .foregroundStyle(.secondary)
     }
 
-    private func candidateExcerpt(_ answer: String, author: ArenaTaskRow) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+    private func candidateExcerpt(_ answer: String, author: ArenaTaskRow, compact: Bool) -> some View {
+        VStack(alignment: .leading, spacing: compact ? 6 : 10) {
             HStack {
                 Text("结论摘录")
                     .font(.title3.weight(.semibold))
@@ -124,31 +130,43 @@ struct ArenaReportReader: View {
                 }
                 .buttonStyle(.link)
             }
-            markdown(ArenaCandidateLead.excerpt(answer)).lineLimit(9)
+            markdown(ArenaCandidateLead.excerpt(answer)).lineLimit(compact ? 4 : 9)
         }
-        .padding(.vertical, 12)
-        .padding(.horizontal, 16)
+        .padding(.vertical, compact ? 8 : 12)
+        .padding(.horizontal, compact ? 12 : 16)
         .background(RoundedRectangle(cornerRadius: 10).fill(Color.accentColor.opacity(0.045)))
     }
 
-    @ViewBuilder private var positions: some View {
-        VStack(alignment: .leading, spacing: 12) {
+    private func positions(compact: Bool) -> some View {
+        VStack(alignment: .leading, spacing: compact ? 6 : 12) {
             Text("各席表态").font(.headline).accessibilityAddTraits(.isHeader)
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 170, maximum: 400), spacing: 10)], alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
                 ForEach(participants, id: \.self) { provider in
                     let vote = votes.first { $0["provider"] == provider }
                     let source = rows.first { $0.id == vote?["id"] }
                     Button {
                         if let source { selectedSource = source }
                     } label: {
-                        HStack(spacing: 7) {
-                            Circle().fill(Self.color(vote?["stance"])).frame(width: 7, height: 7)
+                        let label = Label {
                             Text(ArenaSeatCatalog.name(provider)).fontWeight(.medium)
-                            Spacer(minLength: 3)
-                            Text(Self.stance(vote?["stance"])).foregroundStyle(.secondary)
-                        }.font(.system(size: 13)).padding(10)
-                         .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.045)))
-                         .contentShape(Rectangle())
+                        } icon: {
+                            Circle().fill(Self.color(vote?["stance"])).frame(width: 7, height: 7)
+                        }
+                        let stance = Text(Self.stance(vote?["stance"])).foregroundStyle(.secondary)
+                        let layout = compact
+                            ? AnyLayout(VStackLayout(alignment: .leading, spacing: 3))
+                            : AnyLayout(HStackLayout(spacing: 7))
+                        layout {
+                            label
+                            if !compact { Spacer(minLength: 3) }
+                            stance
+                        }
+                        .font(.system(size: 13))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, compact ? 6 : 10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.045)))
+                        .contentShape(Rectangle())
                     }.buttonStyle(.plain).disabled(source == nil)
                 }
             }
