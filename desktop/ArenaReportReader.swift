@@ -33,70 +33,6 @@ struct ArenaReportReader: View {
     private var votes: [[String: Any]] { ballot?["votes"] as? [[String: Any]] ?? [] }
     private var reason: String { ArenaSessionDigest.stopReason(session) ?? "" }
     private var version: Int { ArenaValue.int(ballot?["version"]) ?? 0 }
-    /// Only candidates that follow the fixed Markdown blocks get the structured
-    /// first screen, diagram and artifacts. Older or malformed candidates keep
-    /// the original lead-paragraph path below.
-    private var digest: ArenaCandidateDigest? {
-        guard let answer = proposal?.answer else { return nil }
-        return ArenaCandidateDigest.parse(answer)
-    }
-    private var artifactInput: ArenaReportArtifactInput? {
-        guard let proposal, let digest else { return nil }
-        let sourceRows = currentSources.compactMap { row -> ArenaReportSourceRow? in
-            guard let answer = row.answer, !row.sourceId.isEmpty else { return nil }
-            return ArenaReportSourceRow(
-                id: row.sourceId,
-                seatLabel: ArenaSeatCatalog.name(row.provider),
-                stageLabel: ArenaStageNames.taskLabel(
-                    row.stage,
-                    round: row.round,
-                    session: session
-                ),
-                answer: answer
-            )
-        }
-
-        var labels: [String: String] = [:]
-        for provider in participants + rows.map(\.provider) where !provider.isEmpty {
-            labels[provider] = ArenaSeatCatalog.name(provider)
-        }
-
-        var positions: [ArenaReportPositionRow] = []
-        var seen = Set<String>()
-        for raw in votes {
-            guard let provider = ArenaValue.string(raw["provider"]),
-                  !provider.isEmpty,
-                  !seen.contains(provider),
-                  let id = ArenaValue.string(raw["id"]),
-                  let row = rows.first(where: { $0.id == id }) else { continue }
-            seen.insert(provider)
-            let stance = ArenaValue.string(raw["stance"])
-            positions.append(
-                ArenaReportPositionRow(
-                    provider: provider,
-                    seatLabel: ArenaSeatCatalog.name(provider),
-                    stance: stance ?? "",
-                    stanceLabel: Self.stance(stance),
-                    sourceID: row.sourceId,
-                    answer: row.answer ?? ""
-                )
-            )
-        }
-
-        return ArenaReportArtifactInput(
-            question: question ?? "",
-            outcome: outcome,
-            isVerifiedConsensus: verifiedConsensus,
-            version: version,
-            candidateAuthor: ArenaSeatCatalog.name(proposal.provider),
-            candidateSourceID: proposal.sourceId,
-            digest: digest,
-            participants: participants,
-            seatLabels: labels,
-            positions: positions,
-            sources: sourceRows
-        )
-    }
     private var verifiedConsensus: Bool {
         reason == "consensus" && proposal != nil && !participants.isEmpty &&
         participants.allSatisfy { provider in
@@ -159,39 +95,25 @@ struct ArenaReportReader: View {
                         .font(.system(size: compact ? 20 : 24, weight: .semibold))
                         .accessibilityAddTraits(.isHeader)
                     if let question { questionSection(question) }
-                    decisionLine(compact: compact) {
-                        openComparison()
-                        DispatchQueue.main.async {
-                            if reduceMotion {
-                                proxy.scrollTo("candidate-comparison", anchor: .top)
-                            } else {
-                                withAnimation(.easeOut(duration: 0.22)) {
+                    if !currentSources.isEmpty {
+                        decisionLine(compact: compact) {
+                            openComparison()
+                            DispatchQueue.main.async {
+                                if reduceMotion {
                                     proxy.scrollTo("candidate-comparison", anchor: .top)
+                                } else {
+                                    withAnimation(.easeOut(duration: 0.22)) {
+                                        proxy.scrollTo("candidate-comparison", anchor: .top)
+                                    }
                                 }
                             }
                         }
-                    }
-                    if let proposal, let answer = proposal.answer {
-                        if let digest, let artifactInput {
-                            ArenaReportDigestView(
-                                digest: digest,
-                                input: artifactInput,
-                                compact: compact,
-                                knownSources: Set(currentSources.map(\.sourceId)),
-                                onOpenSource: { identifier in
-                                    if let row = currentSources.first(where: { $0.sourceId == identifier }) {
-                                        selectedSource = row
-                                    }
-                                },
-                                onOpenAuthor: { selectedSource = proposal }
-                            )
-                        } else {
+                        if let proposal, let answer = proposal.answer {
                             candidateExcerpt(answer, author: proposal, compact: compact)
+                        } else {
+                            Text("本场尚无可核对的候选结论。可在下方查看已保存的材料。")
+                                .foregroundStyle(.secondary)
                         }
-                    } else {
-                        emptyCandidateState
-                    }
-                    if !currentSources.isEmpty {
                         if !participants.isEmpty { positions(compact: compact) }
                         if candidateHistory.hasMultipleVersions {
                             comparisonSection(compact: compact)
@@ -265,27 +187,6 @@ struct ArenaReportReader: View {
         }
         .font(.system(size: 13))
         .foregroundStyle(.secondary)
-    }
-
-    private var emptyCandidateState: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: "doc.text.magnifyingglass")
-                .font(.system(size: 17, weight: .medium))
-                .foregroundStyle(.secondary)
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 4) {
-                Text("最终报告没有候选结论")
-                    .font(.subheadline.weight(.semibold))
-                Text("本场没有形成可核对的候选。若已保存材料，下方仍可查看；缺席、跳过、未完成和未表态都不能当作一致。")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-        .padding(.vertical, 10)
-        .padding(.horizontal, 12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 9).fill(Color.primary.opacity(0.035)))
     }
 
     private func candidateExcerpt(_ answer: String, author: ArenaTaskRow, compact: Bool) -> some View {

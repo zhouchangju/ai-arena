@@ -1776,114 +1776,6 @@ test('all critiques skipped ends in a partial report without a proposal', () => 
 });
 
 // ---------------------------------------------------------------------------
-// Structured candidate blocks
-// ---------------------------------------------------------------------------
-
-test('candidate prompt fixes the four readable blocks and keeps the vote contract', () => {
-  let session = start();
-  session = answerFor(session, 'chatgpt', 'CHATGPT_INDEPENDENT 先做移动端。[S1]');
-  session = answerFor(session, 'claude', 'CLAUDE_INDEPENDENT 先补检索。[S2]');
-  session = answerFor(session, 'chatgpt', 'CHATGPT_CRITIQUE 采集频次待证实。');
-  session = answerFor(session, 'claude', 'CLAUDE_CRITIQUE 检索慢是已知事实。');
-  assert.equal(session.stage, 'proposal');
-
-  const prompt = session.tasks[0].prompt;
-  assert.match(prompt, /^## 直接建议$/m);
-  assert.match(prompt, /^## 成立条件$/m);
-  assert.match(prompt, /^## 影响建议的未决分歧$/m);
-  assert.match(prompt, /^## 其他说明$/m);
-  assert.match(prompt, /前三块必须按顺序各出现一次/);
-  assert.match(prompt, /第四块可选/);
-  assert.match(prompt, /短句/);
-  assert.match(prompt, /术语前后一致/);
-  assert.match(prompt, /就近标注 \[S#\]/);
-  assert.match(prompt, /不得虚构来源/);
-  assert.match(prompt, /缺席、跳过、未表态或往轮表态/);
-  assert.match(prompt, /最强反例/);
-
-  const candidate = `## 直接建议
-先用手机快捷入口验证采集频次。[S1]
-
-## 成立条件
-- 采集确实发生在路上。[S1]
-- 两个周末内只做入口。
-
-## 影响建议的未决分歧
-- 采集频次尚未证实，需要一周记录。[S2]
-
-## 其他说明
-最强反例：现有数据只证明检索慢。[S2]`;
-  session = answerFor(session, 'chatgpt', candidate);
-  assert.equal(session.stage, 'vote');
-
-  // The same candidate text goes to every vote prompt; the stance contract is
-  // unchanged, and the structured headings do not replace the whole-text vote.
-  for (const task of session.tasks) {
-    assert.ok(task.prompt.includes(candidate));
-    assert.match(task.prompt, /同一候选版本 v1 的上述全文/);
-    assert.match(task.prompt, /agree：明确同意/);
-    assert.ok(task.proposalDigest);
-  }
-
-  session = voteAll(
-    session,
-    { chatgpt: 'agree', claude: 'agree' },
-    {
-      chatgpt: 'VOTE_CHATGPT 同意全文。',
-      claude: 'VOTE_CLAUDE 同意全文。',
-    },
-  );
-  assert.equal(session.stopReason, 'consensus');
-  assert.ok(session.report.includes('## 直接建议'));
-  assert.ok(session.report.includes('## 影响建议的未决分歧'));
-});
-
-test('a structured candidate never lets an absent or unfinished seat count as consensus', () => {
-  let session = createSession(QUESTION, ['chatgpt', 'claude', 'gemini'], {
-    maxRounds: 3,
-  });
-  for (const [provider, text] of [
-    ['chatgpt', 'CHATGPT_INDEPENDENT 先做入口。'],
-    ['claude', 'CLAUDE_INDEPENDENT 先补检索。'],
-    ['gemini', 'GEMINI_INDEPENDENT 先做实验。'],
-  ]) {
-    session = answerFor(session, provider, text);
-  }
-  for (const provider of ['chatgpt', 'claude', 'gemini']) {
-    session = answerFor(session, provider, `${provider.toUpperCase()}_CRITIQUE 回应反例。`);
-  }
-  assert.equal(session.stage, 'proposal');
-  session = answerFor(
-    session,
-    'chatgpt',
-    `## 直接建议
-先做手机入口。[S1]
-
-## 成立条件
-- 采集发生在路上。[S1]
-
-## 影响建议的未决分歧
-- 采集频次待核对。[S2]`,
-  );
-  assert.equal(session.stage, 'vote');
-
-  session = answerFor(session, 'chatgpt', 'CHATGPT_VOTE 同意。', { stance: 'agree' });
-  session = answerFor(session, 'claude', 'CLAUDE_VOTE 同意。', { stance: 'agree' });
-  session = skipFor(session, 'gemini');
-
-  assert.equal(session.stage, 'done');
-  assert.equal(session.stopReason, 'partial-votes');
-  assert.doesNotMatch(session.report, /全体一致：/);
-  assert.match(session.report, /部分完成/);
-  assert.match(session.report, /`gemini`：未对 v1 明确表态（不能视为同意）/);
-  const ballot = reportBallot(session.history);
-  assert.deepEqual(
-    ballot.votes.map((vote) => vote.provider).sort(),
-    ['chatgpt', 'claude'],
-  );
-});
-
-// ---------------------------------------------------------------------------
 // Long material and report traceability
 // ---------------------------------------------------------------------------
 
@@ -1943,6 +1835,51 @@ test('frozen peer and candidate text is embedded in full, including the middle',
   assert.ok(session.report.includes(candidateMiddle));
   assert.ok(session.report.includes(middleObjection));
   assert.doesNotMatch(session.report, /中间省略/);
+});
+
+test('proposal prompt adds a plain-text style direction without a fixed visual structure', () => {
+  let session = start();
+  session = answerFor(session, 'chatgpt', 'CHATGPT_INDEPENDENT 先做移动端。[S1]');
+  session = answerFor(session, 'claude', 'CLAUDE_INDEPENDENT 先补检索。[S2]');
+  session = answerFor(session, 'chatgpt', 'CHATGPT_CRITIQUE 采集频次待证实。');
+  session = answerFor(session, 'claude', 'CLAUDE_CRITIQUE 检索慢是已知事实。');
+  assert.equal(session.stage, 'proposal');
+
+  const prompt = session.tasks[0].prompt;
+  assert.match(prompt, /80% of the way to ASD-STE100/);
+  assert.match(prompt, /句子简短，术语一致，条件明确/);
+  assert.match(prompt, /只有在明显有助于理解时，才在正文里用简单图解或对照表/);
+  assert.match(prompt, /成立条件、最强反例/);
+  assert.match(prompt, /每个关键判断后用 \[S#\] 标注出处/);
+  assert.match(prompt, /缺席、跳过或未表态视为同意/);
+  assert.match(prompt, /保留分歧/);
+  assert.doesNotMatch(prompt, /## 直接建议/);
+});
+
+test('every vote prompt carries the complete same-version candidate text', () => {
+  const candidate = `CANDIDATE_HEAD 先做检索，再决定是否扩大覆盖。[S1][S3]
+
+条件 -> 影响
+高峰 -> 先扩容
+样本少 -> 先试点
+
+| 取舍 | 当前判断 |
+|---|---|
+| 先做检索 | 证据更直接 |
+| 先做移动端 | 采集频次待核实 |
+
+CANDIDATE_MIDDLE_MARKER 保留这条限定语，不得截断。`;
+  const session = toVote(candidate);
+  assert.equal(session.stage, 'vote');
+  const proposal = session.history.find((task) => task.stage === 'proposal');
+  assert.ok(proposal);
+  for (const task of session.tasks) {
+    assert.equal(task.version, proposal.version);
+    assert.equal(task.proposalDigest, proposalDigest(proposal));
+    assert.ok(task.prompt.includes(candidate));
+    assert.match(task.prompt, /CANDIDATE_MIDDLE_MARKER/);
+    assert.doesNotMatch(task.prompt, /中间省略|已截断/);
+  }
 });
 
 test('the reader and report accept only ballots for the exact latest candidate text', () => {
