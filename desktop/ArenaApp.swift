@@ -147,6 +147,9 @@ struct ArenaDesktopApp: App {
     init() {
         // 冒烟配置不合法时必须在 ArenaModel 创建（会打开原页）之前退出。
         SmokeRunner.preflight()
+        // Apply the saved appearance before ArenaModel creates any WebView or
+        // window. WKWebView identity and site-owned themes are left untouched.
+        ArenaAppearancePreferences.shared.applyApplicationAppearance()
         appDelegate.model = ArenaModel(
             continueSessionID: ArenaLaunchOptions.continueSessionID()
         )
@@ -156,7 +159,14 @@ struct ArenaDesktopApp: App {
         Settings {
             EmptyView()
         }
-        .commands { CommandGroup(replacing: .appSettings) {} }
+        .commands {
+            CommandGroup(replacing: .appSettings) {
+                Button("设置…") {
+                    ArenaSettingsWindowController.shared.show()
+                }
+                .keyboardShortcut(",", modifiers: .command)
+            }
+        }
     }
 }
 
@@ -345,6 +355,11 @@ struct ArenaRootView: View {
     @State private var seatHint: String?
     @State private var hintTask: Task<Void, Never>?
     @StateObject private var feedback = ArenaFeedbackPresenter()
+    @ObservedObject private var appearance = ArenaAppearancePreferences.shared
+
+    private var usesPhotoBackdrop: Bool {
+        appearance.backdropKind == .image && appearance.customImage != nil
+    }
 
     @State private var questionFocused = false
     @State private var questionFocusRequest = 0
@@ -469,7 +484,7 @@ struct ArenaRootView: View {
         .padding(.bottom, 11)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
-            ArenaGlassSurface(material: .headerView, cornerRadius: 0)
+            ArenaQuestionBackdropView(preferences: appearance)
         )
         .overlay(alignment: .bottom) {
             Rectangle()
@@ -520,6 +535,10 @@ struct ArenaRootView: View {
                     }
                     .help("以 Markdown 保存本场记录")
                 }
+            }
+
+            iconToolButton("外观与设置（⌘,）", icon: "gearshape") {
+                ArenaSettingsWindowController.shared.show()
             }
         }
     }
@@ -719,6 +738,10 @@ struct ArenaRootView: View {
         }
         .padding(14)
         .background(ArenaGlassSurface(material: .underWindowBackground, cornerRadius: 16))
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color(nsColor: .textBackgroundColor).opacity(usesPhotoBackdrop ? 0.72 : 0))
+        )
         .overlay(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .strokeBorder(
@@ -936,6 +959,10 @@ struct ArenaRootView: View {
         .padding(.vertical, 9)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(ArenaGlassSurface(material: .underWindowBackground, cornerRadius: 12))
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color(nsColor: .textBackgroundColor).opacity(usesPhotoBackdrop ? 0.72 : 0))
+        )
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .strokeBorder(Color.primary.opacity(0.09))
@@ -1604,7 +1631,13 @@ struct ArenaSeatCard: View {
             .padding(.horizontal, 9)
             .padding(.vertical, 4)
             .frame(minHeight: 50)
-            .background(Color.primary.opacity(0.035))
+            .background(
+                LinearGradient(
+                    colors: [Color.primary.opacity(0.055), Color.primary.opacity(0.022)],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            )
 
             if pane.boundConversationURL != nil, pane.conversationMismatch() != nil {
                 HStack(spacing: 6) {
