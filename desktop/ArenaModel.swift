@@ -167,13 +167,18 @@ enum ArenaStageNames {
     }
 
     static func discussionLabel(_ session: [String: Any]) -> String {
-        let stage = label(session.arenaString("stage") ?? "")
-        return [stage, reviewRound(session)].compactMap { $0 }.joined(separator: " · ")
+        let key = session.arenaString("stage") ?? ""
+        let round = reviewRound(session)
+        // The round label already starts with 互评, so a critique stage names it once.
+        if key == "critique", let round { return round }
+        return [label(key), round].compactMap { $0 }.joined(separator: " · ")
     }
 
     static func taskLabel(_ stage: String, round: Int, session: [String: Any]?) -> String {
         guard stage != "independent" else { return label(stage) }
-        return "\(label(stage)) · \(roundLabel(round, session: session))"
+        let roundText = roundLabel(round, session: session)
+        // The round label already starts with 互评, so a critique task names it once.
+        return stage == "critique" ? roundText : "\(label(stage)) · \(roundText)"
     }
 
     private static func roundLabel(_ round: Int, session: [String: Any]?) -> String {
@@ -332,6 +337,21 @@ final class ArenaModel: ObservableObject {
 
     @Published var draftAttachments: [ArenaDraftAttachment] = []
 
+    /// True while an unsent composer draft is parked for a history visit.
+    @Published private(set) var hasParkedDraft = false
+
+    private var parkedDraft = ArenaDraftParking()
+
+    /// An unsent question or attachment set exists somewhere in this run: still
+    /// in the composer, or parked while the user reviews history. A started
+    /// session's own saved question is never counted as an unsent draft.
+    var hasUnsentDraft: Bool {
+        if hasParkedDraft { return true }
+        guard session == nil else { return false }
+        return !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !draftAttachments.isEmpty
+    }
+
     func addDraftAttachments(_ attachments: [ArenaDraftAttachment]) {
         guard session == nil, !attachments.isEmpty else { return }
         do {
@@ -434,7 +454,8 @@ final class ArenaModel: ObservableObject {
     @Published private(set) var didContinueSavedDiscussion: Bool = false
 
     /// App-level reaction to a durable completion. Kept separate from view
-    /// state so the window chooses between opening the report and notifying.
+    /// state so the window chooses between revealing the report in place and
+    /// notifying.
     var onDiscussionCompleted: ((ArenaCompletionEvent) -> Void)?
 
     /// A discussion exists and has not reached the final stage. Used by the app
@@ -582,6 +603,10 @@ final class ArenaModel: ObservableObject {
         }
 
         session = created
+        // A really started discussion is the only outcome that consumes the
+        // unsent draft; every refused start returned above and kept it.
+        parkedDraft.consumeOnStart(succeeded: true)
+        hasParkedDraft = parkedDraft.hasDraft
         draftAttachments.removeAll()
         isReadOnly = false
         isRecovering = false
@@ -715,20 +740,40 @@ final class ArenaModel: ObservableObject {
     /// The guidance entry point: pause first (through the normal pause path),
     /// then hand back the pinned phase. Saving a condition never resumes the
     /// discussion and never dispatches an already-issued task.
-    func beginGuidance() -> ArenaGuidanceTarget? {
+    ///
+    /// `ownedPause` records whether this call is the one that paused an
+    /// unpaused discussion. The caller may hand that only back to
+    /// `resumePauseOwnedByGuidance` when the composer is cancelled, so a pause
+    /// the user made themselves is never resumed by accident.
+    func beginGuidance() -> ArenaGuidanceOpening? {
         guard let target = guidanceTarget() else {
             errorMessage = readOnlyGuidanceMessage
             return nil
         }
-        guard !isPaused else { return target }
+        guard !isPaused else {
+            return ArenaGuidanceOpening(target: target, ownedPause: false)
+        }
         guard setPaused(true) else { return nil }
         // The pause action cannot move the stage, but re-pin from the live
         // session so the composer can never save into a stale phase.
         guard let pinned = guidanceTarget(), pinned == target else {
             errorMessage = "讨论阶段已变化，请重新打开补充条件"
+            // Undo only the pause this call just made; nothing was saved.
+            _ = setPaused(false)
             return nil
         }
-        return pinned
+        return ArenaGuidanceOpening(target: pinned, ownedPause: true)
+    }
+
+    /// Undo the pause that the condition composer applied for this pinned
+    /// phase. A pause the user made before opening the composer never sets
+    /// `ownedPause`, a manual「继续」already cleared the pause, and a moved
+    /// stage/round/session makes this a no-op. Nothing is dispatched or re-sent.
+    @discardableResult
+    func resumePauseOwnedByGuidance(_ target: ArenaGuidanceTarget) -> Bool {
+        guard isPaused, !isReadOnly, stageKey != "done" else { return false }
+        guard guidancePhaseMatches(target) else { return false }
+        return setPaused(false)
     }
 
     /// `true` when the pinned phase is still the live, paused, same session /
@@ -1154,22 +1199,33 @@ final class ArenaModel: ObservableObject {
         return Self.backfillPrefill(currentAnswer: answer, preview: previews[provider])
     }
 
-    /// The one local action a blocked seat card may offer, or `nil`.
+    /// The one local action a blocked or recovered seat card may offer, or `nil`.
     ///
     /// This is deliberately narrower than the seat menu: it appears only for a
-    /// blocked, non-manual, non-paused seat in a running discussion, and only
-    /// when the persisted intent proves the action is safe. Manual takeover,
-    /// paused, done, read-only history and every other seat keep their existing
-    /// menus and behaviour.
+    /// blocked seat or a seat restored for manual verification, in a running
+    /// discussion, and only when the persisted intent proves the action is safe.
+    /// A seat the user took over by hand, paused, done, read-only history and
+    /// every other seat keep their existing menus and behaviour.
     ///
     /// A visible conversation-mismatch banner already owns the next step (return
     /// to the saved conversation); the seat card must not add a competing CTA.
     func localAction(for provider: String) -> ArenaSeatLocalAction? {
         guard !isReadOnly, !isPaused, stageKey != "done",
               currentProviders.contains(provider),
-              !manualProviders.contains(provider),
-              let target = manualTarget(for: provider),
-              blockedTasks.contains(target.taskID) else {
+              let target = manualTarget(for: provider) else {
+            return nil
+        }
+        let recoverySeat = verificationProviders.contains(provider)
+        let userTakenOver = manualProviders.contains(provider) && !recoverySeat
+        guard Self.allowsSeatLocalAction(
+            readOnly: isReadOnly,
+            paused: isPaused,
+            done: stageKey == "done",
+            participant: currentProviders.contains(provider),
+            userTakenOver: userTakenOver,
+            recoverySeat: recoverySeat,
+            blocked: blockedTasks.contains(target.taskID)
+        ) else {
             return nil
         }
         if let pane = panes[provider], pane.boundConversationURL != nil,
@@ -1186,6 +1242,26 @@ final class ArenaModel: ObservableObject {
             return nil
         }
         return ArenaSeatLocalAction(kind: kind, target: target)
+    }
+
+    /// Pure eligibility for `localAction(for:)`. A recovery seat is admitted
+    /// even though the restore path marks it manual, so the card can still
+    /// reach an intent-proven safe action. It never widens the action kinds:
+    /// `.prepared` and a missing intent remain `nil`, so recovery cannot send
+    /// or resume automatically, and no unknown submission is treated as unsent.
+    nonisolated static func allowsSeatLocalAction(
+        readOnly: Bool,
+        paused: Bool,
+        done: Bool,
+        participant: Bool,
+        userTakenOver: Bool,
+        recoverySeat: Bool,
+        blocked: Bool
+    ) -> Bool {
+        guard !readOnly, !paused, !done, participant, !userTakenOver else {
+            return false
+        }
+        return blocked || recoverySeat
     }
 
     /// Pure safety rule for `localAction(for:)`. `.readOnlyCheck` is returned
@@ -1247,35 +1323,70 @@ final class ArenaModel: ObservableObject {
 
     // MARK: History
 
-    /// Open a saved discussion for read-only review. This never re-creates a
-    /// delivery loop and never opens or sends to a site.
     /// Open a saved discussion for read-only review. This never opens a page,
     /// re-creates a delivery loop or sends anything. The shared restore path is
     /// used in conservative mode: every pending seat, including one whose task
-    /// was never sent, waits for manual verification.
-    func openHistory(_ id: String) {
+    /// was never sent, waits for manual verification. No pane is allocated for
+    /// read-only reading; `continueSavedDiscussion` mounts them again.
+    @discardableResult
+    func openHistory(_ id: String) -> Bool {
         guard let saved = loadSavedSession(id: id) else {
             errorMessage = "找不到该历史场次，或记录已损坏"
-            return
+            return false
         }
         stopRunningWork()
+        parkComposerDraft()
         installRestored(saved, mode: .manualVerification, readOnly: true)
-        for provider in saved.participants {
-            _ = ensurePane(for: provider)
-        }
         historyResumeID = saved.stage == "done" ? nil : id
         errorMessage = ""
         recoveryNotice = "历史回看为只读：不会打开原页、不会重发，也不能修改回答。"
         refreshStage()
+        return true
     }
 
-    /// Clear the workbench for a fresh question.
+    /// Clear the workbench for a fresh question. A draft parked while reviewing
+    /// history is the user's own unsent content, so it comes back here instead
+    /// of disappearing; content typed in this composer is still cleared by the
+    /// explicit 「新建」 the user pressed.
     func newDiscussion() {
+        let draft = parkedDraft.take()
+        hasParkedDraft = parkedDraft.hasDraft
+        resetComposer(question: draft?.question ?? "", attachments: draft?.attachments ?? [])
+    }
+
+    /// Bring the parked draft back to the composer and leave history without
+    /// starting anything: no page is opened, nothing is sent, and the body text
+    /// plus the same ordered attachments return exactly as they were parked.
+    @discardableResult
+    func restoreParkedDraft() -> Bool {
+        guard let draft = parkedDraft.take() else { return false }
+        hasParkedDraft = false
+        resetComposer(question: draft.question, attachments: draft.attachments)
+        return true
+    }
+
+    /// Hold the composer's unsent content before a history record replaces it.
+    /// `session == nil && !isReadOnly` is the proof this is still the composer:
+    /// a read-only or continued session owns its saved question and must never
+    /// be captured as a new draft. A missing or broken history record returns
+    /// before this is called, so a failed load cannot touch the draft.
+    private func parkComposerDraft() {
+        parkedDraft.park(
+            question: question,
+            attachments: draftAttachments,
+            leavingComposer: session == nil && !isReadOnly
+        )
+        hasParkedDraft = parkedDraft.hasDraft
+    }
+
+    private func resetComposer(question: String, attachments: [ArenaDraftAttachment]) {
         stopRunningWork()
+        // Put the composer content back before the session is cleared so no view
+        // update can briefly show the history question as an unsent draft.
+        self.question = question
+        draftAttachments = attachments
         session = nil
         currentID = nil
-        question = ""
-        draftAttachments.removeAll()
         createdAt = 0
         intents.removeAll()
         manualProviders.removeAll()
@@ -3599,7 +3710,7 @@ final class ArenaModel: ObservableObject {
         // history row is projected from this save instead of re-reading every
         // saved record. A failed save returned before this point.
         historyList = ArenaSessionStore.upserting(
-            engine.store.summary(for: file, session: session),
+            historySummary(for: file, session: session),
             into: historyList
         )
         if let event = completionTracker.recordPersisted(
@@ -3907,7 +4018,7 @@ final class ArenaModel: ObservableObject {
                 recoveryNotice = "当前场次未通过自动恢复检查；已按人工核对方式打开。"
             }
         } else if !explicit {
-            recoveryNotice = "已恢复上次讨论。为避免重复发送，本场改为人工核对：可打开原页核对后粘贴回答，或跳过；新建讨论才会恢复自动派发。"
+            recoveryNotice = "已恢复上次讨论。为避免重复发送，本场先按人工核对：可打开原页核对后粘贴回答，或跳过；核对原页后也可逐席恢复该席自动，各席按已保存的发送记录只读或继续，不会自动发送。"
         }
     }
 
@@ -3979,6 +4090,7 @@ final class ArenaModel: ObservableObject {
             return false
         }
         stopRunningWork()
+        parkComposerDraft()
         errorMessage = ""
         installRestored(saved, mode: .manualVerification)
         recoveryNotice = "已继续这一场。请逐席核对原页，再补录、跳过或恢复本站自动。"
@@ -4036,7 +4148,41 @@ final class ArenaModel: ObservableObject {
     }
 
     private func refreshHistoryList() {
-        historyList = engine.store.summaries()
+        historyList = engine.store.summaries { file, session in
+            historySummary(for: file, session: session)
+        }
+    }
+
+    /// One saved row plus its conservative outcome stamp. The strict ballot is
+    /// evaluated once here (save or explicit refresh), never per search
+    /// keystroke. A missing or unparseable shell, or a ballot the engine cannot
+    /// build, stamps no proof and therefore degrades rather than claiming 全体一致.
+    private func historySummary(
+        for file: ArenaSessionFile,
+        session: [String: Any]?
+    ) -> ArenaHistorySummary {
+        var summary = engine.store.summary(for: file, session: session)
+        guard let raw = summary.stopReason,
+              raw == "consensus" || raw == "conditional-agreement" else {
+            return summary
+        }
+        // A shell without a parsed document still carries the file's stop code;
+        // it has no ballot proof, so it is stamped conservatively rather than
+        // left claiming agreement.
+        let history = session?["history"] as? [[String: Any]] ?? []
+        let ballot = session == nil ? nil : try? engine.reportBallot(
+            history: ArenaBallotProjection.materials(history: history)
+        )
+        guard let stamp = ArenaHistoryOutcome.stamp(
+            stopReason: raw,
+            ballot: ballot,
+            participants: session?.arenaStringArray("providers") ?? summary.providers
+        ) else {
+            return summary
+        }
+        summary.conservativeOutcomeKey = stamp.key
+        summary.conservativeOutcomeLabel = stamp.label
+        return summary
     }
 
     /// Re-read the saved summaries for the search sheet. Read-only: nothing is

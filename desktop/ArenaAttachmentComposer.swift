@@ -198,7 +198,15 @@ struct ArenaQuestionEditor: NSViewRepresentable {
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         guard let editor = scroll.documentView as? ArenaQuestionTextView else { return }
         context.coordinator.parent = self
-        if !editor.hasMarkedText(), editor.string != text { editor.string = text }
+        // Only an external change (new discussion, restored parked draft) writes
+        // the body back. The caret and an in-flight IME composition are kept, so
+        // a layout or width change can never move the cursor or drop typing.
+        if !editor.hasMarkedText(), editor.string != text {
+            let selected = editor.selectedRange()
+            editor.string = text
+            let length = (text as NSString).length
+            editor.setSelectedRange(NSRange(location: min(selected.location, length), length: 0))
+        }
         editor.acceptMaterials = onMaterials
         editor.reportError = onError
         editor.start = onStart

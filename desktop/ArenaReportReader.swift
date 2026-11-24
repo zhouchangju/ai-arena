@@ -20,6 +20,8 @@ struct ArenaReportReader: View {
     @State private var olderSnapshot: ArenaCandidateSnapshot?
     @State private var newerSnapshot: ArenaCandidateSnapshot?
     @State private var priorConcerns: [ArenaCandidateVote] = []
+    @State private var finishedComparison: ArenaComparisonKey?
+    @State private var snapshotCache: [Int: ArenaSnapshotCacheEntry] = [:]
     @State private var changePulse = false
     @State private var pulseSequence = 0
 
@@ -31,32 +33,20 @@ struct ArenaReportReader: View {
         return rows.first { $0.id == id }
     }
     private var votes: [[String: Any]] { ballot?["votes"] as? [[String: Any]] ?? [] }
-    private var reason: String { ArenaSessionDigest.stopReason(session) ?? "" }
     private var version: Int { ArenaValue.int(ballot?["version"]) ?? 0 }
     private var verifiedConsensus: Bool {
-        reason == "consensus" && proposal != nil && !participants.isEmpty &&
-        participants.allSatisfy { provider in
-            votes.contains {
-                ArenaValue.string($0["provider"]) == provider
-                    && ArenaValue.string($0["stance"]) == "agree"
-            }
-        }
+        ArenaHistoryOutcome.verifiedConsensus(
+            stopReason: ArenaSessionDigest.stopReason(session),
+            ballot: ballot,
+            participants: participants
+        )
     }
     private var outcome: String {
-        if verifiedConsensus { return "全体一致" }
-        switch reason {
-        case "conditional-agreement":
-            return votes.contains { ArenaValue.string($0["stance"]) == "conditional" } ? "有条件同意" : "表态记录不完整"
-        case "unresolved-opposition": return "存在分歧"
-        case "user-finished": return "提前结束"
-        case "no-answers": return "尚无回答"
-        case "no-cross-review": return "互评未完成"
-        case "draft": return "候选草稿"
-        case "proposal-skipped", "no-critique": return "尚无最终候选"
-        case "partial-participation": return "部分席位参与"
-        case "partial-votes", "consensus": return "表态记录不完整"
-        default: return "讨论已结束"
-        }
+        ArenaHistoryOutcome.conservativeLabel(
+            stopReason: ArenaSessionDigest.stopReason(session),
+            ballot: ballot,
+            participants: participants
+        )
     }
     private var currentSources: [ArenaTaskRow] {
         rows.filter { $0.status == "answered" && $0.answer?.isEmpty == false }
@@ -99,12 +89,12 @@ struct ArenaReportReader: View {
                         decisionLine(compact: compact) {
                             openComparison()
                             DispatchQueue.main.async {
-                                if reduceMotion {
-                                    proxy.scrollTo("candidate-comparison", anchor: .top)
-                                } else {
-                                    withAnimation(.easeOut(duration: 0.22)) {
+                                if let animation = ArenaMotion.change(reduceMotion) {
+                                    withAnimation(animation) {
                                         proxy.scrollTo("candidate-comparison", anchor: .top)
                                     }
+                                } else {
+                                    proxy.scrollTo("candidate-comparison", anchor: .top)
                                 }
                             }
                         }
@@ -142,7 +132,7 @@ struct ArenaReportReader: View {
                         ReportDisclosure(isExpanded: $showArchive) {
                             Label("完整报告", systemImage: "doc.richtext")
                         } content: {
-                            markdown(original).padding(.top, 12)
+                            fullReport(original).padding(.top, 12)
                         }
                     }
                 }
@@ -176,7 +166,7 @@ struct ArenaReportReader: View {
                         .background(Capsule().fill(Color.primary.opacity(0.07)))
                         .contentShape(Capsule())
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(ArenaPressStyle())
                     .accessibilityLabel("候选 v\(version)，共 \(candidateHistory.versions.count) 个保存版本")
                     .accessibilityHint("打开版本对比")
                 } else {
@@ -227,6 +217,7 @@ struct ArenaReportReader: View {
                             Circle()
                                 .fill(Self.color(ArenaValue.string(vote?["stance"])))
                                 .frame(width: 7, height: 7)
+                                .accessibilityHidden(true)
                         }
                         let stance = Text(Self.stance(ArenaValue.string(vote?["stance"])))
                             .foregroundStyle(.secondary)
@@ -244,13 +235,19 @@ struct ArenaReportReader: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.045)))
                         .contentShape(Rectangle())
-                    }.buttonStyle(.plain).disabled(source == nil)
+                    }
+                    .buttonStyle(ArenaPressStyle())
+                    .disabled(source == nil)
+                    .accessibilityHint(source == nil ? "没有可打开的保存原文" : "打开保存原文")
                 }
             }
             ForEach(Array(concerns.enumerated()), id: \.offset) { _, vote in
                 let id = ArenaValue.string(vote["id"]) ?? ""
                 if let row = rows.first(where: { $0.id == id }), let answer = row.answer {
-                    DisclosureGroup("\(ArenaSeatCatalog.name(row.provider)) · \(Self.stance(ArenaValue.string(vote["stance"])))原文") {
+                    ReportSelfDisclosure {
+                        Text("\(ArenaSeatCatalog.name(row.provider)) · \(Self.stance(ArenaValue.string(vote["stance"])))原文")
+                            .font(.system(size: 13))
+                    } content: {
                         markdown(answer).padding(.top, 8)
                     }
                 }
@@ -278,10 +275,7 @@ struct ArenaReportReader: View {
                 }
             } label: {
                 HStack(spacing: 8) {
-                    Image(systemName: showComparison ? "chevron.down" : "chevron.right")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .accessibilityHidden(true)
+                    ArenaDisclosureChevron(isExpanded: showComparison)
                     Label("版本对比", systemImage: "rectangle.split.2x1")
                     if !showComparison, !comparisonPairLabel.isEmpty {
                         Text(comparisonPairLabel).foregroundStyle(.secondary)
@@ -290,8 +284,9 @@ struct ArenaReportReader: View {
                 .frame(maxWidth: .infinity, minHeight: 32, alignment: .leading)
                 .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(ArenaPressStyle())
             .accessibilityValue(showComparison ? "已展开" : "已收起")
+            .accessibilityHint(showComparison ? "收起版本对比" : "展开版本对比")
             if showComparison {
                 VStack(alignment: .leading, spacing: compact ? 12 : 16) {
                     versionSelectors(compact: compact)
@@ -423,29 +418,45 @@ struct ArenaReportReader: View {
     private func rebuildComparison(left: Int? = nil, right: Int? = nil) {
         let leftValue = left ?? compareLeft
         let rightValue = right ?? compareRight
-        guard candidateHistory.versions.contains(leftValue),
-              candidateHistory.versions.contains(rightValue),
+        let history = candidateHistory
+        guard history.versions.contains(leftValue),
+              history.versions.contains(rightValue),
               leftValue != rightValue else {
             comparisonChanges = []
             comparisonTruncated = false
             olderSnapshot = nil
             newerSnapshot = nil
             priorConcerns = []
+            finishedComparison = nil
             return
         }
 
+        // Opening the section, the selector and each of its size changes all
+        // report a change. Only the first rebuild for this exact pair and this
+        // exact history does the work; the rest keep the result already shown.
+        let key = ArenaComparisonKey(stamp: comparisonStamp(), left: leftValue, right: rightValue)
+        if key == finishedComparison { return }
+
         // One bridge call per version: canonical candidateID and the accepted
         // vote ids. Saved rows only supply text, seat labels and gap reasons.
+        // A snapshot is reused only while the stamp of the saved rows is the
+        // same, so a changed session never keeps an older ballot or text.
         var snapshots: [Int: ArenaCandidateSnapshot] = [:]
-        for version in candidateHistory.versions where version <= rightValue {
-            snapshots[version] = candidateHistory.snapshot(
+        for version in history.versions where version <= rightValue {
+            if let cached = snapshotCache[version], cached.stamp == key.stamp {
+                snapshots[version] = cached.snapshot
+                continue
+            }
+            let snapshot = history.snapshot(
                 version: version,
                 ballot: model.reportBallot(forVersion: version)
             )
+            snapshotCache[version] = ArenaSnapshotCacheEntry(stamp: key.stamp, snapshot: snapshot)
+            snapshots[version] = snapshot
         }
         olderSnapshot = snapshots[leftValue]
         newerSnapshot = snapshots[rightValue]
-        priorConcerns = candidateHistory.versions
+        priorConcerns = history.versions
             .filter { $0 < rightValue }
             .flatMap { snapshots[$0]?.concerns ?? [] }
 
@@ -453,11 +464,40 @@ struct ArenaReportReader: View {
               let newerText = snapshots[rightValue]?.candidate?.text else {
             comparisonChanges = []
             comparisonTruncated = false
+            finishedComparison = key
             return
         }
         let result = ArenaParagraphDiff.compare(old: olderText, new: newerText)
         comparisonChanges = result.rows
         comparisonTruncated = result.truncated
+        finishedComparison = key
+    }
+
+    /// Fingerprint of the saved rows a comparison reads: session id, seats,
+    /// and every proposal/vote row's identity, status, stance, digest and
+    /// candidate text. A new session, a newly recorded vote or a changed
+    /// candidate therefore produces a different stamp; unrelated rows (prompts,
+    /// independent answers) do not.
+    private func comparisonStamp() -> Int {
+        var hasher = Hasher()
+        hasher.combine(ArenaSessionDigest.id(session) ?? "")
+        hasher.combine(participants.joined(separator: "\u{1F}"))
+        for row in session?["history"] as? [[String: Any]] ?? [] {
+            let stage = ArenaValue.string(row["stage"]) ?? ""
+            guard stage == "proposal" || stage == "vote" else { continue }
+            hasher.combine(ArenaValue.string(row["id"]) ?? "")
+            hasher.combine(stage)
+            hasher.combine(ArenaValue.string(row["provider"]) ?? "")
+            hasher.combine(ArenaValue.string(row["status"]) ?? "")
+            hasher.combine(ArenaValue.string(row["sourceId"]) ?? "")
+            hasher.combine(ArenaValue.int(row["version"]) ?? 0)
+            hasher.combine(ArenaValue.string(row["stance"]) ?? "")
+            hasher.combine(ArenaValue.string(row["proposalDigest"]) ?? "")
+            if stage == "proposal" {
+                hasher.combine(ArenaValue.string(row["answer"]) ?? "")
+            }
+        }
+        return hasher.finalize()
     }
 
     /// Only a deliberate selector change pulses. Reduce Motion shows the same
@@ -472,10 +512,10 @@ struct ArenaReportReader: View {
                 changePulse = false
             }
         } else {
-            withAnimation(.easeOut(duration: 0.16)) { changePulse = true }
+            withAnimation(ArenaMotion.quick(reduceMotion)) { changePulse = true }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
                 guard pulseSequence == sequence else { return }
-                withAnimation(.easeOut(duration: 0.5)) { changePulse = false }
+                withAnimation(ArenaMotion.change(reduceMotion)) { changePulse = false }
             }
         }
     }
@@ -538,14 +578,15 @@ struct ArenaReportReader: View {
                 changeTag("修改", color: .accentColor)
                 markdown(change.newText ?? "")
                 if let old = change.oldText {
-                    DisclosureGroup("旧版这一段") {
+                    ReportSelfDisclosure {
+                        Text("旧版这一段").font(.caption)
+                    } content: {
                         Text(verbatim: old)
                             .font(.system(size: 14))
                             .foregroundStyle(.secondary)
                             .textSelection(.enabled)
                             .padding(.top, 4)
                     }
-                    .font(.caption)
                 }
                 comparisonCitations(change.newCitations, concerns: concerns)
             }
@@ -607,6 +648,7 @@ struct ArenaReportReader: View {
                                 Text(citationTitle(identifier, row: row, concerns: concerns))
                                 Image(systemName: "chevron.right")
                                     .font(.system(size: 8, weight: .semibold))
+                                    .accessibilityHidden(true)
                             }
                             .font(.caption)
                         }
@@ -656,6 +698,7 @@ struct ArenaReportReader: View {
                             Circle()
                                 .fill(Self.color(concern.stance))
                                 .frame(width: 6, height: 6)
+                                .accessibilityHidden(true)
                             Text("v\(concern.version)")
                             Text(ArenaSeatCatalog.name(concern.provider))
                             Text(ArenaCandidateStance.label(concern.stance))
@@ -669,13 +712,14 @@ struct ArenaReportReader: View {
                                 Image(systemName: "chevron.right")
                                     .font(.system(size: 8, weight: .semibold))
                                     .foregroundStyle(.secondary)
+                                    .accessibilityHidden(true)
                             }
                         }
                         .font(.system(size: 12))
                         .frame(maxWidth: .infinity, minHeight: 22, alignment: .leading)
                         .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(ArenaPressStyle())
                     .disabled(source == nil)
                 }
             }
@@ -743,6 +787,7 @@ struct ArenaReportReader: View {
                 Circle()
                     .fill(Self.color(vote.stance))
                     .frame(width: 6, height: 6)
+                    .accessibilityHidden(true)
                 Text(ArenaSeatCatalog.name(vote.provider)).fontWeight(.medium)
                 Text(ArenaCandidateStance.label(vote.stance))
                     .foregroundStyle(.secondary)
@@ -755,13 +800,14 @@ struct ArenaReportReader: View {
                     Image(systemName: "chevron.right")
                         .font(.system(size: 8, weight: .semibold))
                         .foregroundStyle(.secondary)
+                        .accessibilityHidden(true)
                 }
             }
             .font(.system(size: 12))
             .frame(maxWidth: .infinity, minHeight: 22, alignment: .leading)
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(ArenaPressStyle())
         .disabled(source == nil)
         .help("打开 \(vote.sourceID) 的保存原文")
     }
@@ -775,6 +821,7 @@ struct ArenaReportReader: View {
                 Circle()
                     .stroke(Color.secondary.opacity(0.55), lineWidth: 1)
                     .frame(width: 6, height: 6)
+                    .accessibilityHidden(true)
                 Text(ArenaSeatCatalog.name(gap.provider))
                 Text(gap.reason.label)
                     .font(.caption)
@@ -791,7 +838,7 @@ struct ArenaReportReader: View {
             .frame(maxWidth: .infinity, minHeight: 22, alignment: .leading)
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(ArenaPressStyle())
         .disabled(source == nil)
     }
 
@@ -809,10 +856,12 @@ struct ArenaReportReader: View {
                         Text(ArenaSeatCatalog.name(row.provider))
                         Spacer()
                         Text("\(ArenaStageNames.taskLabel(row.stage, round: row.round, session: session))").foregroundStyle(.secondary)
-                        Image(systemName: "chevron.right").font(.caption)
+                        Image(systemName: "chevron.right").font(.caption).accessibilityHidden(true)
                     }
-                    .padding(.vertical, 7).contentShape(Rectangle())
-                }.buttonStyle(.plain)
+                    .padding(.vertical, 7).padding(.horizontal, 4).contentShape(Rectangle())
+                }
+                .buttonStyle(ArenaPressStyle())
+                .accessibilityHint("打开 \(row.sourceId) 的保存原文")
             }
         }.padding(.top, 8)
     }
@@ -822,11 +871,19 @@ struct ArenaReportReader: View {
             Button {
                 showQuestion.toggle()
             } label: {
-                Label(showQuestion ? "收起原始问题" : "原始问题", systemImage: showQuestion ? "chevron.down" : "chevron.right")
-                    .font(.subheadline.weight(.semibold))
+                HStack(spacing: 8) {
+                    ArenaDisclosureChevron(isExpanded: showQuestion)
+                    Text(showQuestion ? "收起原始问题" : "原始问题")
+                        .font(.subheadline.weight(.semibold))
+                }
+                .frame(maxWidth: .infinity, minHeight: 32, alignment: .leading)
+                .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(ArenaPressStyle())
             .foregroundStyle(.secondary)
+            .accessibilityLabel("原始问题")
+            .accessibilityValue(showQuestion ? "已展开" : "已收起")
+            .accessibilityHint(showQuestion ? "收起原始问题" : "展开原始问题")
 
             if showQuestion { ArenaSavedMaterials(model: model) }
             Text(verbatim: question)
@@ -850,6 +907,25 @@ struct ArenaReportReader: View {
         }, sources: Set(currentSources.map(\.sourceId)))
     }
 
+    /// 完整报告正文。超长报告换成单篇可选富文本，一次排版完再显示；普通材料
+    /// 继续用原有逐块排版。两条路径的出处跳转都落到同一份保存原文。
+    @ViewBuilder private func fullReport(_ text: String) -> some View {
+        if ArenaReportSurfacePolicy.prefersTextSurface(for: text) {
+            // 挂到下一次主循环再创建正文，AXPress 不会卡在整篇排版里超时。
+            ArenaDeferredReportSurface(
+                text: text,
+                onSource: { ref in
+                    if let row = currentSources.first(where: { $0.sourceId == ref }) {
+                        selectedSource = row
+                    }
+                },
+                sources: Set(currentSources.map(\.sourceId))
+            )
+        } else {
+            markdown(text)
+        }
+    }
+
     private static func stance(_ value: String?) -> String {
         switch value { case "agree": return "同意"; case "conditional": return "有条件同意"; case "oppose": return "反对"; default: return "未核实表态" }
     }
@@ -859,9 +935,10 @@ struct ArenaReportReader: View {
 
     /// One collapsed block of the report. The chevron, the caller's label and the
     /// empty space to the right are a single plain full-width button, so the whole
-    /// row toggles while the content stays inert. Accessibility reads the current
-    /// state; content only exists while expanded, exactly like the original
-    /// 完整报告 row.
+    /// row toggles while the content stays inert. Only the chevron rotates and
+    /// only the pressed tint follows the gesture; the long body itself is never
+    /// animated. Accessibility reads the current state; content only exists
+    /// while expanded, exactly like the original 完整报告 row.
     private struct ReportDisclosure<RowLabel: View, Content: View>: View {
         @Binding var isExpanded: Bool
         private let label: () -> RowLabel
@@ -883,21 +960,54 @@ struct ArenaReportReader: View {
                     isExpanded.toggle()
                 } label: {
                     HStack(spacing: 8) {
-                        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                            .accessibilityHidden(true)
+                        ArenaDisclosureChevron(isExpanded: isExpanded)
                         label()
                     }
                     .frame(maxWidth: .infinity, minHeight: 32, alignment: .leading)
                     .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(ArenaPressStyle())
                 .accessibilityValue(isExpanded ? "已展开" : "已收起")
+                .accessibilityHint(isExpanded ? "收起内容" : "展开内容")
                 if isExpanded { content() }
             }
         }
     }
+
+    /// A report disclosure that owns its own expansion, for repeated rows such
+    /// as saved originals and prior-diff text. Same chevron, same press
+    /// feedback, same accessibility state as `ReportDisclosure`.
+    private struct ReportSelfDisclosure<RowLabel: View, Content: View>: View {
+        @State private var isExpanded = false
+        private let label: () -> RowLabel
+        private let content: () -> Content
+
+        init(
+            @ViewBuilder label: @escaping () -> RowLabel,
+            @ViewBuilder content: @escaping () -> Content
+        ) {
+            self.label = label
+            self.content = content
+        }
+
+        var body: some View {
+            ReportDisclosure(isExpanded: $isExpanded, label: label, content: content)
+        }
+    }
+}
+
+/// Identity of one finished comparison. The stamp covers the saved rows the
+/// comparison read, so the same version pair in a changed session rebuilds.
+private struct ArenaComparisonKey: Equatable {
+    let stamp: Int
+    let left: Int
+    let right: Int
+}
+
+/// One version's bridge-backed snapshot and the stamp it was computed from.
+private struct ArenaSnapshotCacheEntry {
+    let stamp: Int
+    let snapshot: ArenaCandidateSnapshot
 }
 
 /// The existing source-navigation surface, reused by the report and by the
@@ -913,8 +1023,14 @@ struct ArenaSourceReader: View {
             VStack(alignment: .leading, spacing: 18) {
                 Button(action: onReturn) {
                     Label(returnLabel, systemImage: "chevron.left")
+                        .padding(.vertical, 4)
+                        .padding(.horizontal, 2)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.link)
+                .keyboardShortcut(.cancelAction)
+                .help("\(returnLabel)（Esc）")
+                .accessibilityHint("返回后保留原来的阅读位置")
                 Text("\(ArenaSeatCatalog.name(row.provider)) · \(ArenaStageNames.label(row.stage))")
                     .font(.title.weight(.semibold))
                 Text([ArenaStageNames.taskLabel(row.stage, round: row.round, session: session), row.sourceId]

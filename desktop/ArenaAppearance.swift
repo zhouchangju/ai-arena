@@ -296,11 +296,23 @@ final class ArenaAppearancePreferences: ObservableObject {
 
     var hasCustomImage: Bool { customImage != nil }
 
+    /// Switch appearance and persist it. The window appearance and the
+    /// published mode change before the disk write, so clicking the segmented
+    /// control looks and feels direct; a failed write rolls the state back and
+    /// rethrows so the settings row can tell the truth instead of silently
+    /// keeping a mode that is not stored.
     func setMode(_ next: ArenaAppearanceMode) throws {
         guard next != mode else { return }
-        try store.save(.init(mode: next, backdrop: backdropKind, image: customImageData))
+        let previous = mode
         mode = next
         applyApplicationAppearance()
+        do {
+            try store.save(.init(mode: next, backdrop: backdropKind, image: customImageData))
+        } catch {
+            mode = previous
+            applyApplicationAppearance()
+            throw error
+        }
     }
 
     func applyApplicationAppearance() {
@@ -310,13 +322,28 @@ final class ArenaAppearancePreferences: ObservableObject {
     func selectBackdrop(_ next: ArenaQuestionBackdropKind) throws {
         if next == .image, !hasCustomImage { return }
         guard next != backdropKind else { return }
-        try store.save(.init(mode: mode, backdrop: next, image: customImageData))
+        let previous = backdropKind
         backdropKind = next
+        do {
+            try store.save(.init(mode: mode, backdrop: next, image: customImageData))
+        } catch {
+            backdropKind = previous
+            throw error
+        }
     }
 
     func setCustomImage(from url: URL) throws {
         let data = try ArenaQuestionImageProcessor().processedData(from: url)
-        guard let image = NSImage(data: data) else {
+        try applyCustomImageData(data)
+    }
+
+    /// Saves an already bounded JPEG supplied by the caller after the expensive
+    /// decode/encode ran off the main thread. Nothing visible changes until the
+    /// atomic write succeeds.
+    func applyCustomImageData(_ data: Data) throws {
+        guard !data.isEmpty,
+              data.count <= ArenaQuestionImageProcessor.maxOutputBytes,
+              let image = NSImage(data: data) else {
             throw ArenaQuestionImageError.processingFailed
         }
         try store.save(.init(mode: mode, backdrop: .image, image: data))
@@ -326,10 +353,20 @@ final class ArenaAppearancePreferences: ObservableObject {
     }
 
     func restoreDefaultBackdrop() throws {
-        try store.save(.init(mode: mode, backdrop: .gradient, image: nil))
+        let previousKind = backdropKind
+        let previousImage = customImage
+        let previousData = customImageData
+        backdropKind = .gradient
         customImage = nil
         customImageData = nil
-        backdropKind = .gradient
+        do {
+            try store.save(.init(mode: mode, backdrop: .gradient, image: nil))
+        } catch {
+            backdropKind = previousKind
+            customImage = previousImage
+            customImageData = previousData
+            throw error
+        }
     }
 }
 
@@ -424,6 +461,14 @@ struct ArenaQuestionBackdropView: View {
 struct ArenaAppearanceSettingsView: View {
     @ObservedObject var preferences: ArenaAppearancePreferences
     @State private var errorMessage: String?
+    @State private var isProcessingImage = false
+
+    /// Result carried back from the background decoder. Only bounded JPEG bytes
+    /// or a user-facing message cross the boundary.
+    private enum ImageProcessingOutcome: Sendable {
+        case ready(Data)
+        case failed(String)
+    }
 
     var body: some View {
         TabView {
@@ -435,6 +480,7 @@ struct ArenaAppearanceSettingsView: View {
                         }
                     }
                     .pickerStyle(.segmented)
+                    .disabled(isProcessingImage)
                 } header: {
                     Text("外观")
                 }
@@ -446,11 +492,13 @@ struct ArenaAppearanceSettingsView: View {
                         }
                     }
                     .pickerStyle(.segmented)
+                    .disabled(isProcessingImage)
 
                     HStack(spacing: 10) {
                         Button(preferences.hasCustomImage ? "更换图片…" : "选择图片…") {
                             chooseImage()
                         }
+                        .disabled(isProcessingImage)
                         Button("恢复默认") {
                             do {
                                 try preferences.restoreDefaultBackdrop()
@@ -459,7 +507,19 @@ struct ArenaAppearanceSettingsView: View {
                                 errorMessage = error.localizedDescription
                             }
                         }
-                        .disabled(preferences.backdropKind == .gradient && !preferences.hasCustomImage)
+                        .disabled(isProcessingImage
+                            || (preferences.backdropKind == .gradient && !preferences.hasCustomImage))
+                    }
+
+                    if isProcessingImage {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("正在处理图片…")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .accessibilityElement(children: .combine)
                     }
 
                     ArenaQuestionBackdropView(preferences: preferences)
@@ -525,6 +585,7 @@ struct ArenaAppearanceSettingsView: View {
     }
 
     private func chooseImage() {
+        guard !isProcessingImage else { return }
         let panel = NSOpenPanel()
         panel.title = "选择提问区背景图片"
         panel.prompt = "使用"
@@ -533,11 +594,33 @@ struct ArenaAppearanceSettingsView: View {
         panel.canChooseFiles = true
         panel.allowedContentTypes = [.png, .jpeg]
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        do {
-            try preferences.setCustomImage(from: url)
-            errorMessage = nil
-        } catch {
-            errorMessage = error.localizedDescription
+
+        // Decoding and re-encoding a large photo can take noticeably long.
+        // Keep it off the main thread so the picker, the close button and the
+        // rest of the settings window stay responsive, and show a busy row
+        // instead of a silent freeze.
+        errorMessage = nil
+        isProcessingImage = true
+        Task { @MainActor in
+            let outcome = await Task.detached(priority: .userInitiated) { () -> ImageProcessingOutcome in
+                do {
+                    return .ready(try ArenaQuestionImageProcessor().processedData(from: url))
+                } catch {
+                    return .failed(error.localizedDescription)
+                }
+            }.value
+            isProcessingImage = false
+            switch outcome {
+            case .ready(let data):
+                do {
+                    try preferences.applyCustomImageData(data)
+                    errorMessage = nil
+                } catch {
+                    errorMessage = error.localizedDescription
+                }
+            case .failed(let message):
+                errorMessage = message
+            }
         }
     }
 }

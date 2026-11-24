@@ -2,9 +2,9 @@
 
 AI Arena 是一个 **macOS 原生多模型讨论工作台**。输入一次问题，让 ChatGPT、Gemini 和 DeepSeek 在同一个窗口里独立作答、交叉互评，再对同一版候选结论逐席表态。
 
-![报告窗口展示候选建议、发言出处和三席表态](docs/evidence/native-0.4/report.png)
+![报告窗口展示候选建议、发言出处和三席表态](docs/evidence/native-0.7/report.png)
 
-*上图为 0.4.0 报告样例，早于 0.5.0 界面。*
+*0.7.0 在本地三席模拟讨论中生成的报告。*
 
 ## 主要功能
 
@@ -15,6 +15,10 @@ AI Arena 是一个 **macOS 原生多模型讨论工作台**。输入一次问题
 - **本机历史和导出**。可复制报告或导出 Markdown；历史可回看已完成场次，未完成场次在新建、关闭或退出后可从历史选择「继续这一场」。新建、结束或关闭窗口前会确认：结束整场后不能继续，关闭或退出确认后不再发起新的发送。
 
 [查看讨论界面（0.3.0 本地测试样例）](docs/evidence/native-0.3/discussion.png)
+
+## 下载桌面版
+
+Apple Silicon Mac 可下载压缩包，解压后打开 AI Arena。当前版本使用本机临时签名，未经 Apple 公证。[GitHub 发布页](https://github.com/zhouchangju/ai-arena/releases/latest)
 
 ## 从源码运行
 

@@ -389,6 +389,352 @@ struct GuidanceHistoryCheck {
             selection.move(.down, in: ["x", "y"]) && selection.id == "x"
         )
 
+        // --- 4b. One unified Chinese term per saved outcome -----------------
+        let expectedLabels: [String: String] = [
+            "consensus": "全体一致",
+            "conditional-agreement": "有条件一致",
+            "unresolved-opposition": "仍有反对",
+            "partial-votes": "部分表态",
+            "partial-participation": "参与不足",
+            "no-cross-review": "互评缺失",
+            "no-critique": "缺少互评材料",
+            "proposal-skipped": "未形成候选",
+            "draft": "候选草稿",
+            "user-finished": "提前结束",
+            "no-answers": "无有效回答",
+        ]
+        check(
+            "every known stop reason has one unified label",
+            expectedLabels.allSatisfy { ArenaHistoryOutcome.label(stopReason: $0.key) == $0.value }
+        )
+        let unknown = summary("f", "未来版本的停止原因", updatedAt: 25,
+                              stopReason: "future-stop", providers: ["chatgpt", "gemini"])
+        check(
+            "an unknown stop code keeps its raw value in the summary",
+            unknown.stopReason == "future-stop"
+        )
+        check(
+            "an unknown stop code reads as a generic finished state",
+            ArenaHistoryOutcome.label(for: unknown) == "已结束"
+        )
+        check(
+            "an unknown stop code keeps a generic filter key",
+            ArenaHistoryOutcome.key(for: unknown) == "finished"
+        )
+        criteria = ArenaHistorySearchCriteria(query: "讨论已结束")
+        check(
+            "the former report wording still finds the session",
+            ArenaHistorySearch.filter([unknown], criteria: criteria).map(\.id) == ["f"]
+        )
+        criteria = ArenaHistorySearchCriteria(query: "存在分歧")
+        check(
+            "the former opposition wording still finds the session",
+            ArenaHistorySearch.filter(fixtures, criteria: criteria).map(\.id) == ["c"]
+        )
+        criteria = ArenaHistorySearchCriteria(query: "仍有反对")
+        check(
+            "the current opposition wording keeps working",
+            ArenaHistorySearch.filter(fixtures, criteria: criteria).map(\.id) == ["c"]
+        )
+
+        // The report reader must never upgrade a missing vote to consensus.
+        check(
+            "a verified consensus uses the shared term",
+            ArenaHistoryOutcome.reportLabel(
+                stopReason: "consensus", verifiedConsensus: true, hasConditionalVote: false
+            ) == "全体一致"
+        )
+        check(
+            "a consensus without every vote degrades",
+            ArenaHistoryOutcome.reportLabel(
+                stopReason: "consensus", verifiedConsensus: false, hasConditionalVote: false
+            ) == "表态记录不完整"
+        )
+        check(
+            "a conditional stop without a conditional vote degrades",
+            ArenaHistoryOutcome.reportLabel(
+                stopReason: "conditional-agreement", verifiedConsensus: false, hasConditionalVote: false
+            ) == "表态记录不完整"
+        )
+        check(
+            "a conditional stop with a saved vote uses the shared term",
+            ArenaHistoryOutcome.reportLabel(
+                stopReason: "conditional-agreement", verifiedConsensus: false, hasConditionalVote: true
+            ) == "有条件一致"
+        )
+        check(
+            "an opposition report uses the same term as history",
+            ArenaHistoryOutcome.reportLabel(
+                stopReason: "unresolved-opposition", verifiedConsensus: false, hasConditionalVote: false
+            ) == ArenaHistoryOutcome.label(for: fixtures[2])
+        )
+        check(
+            "partial votes keeps its degraded shared term",
+            ArenaHistoryOutcome.reportLabel(
+                stopReason: "partial-votes", verifiedConsensus: false, hasConditionalVote: false
+            ) == "部分表态"
+        )
+        check(
+            "an unknown report stop uses the generic finished term",
+            ArenaHistoryOutcome.reportLabel(
+                stopReason: "future-stop", verifiedConsensus: false, hasConditionalVote: false
+            ) == "已结束"
+        )
+
+        // --- 4c. Opening a saved session never duplicates an inline report ---
+        check(
+            "a read-only session with a report stays in the workbench",
+            ArenaHistoryOpenTarget.decide(readOnly: true, hasReport: true) == .inlineReport
+        )
+        check(
+            "a read-only session without a report lands on saved answers",
+            ArenaHistoryOpenTarget.decide(readOnly: true, hasReport: false) == .savedAnswers
+        )
+        check(
+            "a live finished session opens the independent report",
+            ArenaHistoryOpenTarget.decide(readOnly: false, hasReport: true) == .report
+        )
+        check(
+            "a live session without a report lands on saved answers",
+            ArenaHistoryOpenTarget.decide(readOnly: false, hasReport: false) == .savedAnswers
+        )
+
+        // --- 4d. The export/banner label is strict about missing votes ------
+        func ballot(
+            candidate: String? = "p2",
+            version: Int = 2,
+            votes: [(String, String)]
+        ) -> [String: Any] {
+            var value: [String: Any] = [
+                "version": version,
+                "votes": votes.map {
+                    ["id": "vote-\($0.0)", "provider": $0.0, "stance": $0.1]
+                },
+            ]
+            if let candidate { value["candidateID"] = candidate }
+            return value
+        }
+        let seats = ["chatgpt", "gemini", "deepseek"]
+        let complete = ballot(votes: [("chatgpt", "agree"), ("gemini", "agree"), ("deepseek", "agree")])
+        check(
+            "every same-version agree vote keeps the shared consensus label",
+            ArenaHistoryOutcome.conservativeLabel(
+                stopReason: "consensus", ballot: complete, participants: seats
+            ) == "全体一致"
+        )
+        check(
+            "a consensus with one missing vote degrades in the export label",
+            ArenaHistoryOutcome.conservativeLabel(
+                stopReason: "consensus",
+                ballot: ballot(votes: [("chatgpt", "agree"), ("gemini", "agree")]),
+                participants: seats
+            ) == "表态记录不完整"
+        )
+        check(
+            "a consensus with one conditional vote degrades",
+            ArenaHistoryOutcome.conservativeLabel(
+                stopReason: "consensus",
+                ballot: ballot(votes: [("chatgpt", "agree"), ("gemini", "agree"), ("deepseek", "conditional")]),
+                participants: seats
+            ) == "表态记录不完整"
+        )
+        check(
+            "a consensus code without any ballot degrades",
+            ArenaHistoryOutcome.conservativeLabel(
+                stopReason: "consensus", ballot: nil, participants: seats
+            ) == "表态记录不完整"
+        )
+        check(
+            "a ballot without an answered candidate version degrades",
+            ArenaHistoryOutcome.conservativeLabel(
+                stopReason: "consensus",
+                ballot: ballot(candidate: nil, version: 0, votes: [
+                    ("chatgpt", "agree"), ("gemini", "agree"), ("deepseek", "agree"),
+                ]),
+                participants: seats
+            ) == "表态记录不完整"
+        )
+        check(
+            "a consensus without recorded participants degrades",
+            ArenaHistoryOutcome.conservativeLabel(
+                stopReason: "consensus", ballot: complete, participants: []
+            ) == "表态记录不完整"
+        )
+        check(
+            "a vote for a non-participant cannot complete the ballot",
+            ArenaHistoryOutcome.conservativeLabel(
+                stopReason: "consensus",
+                ballot: ballot(votes: [("chatgpt", "agree"), ("gemini", "agree"), ("other", "agree")]),
+                participants: seats
+            ) == "表态记录不完整"
+        )
+        check(
+            "a conditional stop with a saved conditional vote keeps its term",
+            ArenaHistoryOutcome.conservativeLabel(
+                stopReason: "conditional-agreement",
+                ballot: ballot(votes: [("chatgpt", "agree"), ("gemini", "conditional")]),
+                participants: seats
+            ) == "有条件一致"
+        )
+        check(
+            "a conditional stop without a conditional vote degrades",
+            ArenaHistoryOutcome.conservativeLabel(
+                stopReason: "conditional-agreement",
+                ballot: ballot(votes: [("chatgpt", "agree")]),
+                participants: seats
+            ) == "表态记录不完整"
+        )
+        let savedConsensus: [String: Any] = [
+            "stopReason": "consensus",
+            "providers": ["chatgpt", "gemini"],
+        ]
+        _ = ArenaHistoryOutcome.conservativeLabel(
+            stopReason: savedConsensus["stopReason"] as? String,
+            ballot: nil,
+            participants: savedConsensus["providers"] as? [String] ?? []
+        )
+        check(
+            "the conservative label never rewrites the saved stop code",
+            savedConsensus["stopReason"] as? String == "consensus"
+        )
+
+        // --- 4e. History rows use the same strict stamp, computed once ------
+        func versionedBallot(
+            candidate: String = "p2",
+            version: Int = 2,
+            voteVersion: Int? = nil,
+            votes: [(String, String)]
+        ) -> [String: Any] {
+            var value = ballot(candidate: candidate, version: version, votes: votes)
+            if let voteVersion {
+                let rows = (value["votes"] as? [[String: Any]] ?? []).map { row -> [String: Any] in
+                    var copy = row
+                    copy["version"] = voteVersion
+                    return copy
+                }
+                value["votes"] = rows
+            }
+            return value
+        }
+        let fullBallot = versionedBallot(voteVersion: 2, votes: [
+            ("chatgpt", "agree"), ("gemini", "agree"), ("deepseek", "agree"),
+        ])
+        check(
+            "a true full same-version ballot stamps consensus",
+            ArenaHistoryOutcome.stamp(
+                stopReason: "consensus", ballot: fullBallot, participants: seats
+            ) == ArenaHistoryOutcome.Stamp(key: "consensus", label: "全体一致")
+        )
+        check(
+            "a missing vote stamps the conservative incomplete label",
+            ArenaHistoryOutcome.stamp(
+                stopReason: "consensus",
+                ballot: versionedBallot(voteVersion: 2, votes: [
+                    ("chatgpt", "agree"), ("gemini", "agree"),
+                ]),
+                participants: seats
+            ) == ArenaHistoryOutcome.Stamp(key: "incomplete-votes", label: "表态记录不完整")
+        )
+        check(
+            "votes from the wrong version stamp the incomplete label",
+            ArenaHistoryOutcome.stamp(
+                stopReason: "consensus",
+                ballot: versionedBallot(voteVersion: 1, votes: [
+                    ("chatgpt", "agree"), ("gemini", "agree"), ("deepseek", "agree"),
+                ]),
+                participants: seats
+            ) == ArenaHistoryOutcome.Stamp(key: "incomplete-votes", label: "表态记录不完整")
+        )
+        check(
+            "a shell or ballot-less record degrades instead of claiming consensus",
+            ArenaHistoryOutcome.stamp(
+                stopReason: "consensus", ballot: nil, participants: seats
+            ) == ArenaHistoryOutcome.Stamp(key: "incomplete-votes", label: "表态记录不完整")
+        )
+        check(
+            "a genuinely verified conditional stamp keeps its own label",
+            ArenaHistoryOutcome.stamp(
+                stopReason: "conditional-agreement",
+                ballot: versionedBallot(voteVersion: 2, votes: [
+                    ("chatgpt", "agree"), ("gemini", "conditional"),
+                ]),
+                participants: seats
+            ) == ArenaHistoryOutcome.Stamp(key: "conditional-agreement", label: "有条件一致")
+        )
+        check(
+            "a conditional without a same-version conditional vote degrades",
+            ArenaHistoryOutcome.stamp(
+                stopReason: "conditional-agreement",
+                ballot: versionedBallot(voteVersion: 1, votes: [
+                    ("chatgpt", "agree"), ("gemini", "conditional"),
+                ]),
+                participants: seats
+            ) == ArenaHistoryOutcome.Stamp(key: "incomplete-votes", label: "表态记录不完整")
+        )
+        check(
+            "other stop codes keep the raw-code label",
+            ArenaHistoryOutcome.stamp(
+                stopReason: "unresolved-opposition", ballot: fullBallot, participants: seats
+            ) == nil
+        )
+
+        var degraded = summary("g", "旧记录停止码", updatedAt: 20,
+                               stopReason: "consensus", providers: seats)
+        degraded.conservativeOutcomeKey = "incomplete-votes"
+        degraded.conservativeOutcomeLabel = "表态记录不完整"
+        check(
+            "a stamped history row shows the conservative label",
+            ArenaHistoryOutcome.label(for: degraded) == "表态记录不完整"
+                && ArenaHistoryOutcome.key(for: degraded) == "incomplete-votes"
+        )
+        check(
+            "the raw code stays in the summary for provenance",
+            degraded.stopReason == "consensus"
+        )
+        check(
+            "the stamped row is not found as consensus",
+            ArenaHistorySearch.filter(
+                [degraded],
+                criteria: ArenaHistorySearchCriteria(query: "全体一致")
+            ).isEmpty
+        )
+        check(
+            "the stamped row is found by its conservative label",
+            ArenaHistorySearch.filter(
+                [degraded],
+                criteria: ArenaHistorySearchCriteria(query: "表态记录不完整")
+            ).map(\.id) == ["g"]
+        )
+        check(
+            "the outcome filter follows the stamped key",
+            ArenaHistorySearch.filter(
+                [degraded],
+                criteria: ArenaHistorySearchCriteria(outcome: "consensus")
+            ).isEmpty
+                && ArenaHistorySearch.filter(
+                    [degraded],
+                    criteria: ArenaHistorySearchCriteria(outcome: "incomplete-votes")
+                ).map(\.id) == ["g"]
+        )
+        let degradedFacets = ArenaHistorySearch.outcomeFacets([degraded])
+        check(
+            "the outcome facet uses the conservative key and label",
+            degradedFacets.map(\.key) == ["incomplete-votes"]
+                && degradedFacets.map(\.label) == ["表态记录不完整"]
+        )
+        check(
+            "an unstamped summary still falls back to the raw label",
+            ArenaHistoryOutcome.label(for: summary("h", "壳场", updatedAt: 10,
+                                                  stopReason: "consensus", providers: []))
+                == "全体一致"
+        )
+        let tied = summary("a", "同一时间的旧场", updatedAt: 500, providers: seats)
+        let tiedOther = summary("b", "同一时间的另一场", updatedAt: 500, providers: seats)
+        check(
+            "equal update times keep a stable id order",
+            ArenaSessionStore.upserting(tied, into: [tiedOther]).map(\.id) == ["a", "b"]
+        )
+
         // --- 5. Version-scoped ballot projection ----------------------------
         let history: [[String: Any]] = [
             [

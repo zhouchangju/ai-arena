@@ -207,6 +207,69 @@ struct NativeSeatStateCheck {
                   intentPhase: .submitted, hasCompletePreview: true, canBackfill: false
               ) == nil)
 
+        // --- 5c. A restored seat may reach only an intent-proven safe action ---
+        check(
+            "a restored verification seat is admitted without a blocked task",
+            ArenaModel.allowsSeatLocalAction(
+                readOnly: false, paused: false, done: false, participant: true,
+                userTakenOver: false, recoverySeat: true, blocked: false
+            )
+        )
+        check(
+            "a normal blocked seat is still admitted",
+            ArenaModel.allowsSeatLocalAction(
+                readOnly: false, paused: false, done: false, participant: true,
+                userTakenOver: false, recoverySeat: false, blocked: true
+            )
+        )
+        check(
+            "a seat the user took over by hand keeps only its menu",
+            !ArenaModel.allowsSeatLocalAction(
+                readOnly: false, paused: false, done: false, participant: true,
+                userTakenOver: true, recoverySeat: true, blocked: true
+            )
+        )
+        check(
+            "neither blocked nor recovered offers nothing",
+            !ArenaModel.allowsSeatLocalAction(
+                readOnly: false, paused: false, done: false, participant: true,
+                userTakenOver: false, recoverySeat: false, blocked: false
+            )
+        )
+        for context in [
+            ("read-only", true, false, false, true),
+            ("paused", false, true, false, true),
+            ("done", false, false, true, true),
+            ("not a participant", false, false, false, false),
+        ] {
+            check(
+                "\(context.0) never offers a local action",
+                !ArenaModel.allowsSeatLocalAction(
+                    readOnly: context.1, paused: context.2, done: context.3,
+                    participant: context.4, userTakenOver: false,
+                    recoverySeat: true, blocked: true
+                )
+            )
+        }
+        check(
+            "a recovered prepared task still offers no send-capable shortcut",
+            ArenaModel.seatLocalActionKind(
+                intentPhase: .prepared, hasCompletePreview: false, canBackfill: true
+            ) == nil
+        )
+        check(
+            "a recovered task without intent evidence offers no shortcut",
+            ArenaModel.seatLocalActionKind(
+                intentPhase: nil, hasCompletePreview: false, canBackfill: true
+            ) == nil
+        )
+        check(
+            "a recovered submitted task may offer only a read-only check",
+            ArenaModel.seatLocalActionKind(
+                intentPhase: .submitted, hasCompletePreview: false, canBackfill: true
+            ) == .readOnlyCheck
+        )
+
         // --- 6. Unified stage wording -----------------------------------------
         check("critique is 互评", ArenaStageNames.label("critique") == "互评")
         check("vote is 表态", ArenaStageNames.label("vote") == "表态")
@@ -217,6 +280,17 @@ struct NativeSeatStateCheck {
         let critique: [String: Any] = ["stage": "critique", "round": 1, "maxRounds": 3]
         check("first critique uses the same round and cap as the report",
               ArenaStageNames.reviewRound(critique) == "互评第 1 轮 / 上限 3")
+        check("a critique stage names the round once, not twice",
+              ArenaStageNames.discussionLabel(critique) == "互评第 1 轮 / 上限 3")
+        check("a critique task names the round once, not twice",
+              ArenaStageNames.taskLabel("critique", round: 1, session: critique)
+                  == "互评第 1 轮 / 上限 3")
+        let proposal: [String: Any] = ["stage": "proposal", "round": 2, "maxRounds": 3]
+        check("later stages keep their name and the full round wording",
+              ArenaStageNames.discussionLabel(proposal) == "候选结论 · 互评第 2 轮 / 上限 3")
+        check("a proposal task keeps its name and the full round wording",
+              ArenaStageNames.taskLabel("proposal", round: 2, session: proposal)
+                  == "候选结论 · 互评第 2 轮 / 上限 3")
         let earlyFinish: [String: Any] = ["stage": "done", "round": 1, "history": [independent]]
         check("ending before review omits the round", ArenaStageNames.reviewRound(earlyFinish) == nil)
         let legacyFinish: [String: Any] = ["stage": "done", "round": 1, "history": [independent, critique, critique]]

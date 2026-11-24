@@ -284,7 +284,7 @@ struct ArenaHistorySearchView: View {
                 if reduceMotion {
                     proxy.scrollTo(id)
                 } else {
-                    withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(id) }
+                    withAnimation(ArenaMotion.quick(reduceMotion)) { proxy.scrollTo(id) }
                 }
             }
         }
