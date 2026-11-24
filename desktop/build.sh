@@ -33,7 +33,7 @@ const core = ['providers', 'core'].map(name => fs.readFileSync(source(name), 'ut
   .replace(/^export (?=(const|function) )/gm, '')).join('\n');
 fs.writeFileSync(path.join(resources, 'arena-core.js'), core);
 JS
-xcrun swiftc -swift-version 5 -target "$(uname -m)-apple-macos13.0" -parse-as-library -O -framework WebKit -framework SwiftUI -framework JavaScriptCore "$root"/desktop/*.swift -o "$app/Contents/MacOS/AIArena"
+xcrun swiftc -swift-version 5 -target "$(uname -m)-apple-macos13.0" -parse-as-library -O -framework WebKit -framework SwiftUI -framework JavaScriptCore -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework CoreText "$root"/desktop/*.swift -o "$app/Contents/MacOS/AIArena"
 
 identity="${ARENA_SIGN_IDENTITY:-}"
 if [[ -z "$identity" ]]; then
