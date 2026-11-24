@@ -924,7 +924,7 @@ test('guidance added while paused reaches only newly issued prompts', () => {
   assert.match(session.report, /独立作答提出：GUIDE_WEEKEND_LIMIT/);
   assert.match(
     session.report,
-    /随新任务发出：（互评 · 互评第 1 轮 \/ 上限 2）· chatgpt；（互评 · 互评第 1 轮 \/ 上限 2）· claude/,
+    /随新任务发出：（互评第 1 轮 \/ 上限 2）· chatgpt；（互评第 1 轮 \/ 上限 2）· claude/,
   );
 });
 
@@ -983,7 +983,7 @@ test('guidance is rejected outside independent/critique and never enters vote pr
   // unverified, and names the tasks that actually carried it.
   assert.match(session.report, /## 用户补充条件/);
   assert.match(session.report, /补充 #1 · \d{4}-\d{2}-\d{2} \d{2}:\d{2}/);
-  assert.match(session.report, /互评 · 互评第 1 轮 \/ 上限 2提出：GUIDE_CRITIQUE/);
+  assert.match(session.report, /互评第 1 轮 \/ 上限 2提出：GUIDE_CRITIQUE/);
   assert.match(session.report, /未经事实核验/);
   assert.match(
     session.report,

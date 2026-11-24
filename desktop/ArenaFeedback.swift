@@ -65,23 +65,26 @@ final class ArenaFeedbackPresenter: ObservableObject {
 
     private var dismissTask: Task<Void, Never>?
 
+    /// The presenter only owns the message and its lifetime. Appearing and
+    /// disappearing are animated exactly once, by the overlay, from the
+    /// message identity. A repeated message keeps its identity so only the
+    /// timer restarts: rapid repeats no longer re-run the insertion
+    /// transition, and there is no second `withAnimation` racing the view's.
     func show(_ text: String, tone: ArenaFeedbackTone = .success) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
         dismissTask?.cancel()
-        let next = ArenaFeedbackMessage(text: trimmed, tone: tone)
-        withAnimation(.easeOut(duration: 0.15)) {
-            message = next
+        if message?.text != trimmed || message?.tone != tone {
+            message = ArenaFeedbackMessage(text: trimmed, tone: tone)
         }
         ArenaAccessibilityAnnouncer.announce(trimmed)
 
+        let identity = message?.id
         dismissTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(Self.duration * 1_000_000_000))
-            guard !Task.isCancelled, let self, self.message?.id == next.id else { return }
-            withAnimation(.easeOut(duration: 0.2)) {
-                self.message = nil
-            }
+            guard !Task.isCancelled, let self, self.message?.id == identity else { return }
+            self.message = nil
         }
     }
 
@@ -128,7 +131,7 @@ struct ArenaFeedbackOverlay: View {
             }
         }
         .allowsHitTesting(false)
-        .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: presenter.message?.id)
+        .animation(ArenaMotion.quick(reduceMotion), value: presenter.message?.id)
     }
 }
 
@@ -198,21 +201,35 @@ struct ArenaCompletionTracker {
 
 // MARK: - 完成事件路由
 
+/// Where one durable completion is surfaced. No case moves focus into a new
+/// window: a finished discussion must not interrupt reading, typing or manual
+/// work that is already in progress.
 enum ArenaCompletionDelivery: Equatable {
-    case presentReport
+    /// Foreground: stay where the reader is. The workbench shows its existing
+    /// short toast once and keeps the persistent「查看报告」entry; no banner,
+    /// strip or window is inserted into the page area.
+    case revealInPlace
+    /// Background automatic completion: one local notification.
     case notification
+    /// Background「结束」: the user already knows, so stay silent.
     case silent
 }
 
 enum ArenaCompletionPolicy {
-    /// Foreground keeps the existing behaviour of opening the report. A
-    /// background automatic completion gets one local notification. An
-    /// explicit 「结束」 in the background stays silent because the user already
-    /// knows the discussion ended.
+    /// Foreground completion never opens, raises or focuses a window on its
+    /// own. A background automatic completion gets one local notification; an
+    /// explicit 「结束」 in the background stays silent.
     static func delivery(isForeground: Bool, explicitFinish: Bool) -> ArenaCompletionDelivery {
-        if isForeground { return .presentReport }
-        return explicitFinish ? .silent : .notification
+        guard isForeground else { return explicitFinish ? .silent : .notification }
+        return .revealInPlace
     }
+}
+
+extension Notification.Name {
+    /// A durable foreground completion. The workbench window answers it with the
+    /// toast it already has, so the completion feedback costs no layout, takes no
+    /// focus and announces itself once. The report keeps its persistent entry.
+    static let arenaCompletionAnnouncedInPlace = Notification.Name("arena.completion.announced-in-place")
 }
 
 // MARK: - 本地完成通知

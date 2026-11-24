@@ -1817,9 +1817,10 @@ function reviewRoundLabel(round, maxRounds) {
 
 function reportStage(task, maxRounds) {
   const stage = STAGE_LABELS[task.stage] ?? task.stage;
-  return task.stage === 'independent'
-    ? stage
-    : stage + ' · ' + reviewRoundLabel(task.round, maxRounds);
+  if (task.stage === 'independent') return stage;
+  // The round label already starts with 互评, so a critique task names it once.
+  const round = reviewRoundLabel(task.round, maxRounds);
+  return task.stage === 'critique' ? round : stage + ' · ' + round;
 }
 
 /** Review cycles that began, whether their tasks were answered, skipped or left pending. */

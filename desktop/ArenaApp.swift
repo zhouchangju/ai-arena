@@ -227,7 +227,9 @@ final class ArenaAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate 
     @MainActor
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         guard sender === mainWindow, !terminationConfirmed,
-              model?.hasRunningDiscussion == true else { return true }
+              (model?.hasRunningDiscussion == true || model?.hasUnsentDraft == true) else {
+            return true
+        }
         // Ask through the same path as ⌘Q while the workbench is still visible.
         DispatchQueue.main.async { NSApp.terminate(nil) }
         return false
@@ -235,22 +237,37 @@ final class ArenaAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate 
 
     @MainActor
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard !terminationConfirmed, let model, model.hasRunningDiscussion else { return .terminateNow }
+        guard !terminationConfirmed, let model else { return .terminateNow }
+        // A running discussion and a parked unsent draft can coexist. One dialog
+        // states both outcomes instead of the running warning silently dropping
+        // the draft; 取消 stays the default and return key.
+        let prompt = ArenaQuitPrompt(
+            hasRunningDiscussion: model.hasRunningDiscussion,
+            hasUnsentDraft: model.hasUnsentDraft
+        )
+        guard prompt.isNeeded else { return .terminateNow }
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "仍有讨论在进行"
-        alert.informativeText = "退出会停止后续派发。已发送的请求可能仍会在原页生成；之后可以从「历史」继续核对已保存的进度。"
-        alert.addButton(withTitle: "退出")
+        alert.messageText = prompt.title
+        alert.informativeText = prompt.message
+        alert.addButton(withTitle: prompt.confirmTitle)
         let cancel = alert.addButton(withTitle: "取消")
-        cancel.keyEquivalent = "\r"
-        alert.buttons[0].keyEquivalent = ""
+        if prompt.cancelIsDefault {
+            cancel.keyEquivalent = "\r"
+            alert.buttons[0].keyEquivalent = ""
+        }
         if alert.runModal() == .alertFirstButtonReturn {
             terminationConfirmed = true
-            model.stopRunningWork()
+            if prompt.hasRunningDiscussion { model.stopRunningWork() }
             return .terminateNow
         }
-        // The last window may already have closed. Bring the workbench back
-        // instead of leaving an app with no window.
+        return restoreWorkbenchAfterCancelledQuit()
+    }
+
+    /// The last window may already have closed. Bring the workbench back
+    /// instead of leaving an app with no window.
+    @MainActor
+    private func restoreWorkbenchAfterCancelledQuit() -> NSApplication.TerminateReply {
         if let main = mainWindow {
             if main.isMiniaturized { main.deminiaturize(nil) }
             main.makeKeyAndOrderFront(nil)
@@ -274,21 +291,19 @@ final class ArenaAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate 
     // MARK: 完成后的落点
 
     /// A completion may arrive while the workbench is in the background. The
-    /// policy keeps the old foreground behaviour (open the report), sends one
-    /// local notification when backgrounded, and stays silent for an explicit
-    /// 「结束」 that the user just triggered.
+    /// policy never opens, raises or focuses a window, and never inserts a bar
+    /// into the page area: a foreground completion only asks the workbench for
+    /// its existing toast (the report keeps its own「查看报告」entry), a
+    /// background automatic completion sends one local notification, and a
+    /// background 「结束」 stays silent.
     @MainActor
     private func handleCompletion(_ event: ArenaCompletionEvent) {
-        guard let model else { return }
         switch ArenaCompletionPolicy.delivery(
             isForeground: isCompletionForeground,
             explicitFinish: event.explicitFinish
         ) {
-        case .presentReport:
-            ArenaDetailsWindowController.shared.present(
-                model: model,
-                request: ArenaDetailRequest(provider: nil, tab: .report)
-            )
+        case .revealInPlace:
+            NotificationCenter.default.post(name: .arenaCompletionAnnouncedInPlace, object: nil)
         case .notification:
             ArenaCompletionNotifier.shared.notifyCompletion(event)
         case .silent:
@@ -304,30 +319,56 @@ final class ArenaAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate 
         guard let model else { return }
         let currentID = ArenaSessionDigest.id(model.session)
         if currentID == id {
-            ArenaDetailsWindowController.shared.present(
-                model: model,
-                request: ArenaDetailRequest(provider: nil, tab: .report)
-            )
+            switch ArenaHistoryOpenTarget.decide(
+                readOnly: model.isReadOnly,
+                hasReport: ArenaSessionDigest.report(model.session) != nil
+            ) {
+            case .inlineReport:
+                // This read-only history already shows its report in the main
+                // workbench; reuse it instead of opening a second copy.
+                ArenaDetailsWindowController.shared.avoidDuplicateReport(model: model)
+                bringMainWindowForward()
+            case .savedAnswers:
+                ArenaDetailsWindowController.shared.present(
+                    model: model,
+                    request: ArenaDetailRequest(provider: nil, tab: .answers)
+                )
+            case .report:
+                ArenaDetailsWindowController.shared.present(
+                    model: model,
+                    request: ArenaDetailRequest(provider: nil, tab: .report)
+                )
+            }
             return
         }
         guard !model.hasRunningDiscussion else {
             bringMainWindowForward()
             return
         }
-        model.openHistory(id)
+        guard model.openHistory(id) else {
+            bringMainWindowForward()
+            return
+        }
         guard ArenaSessionDigest.id(model.session) == id else {
+            bringMainWindowForward()
+            return
+        }
+        let report = ArenaSessionDigest.report(model.session)
+        if model.isReadOnly, report != nil {
+            // The read-only report is shown inside the main workbench.
+            ArenaDetailsWindowController.shared.avoidDuplicateReport(model: model)
             bringMainWindowForward()
             return
         }
         ArenaDetailsWindowController.shared.present(
             model: model,
-            request: ArenaDetailRequest(provider: nil, tab: .report)
+            request: ArenaDetailRequest(provider: nil, tab: report != nil ? .report : .answers)
         )
     }
 
     /// Foreground means the app is active and at least one of its real windows
-    /// is visible, so opening the report cannot pull focus from another app or
-    /// from a minimised workbench.
+    /// is visible, so a completion can be revealed inside the workbench without
+    /// pulling focus from another app or from a minimised workbench.
     @MainActor
     private var isCompletionForeground: Bool {
         guard NSApp.isActive else { return false }
@@ -381,6 +422,14 @@ struct ArenaRootView: View {
     @State private var questionFocusRequest = 0
     @State private var previewAttachment: ArenaDraftAttachment?
     @State private var guidanceTarget: ArenaGuidanceTarget?
+    /// Set only while the condition editor is open. `ownedPause` distinguishes
+    /// the pause this workbench applied for the editor from one the user made.
+    @State private var guidanceOpening: ArenaGuidanceOpening?
+    @State private var guidanceDidSave = false
+    /// Opening configuration (seats, review limit) starts folded: the question
+    /// and「开始讨论」own the opening screen, and the complete summary line
+    /// (seats + review limit) keeps the choice visible without a second copy.
+    @State private var showsOpeningOptions = false
     @State private var showsHistorySearch = false
     @State private var pendingHistoryAction: HistoryAction?
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -398,12 +447,15 @@ struct ArenaRootView: View {
                 errorBanner(message)
             }
             if model.isRecovering && isRunning && !model.recoveryNotice.isEmpty {
-                Text(model.recoveryNotice)
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 5)
+                HStack(alignment: .center, spacing: 10) {
+                    Text(model.recoveryNotice)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if model.hasParkedDraft { parkedDraftReturnButton }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 5)
             }
             Divider()
             seatArea
@@ -415,11 +467,16 @@ struct ArenaRootView: View {
                 .padding(.bottom, 18)
         }
         .task {
+            // Restoring a finished session keeps the workbench where it is.
+            // Nothing opens, activates or takes focus from another window.
             model.prepareHome()
-            if model.isRecovering && model.stageKey == "done" && !SmokeRunner.isEnabled {
-                presentDetails(provider: nil, tab: .report)
-            }
             SmokeRunner.shared.begin(model: model)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .arenaCompletionAnnouncedInPlace)) { _ in
+            // The existing toast is the whole completion feedback: it floats
+            // above the seats, shifts no layout, steals no focus and announces
+            // itself once to VoiceOver.
+            feedback.show("讨论已结束，报告已保存")
         }
         .alert(item: $confirmation) { item in
             switch item {
@@ -456,6 +513,13 @@ struct ArenaRootView: View {
                     primaryButton: .default(Text("打开历史")) { openHistory(id) },
                     secondaryButton: .cancel(Text("取消"))
                 )
+            case .returnToDraft:
+                return Alert(
+                    title: Text("返回草稿？"),
+                    message: Text("当前讨论会停止并保留在历史中。已发送的请求可能仍会在原页生成；返回后会恢复尚未发送的题面和附件，但不会自动开始。"),
+                    primaryButton: .default(Text("返回草稿")) { returnToParkedDraft() },
+                    secondaryButton: .cancel(Text("取消"))
+                )
             }
         }
         .sheet(isPresented: $showsHistorySearch, onDismiss: runPendingHistoryAction) {
@@ -476,10 +540,14 @@ struct ArenaRootView: View {
         .onReceive(NotificationCenter.default.publisher(for: .arenaOpenHistorySearch)) { _ in
             showsHistorySearch = true
         }
-        .sheet(item: $guidanceTarget) { target in
-            ArenaGuidanceComposer(model: model, target: target) {
-                guidanceTarget = nil
-            }
+        .sheet(item: $guidanceTarget, onDismiss: guidanceDismissed) { target in
+            ArenaGuidanceComposer(
+                model: model,
+                target: target,
+                ownedPause: guidanceOpening?.ownedPause ?? false,
+                onSaved: { guidanceDidSave = true },
+                onClose: { guidanceTarget = nil }
+            )
         }
     }
 
@@ -510,7 +578,7 @@ struct ArenaRootView: View {
                 .fill(Color.primary.opacity(0.08))
                 .frame(height: 1)
         }
-        .animation(reduceMotion ? nil : .easeInOut(duration: 0.22), value: hasStarted)
+        .animation(ArenaMotion.change(reduceMotion), value: hasStarted)
     }
 
     private var titleRow: some View {
@@ -639,22 +707,6 @@ struct ArenaRootView: View {
                         onStart: startDiscussion
                     )
                 }
-
-                if model.question.trimmedNonEmpty != nil {
-                    Button {
-                        model.question = ""
-                        questionFocusRequest += 1
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 14))
-                            .foregroundStyle(.tertiary)
-                            .frame(width: 26, height: 26)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .help("清空问题")
-                    .accessibilityLabel("清空问题")
-                }
             }
             .padding(.bottom, 2)
 
@@ -665,22 +717,35 @@ struct ArenaRootView: View {
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 12) {
                     addMaterialsButton
-                    seatChips
-                    roundPicker
+                    openingOptionsToggle
                     Spacer(minLength: 8)
                     startButton
                 }
                 VStack(alignment: .leading, spacing: 9) {
                     HStack(spacing: 12) {
                         addMaterialsButton
-                        seatChips
-                        roundPicker
+                        openingOptionsToggle
                     }
                     HStack(spacing: 8) {
                         Spacer(minLength: 0)
                         startButton
                     }
                 }
+            }
+
+            if showsOpeningOptions {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 12) {
+                        seatChips
+                        roundPicker
+                        Spacer(minLength: 0)
+                    }
+                    VStack(alignment: .leading, spacing: 8) {
+                        seatChips
+                        roundPicker
+                    }
+                }
+                .padding(.top, 2)
             }
         }
         .padding(14)
@@ -699,10 +764,49 @@ struct ArenaRootView: View {
                 )
         )
         .shadow(color: .black.opacity(reduceTransparency ? 0 : 0.05), radius: 8, y: 2)
-        .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: questionFocused)
+        .animation(ArenaMotion.quick(reduceMotion), value: questionFocused)
         .sheet(item: $previewAttachment) { item in
             ArenaMaterialPreview(item: item) { previewAttachment = nil }
         }
+    }
+
+    /// Compact summary of the opening configuration. Folded, the line states
+    /// every selected seat and the review limit. Expanded, the same control is
+    /// titled「讨论设置」so the three names appear only once, on the chips.
+    private var openingOptionsToggle: some View {
+        Button {
+            withAnimation(ArenaMotion.quick(reduceMotion)) {
+                showsOpeningOptions.toggle()
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: showsOpeningOptions ? "slider.horizontal.3" : "person.2")
+                    .font(.system(size: 11, weight: .semibold))
+                Text(showsOpeningOptions ? "讨论设置" : openingOptionsSummary)
+                    .font(.system(size: 12.5, weight: .medium))
+                    .lineLimit(1)
+                Image(systemName: showsOpeningOptions ? "chevron.up" : "chevron.down")
+                    .font(.system(size: 9.5, weight: .semibold))
+            }
+            .padding(.horizontal, 2)
+            .frame(minHeight: 28)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .help(showsOpeningOptions
+              ? "收起讨论设置；聚焦后按空格或回车也可切换"
+              : "调整参与席位和互评上限；聚焦后按空格或回车也可展开")
+        .accessibilityLabel(showsOpeningOptions ? "讨论设置" : "开场配置：\(openingOptionsSummary)")
+        .accessibilityValue(showsOpeningOptions ? "已展开" : "已收起")
+        .accessibilityHint("按空格或回车展开或收起")
+    }
+
+    private var openingOptionsSummary: String {
+        let seats = ArenaSeatCatalog.ordered.filter(selectedProviders.contains)
+            .map(ArenaSeatCatalog.name)
+            .joined(separator: "、")
+        return "\(seats) · 互评上限 \(roundLimit)"
     }
 
     private var addMaterialsButton: some View {
@@ -921,25 +1025,32 @@ struct ArenaRootView: View {
             stagePill
             Spacer(minLength: 8)
             if isRunning {
+                // Pause/Continue stays a first-class control. Ending the whole
+                // discussion or starting a new one moves into one secondary
+                // menu and both keep their confirmation.
                 toolButton(
                     isPaused ? "继续" : "暂停",
                     icon: isPaused ? "play.fill" : "pause.fill",
                     large: true,
                     action: pauseOrResume
                 )
-                .help(isPaused ? "继续派发后续轮次" : "暂停后续派发，保留当前进度")
+                .help(isPaused
+                      ? "继续派发后续轮次（⌘⇧P）"
+                      : "暂停后续派发，保留当前进度（⌘⇧P）")
+                .keyboardShortcut("p", modifiers: [.command, .shift])
+                // While the condition editor is open, its pause transaction is
+                // the only owner of the paused state; a stray shortcut must not
+                // turn it into a user-made pause that would then be kept.
+                .disabled(guidanceTarget != nil)
                 if guidanceAvailable {
                     toolButton("补充条件", icon: "text.badge.plus", large: true) {
                         openGuidanceComposer()
                     }
                     .help("先暂停讨论，再把条件写入之后新建的提示；不会改写或重发已发出的任务")
                 }
-                toolButton("结束", icon: "stop.fill", large: true) {
-                    confirmation = .finish
-                }
-                .help("结束整场讨论并生成当前报告（已发送的请求可能仍会生成）")
+                runActionsMenu
             }
-            if hasSavedReport {
+            if hasSavedReport && !showsInlineHistoryReport {
                 Button {
                     presentDetails(provider: nil, tab: .report)
                 } label: {
@@ -955,21 +1066,57 @@ struct ArenaRootView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
-                .help("打开本场报告")
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+                .help("打开本场报告（⌘⇧R）")
             }
-            toolButton("新建", icon: "square.and.pencil", large: true) {
-                if model.hasRunningDiscussion {
-                    confirmation = .newDiscussion
-                } else {
+            // A continued history can reach its end while the unsent draft is
+            // still parked. Once nothing is running, offer the direct return
+            // here as well; read-only review already has the banner button.
+            if !isRunning, !model.isReadOnly, model.hasParkedDraft {
+                parkedDraftReturnButton
+            }
+            if !isRunning {
+                toolButton("新建", icon: "square.and.pencil", large: true) {
                     performNewDiscussion()
                 }
+                .help("清空当前场次，开始新的问题；本场记录仍保留在历史中")
             }
-            .help(
-                model.hasRunningDiscussion
-                    ? "停止当前讨论并开始新的问题（会确认，可从历史继续）"
-                    : "清空当前场次，开始新的问题"
-            )
         }
+    }
+
+    /// The two actions that end or replace a live discussion. Keeping them
+    /// behind one menu prevents a misplaced click next to Pause/Continue, and
+    /// both still route through the existing confirmation alerts.
+    private var runActionsMenu: some View {
+        Menu {
+            Button(role: .destructive) {
+                confirmation = .finish
+            } label: {
+                Label("结束整场讨论…", systemImage: "stop.fill")
+            }
+            .help("停止后续派发并生成当前报告（已发送的请求可能仍会生成）")
+            Divider()
+            Button {
+                confirmation = .newDiscussion
+            } label: {
+                Label("新建讨论…", systemImage: "square.and.pencil")
+            }
+            .help("停止当前讨论并开始新的问题（会确认，可从历史继续）")
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "ellipsis.circle")
+                    .font(.system(size: 12.5, weight: .medium))
+                Text("更多")
+                    .font(.system(size: 13, weight: .medium))
+            }
+            .padding(.horizontal, 2)
+            .frame(minHeight: 32)
+            .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("结束整场或新建讨论；两者都会先确认")
+        .accessibilityLabel("更多：结束整场或新建讨论")
     }
 
     private var stagePill: some View {
@@ -1081,38 +1228,27 @@ struct ArenaRootView: View {
     /// available width is narrower than three usable site columns, so the row
     /// scrolls horizontally instead of wrapping into a 2+1 grid with half-height
     /// pages. Two seats still share the width evenly.
-    @ViewBuilder
+    ///
+    /// The view structure is identical at every width: only the column width,
+    /// and therefore the scroll range, changes. Crossing the three-column
+    /// threshold cannot rebuild the seat subtree, so each mounted WKWebView
+    /// keeps its document, scroll position and first responder.
     private func seatColumns(_ providers: [String], size: CGSize) -> some View {
         let gap: CGFloat = 8
-        let minimumColumn: CGFloat = 320
-        if providers.count <= 2 {
+        let count = max(providers.count, 1)
+        let available = max(size.width - gap * CGFloat(count - 1), 0)
+        let ideal = available / CGFloat(count)
+        let minimumColumn: CGFloat = providers.count >= 3 ? 320 : 240
+        let column = max(ideal, minimumColumn)
+        return ScrollView(.horizontal) {
             HStack(spacing: gap) {
                 ForEach(providers, id: \.self) { provider in
                     seatCard(provider)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
-            }
-        } else {
-            let available = max(size.width - gap * CGFloat(providers.count - 1), 0)
-            let ideal = available / CGFloat(providers.count)
-            if ideal >= minimumColumn {
-                HStack(spacing: gap) {
-                    ForEach(providers, id: \.self) { provider in
-                        seatCard(provider)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    }
-                }
-            } else {
-                ScrollView(.horizontal, showsIndicators: true) {
-                    HStack(spacing: gap) {
-                        ForEach(providers, id: \.self) { provider in
-                            seatCard(provider)
-                                .frame(width: minimumColumn, height: max(size.height, 0))
-                        }
-                    }
+                        .frame(width: column, height: max(size.height, 1))
                 }
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
     }
 
     private var readOnlyBanner: some View {
@@ -1128,6 +1264,9 @@ struct ArenaRootView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer(minLength: 8)
+            if model.hasParkedDraft {
+                parkedDraftReturnButton
+            }
             if let id = model.historyResumeID {
                 Button {
                     confirmation = .continueHistory(id)
@@ -1145,6 +1284,34 @@ struct ArenaRootView: View {
         .background(Color.primary.opacity(0.035))
     }
 
+    /// The only way out of history that keeps the draft. It appears only while
+    /// an unsent draft is really parked; a read-only session's own saved
+    /// question never creates one. Read-only review returns directly; a running
+    /// discussion stops when the draft comes back, so it asks first.
+    private var parkedDraftReturnButton: some View {
+        Button {
+            switch parkedDraftReturnPolicy {
+            case .confirmStop: confirmation = .returnToDraft
+            case .direct, .unavailable: returnToParkedDraft()
+            }
+        } label: {
+            Label("返回草稿", systemImage: "arrow.uturn.backward")
+                .font(.system(size: 12.5, weight: .medium))
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.regular)
+        .help("回到尚未发送的问题和附件，继续编辑；不会发送任何内容")
+        .accessibilityLabel("返回未发送的草稿")
+    }
+
+    private var parkedDraftReturnPolicy: ArenaDraftReturnPolicy {
+        ArenaDraftReturnPolicy.decide(
+            isReadOnly: model.isReadOnly,
+            isRunning: isRunning,
+            hasParkedDraft: model.hasParkedDraft
+        )
+    }
+
     @ViewBuilder
     private func seatCard(_ provider: String) -> some View {
         if let pane = model.panes[provider] {
@@ -1155,6 +1322,7 @@ struct ArenaRootView: View {
                 status: state,
                 isParticipant: isParticipant(provider),
                 hasStarted: hasStarted,
+                showsOperations: hasStarted && !isFinished,
                 controls: model.controls(for: provider),
                 receiptSignal: model.seatReceiptSignals[provider],
                 savedAnswerSignal: liveSavedAnswerSignal(for: provider),
@@ -1239,6 +1407,9 @@ struct ArenaRootView: View {
     private func performNewDiscussion() {
         selectedProviders = Set(ArenaSeatCatalog.ordered)
         roundLimit = 3
+        // A new question starts from the compact opening row, not whatever
+        // disclosure state the previous session was left in.
+        showsOpeningOptions = false
         ArenaDetailsWindowController.shared.close()
         ArenaBackfillWindowController.shared.close()
         model.newDiscussion()
@@ -1254,9 +1425,35 @@ struct ArenaRootView: View {
     }
 
     private func openHistory(_ id: String) {
-        ArenaBackfillWindowController.shared.close()
-        model.openHistory(id)
-        presentDetails(provider: nil, tab: .report)
+        // A draft in the non-modal backfill panel is user text that cannot be
+        // recovered from the session file, so it stays open when it has one.
+        if !ArenaBackfillWindowController.shared.hasUnsavedDraft {
+            ArenaBackfillWindowController.shared.close()
+        }
+        guard model.openHistory(id) else { return }
+        if showsInlineHistoryReport {
+            // The read-only report is already embedded in the main window.
+            // Never pop a second copy; an open details window moves to the
+            // saved answers without being raised or focused.
+            ArenaDetailsWindowController.shared.avoidDuplicateReport(model: model)
+            return
+        }
+        presentDetails(provider: nil, tab: .answers)
+    }
+
+    /// Leave history for the parked composer draft. This is not a start: no
+    /// site is opened and nothing is sent. It runs only after the running-state
+    /// confirmation, or directly in read-only review.
+    private func returnToParkedDraft() {
+        ArenaDetailsWindowController.shared.close()
+        // A draft in the non-modal backfill panel is user text that cannot be
+        // recovered from the session file, so it stays open when it has one.
+        if !ArenaBackfillWindowController.shared.hasUnsavedDraft {
+            ArenaBackfillWindowController.shared.close()
+        }
+        guard model.restoreParkedDraft() else { return }
+        model.prepareHome()
+        questionFocusRequest += 1
     }
 
     private func presentDetails(provider: String?, tab: ArenaInspectorTab) {
@@ -1282,13 +1479,13 @@ struct ArenaRootView: View {
 
     private func showSeatHint(_ text: String) {
         hintTask?.cancel()
-        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.15)) {
+        withAnimation(ArenaMotion.quick(reduceMotion)) {
             seatHint = text
         }
         hintTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 2_400_000_000)
             guard !Task.isCancelled else { return }
-            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) {
+            withAnimation(ArenaMotion.change(reduceMotion)) {
                 seatHint = nil
             }
         }
@@ -1305,9 +1502,22 @@ struct ArenaRootView: View {
         (model.session?["paused"] as? Bool) ?? false
     }
 
+    /// The discussion reached its final stage. Ending already hides the
+    /// inapplicable seat operations; the saved report keeps its own entry.
+    private var isFinished: Bool {
+        model.stageKey == "done"
+    }
+
     /// A report saved for the current session (completed or read-only history).
     private var hasSavedReport: Bool {
         ArenaSessionDigest.report(model.session) != nil
+    }
+
+    /// Read-only history already renders that report inside the main window,
+    /// so the action bar must not offer a second copy. The independent details
+    /// window stays reachable through 「详情」.
+    private var showsInlineHistoryReport: Bool {
+        ArenaHistoryOpenTarget.decide(readOnly: model.isReadOnly, hasReport: hasSavedReport) == .inlineReport
     }
 
     private var guidanceAvailable: Bool {
@@ -1317,10 +1527,28 @@ struct ArenaRootView: View {
 
     /// Pause first through the model's single pause path, then open the editor
     /// for the pinned live phase. Nothing is resumed automatically, here or on
-    /// save; the user must press 「继续」.
+    /// save; the user must press 「继续」. The opening result records whether
+    /// this workbench caused the pause, so dismissing without saving can undo
+    /// only that pause.
     private func openGuidanceComposer() {
-        guard let target = model.beginGuidance() else { return }
-        guidanceTarget = target
+        guidanceDidSave = false
+        guard let opening = model.beginGuidance() else { return }
+        guidanceOpening = opening
+        guidanceTarget = opening.target
+    }
+
+    /// Runs for every way the condition sheet can close: the「关闭」button,
+    /// Escape, or the system dismiss gesture. Leaving without saving undoes the
+    /// pause this workbench applied for the editor, and never a pause the user
+    /// made before opening it. A saved condition keeps the pause, as documented
+    /// in the editor, until the user presses 「继续」.
+    private func guidanceDismissed() {
+        let opening = guidanceOpening
+        let saved = guidanceDidSave
+        guidanceOpening = nil
+        guidanceDidSave = false
+        guard let opening, opening.ownedPause, !saved else { return }
+        model.resumePauseOwnedByGuidance(opening.target)
     }
 
     /// Run the history action only after the search sheet finished dismissing,
@@ -1435,6 +1663,9 @@ struct ArenaSeatCard: View {
     let status: ArenaSeatState
     let isParticipant: Bool
     let hasStarted: Bool
+    /// Seat operations only exist while they can do something. The opening
+    /// composer and a finished discussion render no disabled menu at all.
+    let showsOperations: Bool
     let controls: ArenaSeatControls
     let receiptSignal: ArenaSeatLiveSignal?
     let savedAnswerSignal: ArenaSeatLiveSignal?
@@ -1527,16 +1758,20 @@ struct ArenaSeatCard: View {
                             .foregroundStyle(.secondary)
                     }
                     Spacer(minLength: 4)
-                    Button(action: onPrompt) {
-                        Image(systemName: "text.bubble")
-                            .font(.system(size: 12.5, weight: .medium))
-                            .frame(width: 28, height: 28)
-                            .contentShape(Rectangle())
+                    if hasStarted {
+                        Button(action: onPrompt) {
+                            Image(systemName: "text.bubble")
+                                .font(.system(size: 12.5, weight: .medium))
+                                .frame(width: 28, height: 28)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.borderless)
+                        .help("查看本席当前真正提示")
+                        .accessibilityLabel("查看本席当前提示")
                     }
-                    .buttonStyle(.borderless)
-                    .help("查看本席当前真正提示")
-                    .accessibilityLabel("查看本席当前提示")
-                    menu
+                    if showsOperations {
+                        menu
+                    }
                 }
                 if showsStatusDetail {
                     Text(status.detail)
@@ -1683,6 +1918,18 @@ struct ArenaSeatCard: View {
             receiptTask?.cancel()
             savedCheckSettleTask?.cancel()
         }
+        .onChange(of: reduceMotion) { reduced in
+            // Turning Reduce Motion on takes effect immediately: any running
+            // one-shot settles now, and no new motion is queued.
+            guard reduced else { return }
+            receiptTask?.cancel()
+            receiptTask = nil
+            savedCheckSettleTask?.cancel()
+            savedCheckSettleTask = nil
+            receiptPlaneVisible = false
+            receiptPlaneLaunched = false
+            savedCheckScale = 1
+        }
     }
 
     /// One-shot paper-plane motion for this seat header only. It is triggered
@@ -1692,11 +1939,7 @@ struct ArenaSeatCard: View {
         receiptTask?.cancel()
         receiptPlaneLaunched = false
         receiptPlaneVisible = true
-        if !reduceMotion {
-            withAnimation(.easeOut(duration: 0.18)) { receiptPlaneLaunched = true }
-        } else {
-            receiptPlaneLaunched = true
-        }
+        withAnimation(ArenaMotion.quick(reduceMotion)) { receiptPlaneLaunched = true }
         receiptTask = Task { @MainActor in
             let dwell: UInt64 = reduceMotion ? 900_000_000 : 700_000_000
             try? await Task.sleep(nanoseconds: dwell)
@@ -1705,7 +1948,7 @@ struct ArenaSeatCard: View {
                 receiptPlaneVisible = false
                 receiptPlaneLaunched = false
             } else {
-                withAnimation(.easeOut(duration: 0.18)) { receiptPlaneLaunched = false }
+                withAnimation(ArenaMotion.quick(reduceMotion)) { receiptPlaneLaunched = false }
                 try? await Task.sleep(nanoseconds: 120_000_000)
                 guard !Task.isCancelled else { return }
                 receiptPlaneVisible = false
@@ -1726,7 +1969,7 @@ struct ArenaSeatCard: View {
         savedCheckSettleTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 20_000_000)
             guard !Task.isCancelled else { return }
-            withAnimation(.easeOut(duration: 0.2)) {
+            withAnimation(ArenaMotion.quick(reduceMotion)) {
                 savedCheckScale = 1
             }
         }
@@ -1966,13 +2209,19 @@ struct ArenaStageAnswerCount: View {
                     return
                 }
                 guard next.answered != displayedAnswered else { return }
-                if live && !reduceMotion {
-                    withAnimation(.easeOut(duration: 0.2)) {
+                if live {
+                    withAnimation(ArenaMotion.change(reduceMotion)) {
                         displayedAnswered = next.answered
                     }
                 } else {
                     displayedAnswered = next.answered
                 }
+            }
+            .onChange(of: reduceMotion) { _ in
+                // Switching Reduce Motion on settles the current number at once
+                // instead of leaving an in-flight roll running.
+                displayedAnswered = answered
+                displayedTotal = total
             }
             .accessibilityLabel("本阶段已收到 \(displayedAnswered) / \(displayedTotal) 席回答")
     }
@@ -2151,6 +2400,7 @@ enum ArenaConfirmation: Identifiable {
     case finish
     case continueHistory(String)
     case openHistory(String)
+    case returnToDraft
 
     var id: String {
         switch self {
@@ -2158,6 +2408,7 @@ enum ArenaConfirmation: Identifiable {
         case .finish: return "finish"
         case .continueHistory(let id): return "continue-\(id)"
         case .openHistory(let id): return "history-\(id)"
+        case .returnToDraft: return "return-to-draft"
         }
     }
 }
@@ -2233,6 +2484,19 @@ final class ArenaDetailsWindowController: NSObject, NSWindowDelegate, NSToolbarD
         window.subtitle = Self.subtitle(for: model.session)
         if window.isMiniaturized { window.deminiaturize(nil) }
         arenaPresentWindow(window)
+        refreshToolbar()
+    }
+
+    /// A read-only history already shows its saved report inside the main
+    /// workbench. An open details window must not present a second copy, so it
+    /// is moved to the saved answers. The window is never created, raised or
+    /// focused here: focus stays where the user left it.
+    func avoidDuplicateReport(model: ArenaModel) {
+        guard let window, window.isVisible, hostedModel === model else { return }
+        guard state.tab == .report, !state.showsRawRecord else { return }
+        state.tab = .answers
+        state.normalize(session: model.session)
+        window.subtitle = Self.subtitle(for: model.session)
         refreshToolbar()
     }
 
@@ -2730,7 +2994,7 @@ struct ArenaDetailsWindowView: View {
                 .id(sessionIdentity)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if let reason = ArenaSessionDigest.stopReason(session) {
-            emptyState("尚未生成报告。停止原因：\(reason)")
+            emptyState("尚未生成报告。停止原因：\(ArenaHistoryOutcome.label(stopReason: reason))")
         } else {
             emptyState("讨论结束后可在这里查看报告。")
         }
@@ -2739,14 +3003,18 @@ struct ArenaDetailsWindowView: View {
     // MARK: 原始记录
 
     private var jsonView: some View {
-        VStack(spacing: 0) {
+        // One serialization per evaluation: the copy button and the text show
+        // the same record, and re-encoding it twice doubles the cost of every
+        // refresh on a long session.
+        let text = ArenaJSON.string(session)
+        return VStack(spacing: 0) {
             HStack(spacing: 8) {
                 Text("会话原始数据（只读）")
                     .font(.system(size: 12.5))
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 8)
                 Button("复制 JSON") {
-                    feedback.copyToPasteboard(ArenaJSON.string(session))
+                    feedback.copyToPasteboard(text)
                 }
                 .controlSize(.large)
                 .disabled(session == nil)
@@ -2757,7 +3025,7 @@ struct ArenaDetailsWindowView: View {
             Divider()
 
             ScrollView([.horizontal, .vertical]) {
-                Text(ArenaJSON.string(session))
+                Text(text)
                     .font(.system(size: 12, design: .monospaced))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -2869,6 +3137,14 @@ struct ArenaAnswerDisclosure: View {
                 highlightedMaterials.removeAll()
             }
         }
+        .onChange(of: reduceMotion) { reduced in
+            // Reduce Motion takes effect immediately: stop the domino and show
+            // the same material rows without any highlight.
+            guard reduced else { return }
+            highlightTask?.cancel()
+            highlightTask = nil
+            highlightedMaterials.removeAll()
+        }
         .onDisappear {
             highlightTask?.cancel()
             highlightTask = nil
@@ -2957,7 +3233,7 @@ struct ArenaAnswerDisclosure: View {
         highlightTask = Task { @MainActor in
             for index in 0..<count {
                 guard !Task.isCancelled else { return }
-                withAnimation(.easeOut(duration: 0.16)) {
+                withAnimation(ArenaMotion.quick(reduceMotion)) {
                     _ = highlightedMaterials.insert(index)
                 }
                 try? await Task.sleep(nanoseconds: 55_000_000)
@@ -2965,7 +3241,7 @@ struct ArenaAnswerDisclosure: View {
             guard !Task.isCancelled else { return }
             try? await Task.sleep(nanoseconds: 420_000_000)
             guard !Task.isCancelled else { return }
-            withAnimation(.easeOut(duration: 0.22)) {
+            withAnimation(ArenaMotion.change(reduceMotion)) {
                 highlightedMaterials.removeAll()
             }
         }
@@ -3002,6 +3278,14 @@ final class ArenaBackfillDraft: ObservableObject {
     @Published var attachmentsConfirmed = false
 
     private(set) var target: ArenaManualTarget?
+    private var initialText = ""
+    private var initialStance = ""
+
+    /// True once the panel holds something the user changed beyond the
+    /// prefill, so switching sessions must not close it silently.
+    var hasUnsavedDraft: Bool {
+        text != initialText || stance != initialStance || attachmentsConfirmed
+    }
 
     func configure(model: ArenaModel, provider: String) {
         self.provider = provider
@@ -3011,6 +3295,8 @@ final class ArenaBackfillDraft: ObservableObject {
         error = ""
         target = model.manualTarget(for: provider)
         attachmentsConfirmed = false
+        initialText = text
+        initialStance = stance
         if prefill.isPartial {
             note = "以下为流式预览片段，尚未确认完成；请先核对原页，再修改后提交。"
             noteIsWarning = true
@@ -3150,6 +3436,7 @@ final class ArenaBackfillWindowController: NSObject, NSWindowDelegate {
     private var panel: NSPanel?
     private weak var model: ArenaModel?
     private var provider: String?
+    private var draft: ArenaBackfillDraft?
 
     private override init() {
         super.init()
@@ -3198,7 +3485,15 @@ final class ArenaBackfillWindowController: NSObject, NSWindowDelegate {
         self.panel = panel
         self.model = model
         self.provider = provider
+        self.draft = draft
         panel.makeKeyAndOrderFront(nil)
+    }
+
+    /// User text in the visible panel that is not just the prefill. Switching
+    /// sessions must not silently discard it.
+    var hasUnsavedDraft: Bool {
+        guard let panel, panel.isVisible else { return false }
+        return draft?.hasUnsavedDraft ?? false
     }
 
     func close() {
@@ -3208,6 +3503,7 @@ final class ArenaBackfillWindowController: NSObject, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         guard (notification.object as? NSPanel) === panel else { return }
         provider = nil
+        draft = nil
     }
 }
 
@@ -3406,7 +3702,11 @@ enum ArenaExporter {
         if let reason = ArenaSessionDigest.stopReason(session) {
             lines.append("## 停止原因")
             lines.append("")
-            lines.append(reason)
+            lines.append(ArenaHistoryOutcome.conservativeLabel(
+                stopReason: reason,
+                ballot: ballot,
+                participants: providers
+            ))
             lines.append("")
         }
 

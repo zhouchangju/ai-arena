@@ -10,9 +10,22 @@
 
 import SwiftUI
 
+/// Result of opening the condition composer. `ownedPause` is true only when
+/// this workbench had to pause an unpaused discussion to open the editor; a
+/// discussion the user paused themselves never carries it.
+struct ArenaGuidanceOpening: Equatable {
+    let target: ArenaGuidanceTarget
+    let ownedPause: Bool
+}
+
 struct ArenaGuidanceComposer: View {
     @ObservedObject var model: ArenaModel
     let target: ArenaGuidanceTarget
+    /// Whether the pause in effect was caused by opening this editor.
+    let ownedPause: Bool
+    /// Called after one condition was saved. The caller keeps that as「已保存」
+    /// so closing the editor does not undo a pause the user is still using.
+    let onSaved: () -> Void
     let onClose: () -> Void
 
     @State private var draft: String = ""
@@ -82,14 +95,25 @@ struct ArenaGuidanceComposer: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text("补充讨论条件")
                     .font(.system(size: 15, weight: .semibold))
-                Text("当前已暂停 · 保存后仍保持暂停")
+                Text(pauseNote)
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 8)
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 13)
+    }
+
+    /// Says exactly what closing the editor will do. The pause is only undone
+    /// when this sheet caused it and nothing was saved; a pause the user made
+    /// before opening the editor is always kept.
+    private var pauseNote: String {
+        if ownedPause {
+            return "打开时已自动暂停。保存后仍保持暂停；不保存直接关闭会恢复原来的派发。"
+        }
+        return "本场原本已暂停。保存后仍保持暂停；关闭不会自动继续。"
     }
 
     private var effectNotice: some View {
@@ -163,6 +187,9 @@ struct ArenaGuidanceComposer: View {
             Spacer(minLength: 8)
             Button("关闭") { onClose() }
                 .keyboardShortcut(.cancelAction)
+                .help(ownedPause
+                      ? "不保存条件；如果这次暂停是打开编辑器时自动造成的，会恢复到原来的派发状态"
+                      : "不保存条件；本场保持你原来的暂停状态")
             Button("保存条件") { save() }
                 .keyboardShortcut(.defaultAction)
                 .disabled(!canSave)
@@ -178,6 +205,7 @@ struct ArenaGuidanceComposer: View {
             statusIsError = false
             status = "已保存条件 #\(note.seq)；讨论仍保持暂停。"
             editorFocused = true
+            onSaved()
         case let .rejected(message):
             statusIsError = true
             status = message

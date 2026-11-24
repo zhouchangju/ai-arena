@@ -22,6 +22,9 @@ enum ArenaHistoryOutcome {
         guard item.isFinished else {
             return item.paused ? "unfinished-paused" : "unfinished"
         }
+        // A batch refresh/save stamped the strict ballot result once. Search and
+        // menu filters read that stamp instead of recomputing per keystroke.
+        if let key = item.conservativeOutcomeKey { return key }
         switch item.stopReason {
         case "consensus": return "consensus"
         case "conditional-agreement": return "conditional-agreement"
@@ -38,25 +41,170 @@ enum ArenaHistoryOutcome {
         }
     }
 
-    /// The wording used by the existing History menu. Kept identical so the
-    /// menu and the search sheet never describe the same session differently.
+    /// The one Chinese short-term table for a saved outcome. The history menu,
+    /// search sheet, report reader and Markdown export all read these strings,
+    /// so the same session is never described with two different words.
+    static let labels: [String: String] = [
+        "consensus": "全体一致",
+        "conditional-agreement": "有条件一致",
+        "unresolved-opposition": "仍有反对",
+        "partial-votes": "部分表态",
+        "partial-participation": "参与不足",
+        "no-cross-review": "互评缺失",
+        "no-critique": "缺少互评材料",
+        "proposal-skipped": "未形成候选",
+        "draft": "候选草稿",
+        "user-finished": "提前结束",
+        "no-answers": "无有效回答",
+    ]
+
+    /// Older wording that described the same saved outcome before the terms
+    /// were unified. Search keeps these as aliases, so a familiar phrase such
+    /// as 「仍有反对」 or a former report phrase still finds the session.
+    static let alternateLabels: [String: [String]] = [
+        "conditional-agreement": ["有条件同意"],
+        "unresolved-opposition": ["存在分歧"],
+        "partial-votes": ["表态记录不完整"],
+        "partial-participation": ["部分席位参与"],
+        "no-cross-review": ["互评未完成"],
+        "no-critique": ["尚无最终候选"],
+        "proposal-skipped": ["尚无最终候选"],
+        "no-answers": ["尚无回答"],
+        "finished": ["讨论已结束"],
+        "incomplete-votes": ["部分表态"],
+    ]
+
+    /// Conservative presentation derived once from a saved ballot. It only
+    /// labels the saved code honestly; the raw stopReason and JSON stay intact.
+    struct Stamp: Equatable {
+        let key: String
+        let label: String
+    }
+
+    /// The wording used by the existing History menu, search sheet, report
+    /// reader and export. An unknown saved code is never rewritten: it keeps
+    /// its raw value in the session JSON and only falls back here.
     static func label(for item: ArenaHistorySummary) -> String {
         guard item.isFinished else {
             return item.paused ? "未完成 · 已暂停" : "未完成 · 可继续"
         }
-        switch item.stopReason {
-        case "consensus": return "全体一致"
-        case "conditional-agreement": return "有条件一致"
-        case "unresolved-opposition": return "仍有反对"
-        case "partial-votes": return "部分表态"
-        case "partial-participation": return "参与不足"
-        case "no-cross-review": return "互评缺失"
-        case "no-critique": return "缺少互评材料"
-        case "proposal-skipped": return "未形成候选"
-        case "draft": return "候选草稿"
-        case "user-finished": return "提前结束"
-        case "no-answers": return "无有效回答"
-        default: return "已结束"
+        if let label = item.conservativeOutcomeLabel { return label }
+        return label(stopReason: item.stopReason)
+    }
+
+    /// Chinese label for a persisted stop reason. Unknown codes stay in the
+    /// original data and read as a generic finished state here.
+    static func label(stopReason: String?) -> String {
+        guard let stopReason else { return "已结束" }
+        return labels[stopReason] ?? "已结束"
+    }
+
+    /// The report reader's label. `verifiedConsensus` is decided by the reader
+    /// from the saved candidate plus every participant's same-version `agree`
+    /// vote; a missing vote or candidate degrades instead of claiming 全体一致.
+    /// A conditional stop without any recorded conditional stance also degrades.
+    static func reportLabel(
+        stopReason: String?,
+        verifiedConsensus: Bool,
+        hasConditionalVote: Bool
+    ) -> String {
+        let raw = stopReason ?? ""
+        if verifiedConsensus { return label(stopReason: "consensus") }
+        if raw == "consensus" { return "表态记录不完整" }
+        if raw == "conditional-agreement", !hasConditionalVote {
+            return "表态记录不完整"
+        }
+        return label(stopReason: stopReason)
+    }
+
+    /// Alternate search wording for this session's saved outcome.
+    static func searchTerms(for item: ArenaHistorySummary) -> [String] {
+        alternateLabels[key(for: item)] ?? []
+    }
+
+    /// Strict consensus from the existing report ballot. A `consensus` code
+    /// alone never proves agreement: the ballot must name an answered candidate
+    /// version and every participant must have a saved same-version `agree`
+    /// vote for it. Missing, older or mismatched votes degrade instead.
+    static func verifiedConsensus(
+        stopReason: String?,
+        ballot: [String: Any]?,
+        participants: [String]
+    ) -> Bool {
+        guard stopReason == "consensus", let ballot else { return false }
+        let version = ballot.arenaInt("version") ?? 0
+        guard version > 0,
+              let candidateID = ballot["candidateID"] as? String,
+              !candidateID.isEmpty,
+              !participants.isEmpty else {
+            return false
+        }
+        let votes = ballot["votes"] as? [[String: Any]] ?? []
+        return participants.allSatisfy { provider in
+            votes.contains { vote in
+                (vote["provider"] as? String) == provider
+                    && (vote["stance"] as? String) == "agree"
+                    && sameVersion(vote, version)
+            }
+        }
+    }
+
+    /// A recorded conditional stance for the ballot's candidate version.
+    static func hasConditionalVote(ballot: [String: Any]?) -> Bool {
+        guard let ballot else { return false }
+        let version = ballot.arenaInt("version") ?? 0
+        let votes = ballot["votes"] as? [[String: Any]] ?? []
+        return votes.contains { vote in
+            (vote["stance"] as? String) == "conditional" && sameVersion(vote, version)
+        }
+    }
+
+    /// The engine bridge already scopes votes to the candidate version and may
+    /// omit a vote's version field. When it is present, it must match.
+    private static func sameVersion(_ vote: [String: Any], _ version: Int) -> Bool {
+        guard let voteVersion = vote.arenaInt("version") else { return true }
+        return version > 0 && voteVersion == version
+    }
+
+    /// One conservative label for the report, completion banner and Markdown
+    /// export. The raw stop code stays untouched in the saved JSON; only this
+    /// presentation degrades when the ballot cannot prove the claim.
+    static func conservativeLabel(
+        stopReason: String?,
+        ballot: [String: Any]?,
+        participants: [String]
+    ) -> String {
+        reportLabel(
+            stopReason: stopReason,
+            verifiedConsensus: verifiedConsensus(
+                stopReason: stopReason, ballot: ballot, participants: participants
+            ),
+            hasConditionalVote: hasConditionalVote(ballot: ballot)
+        )
+    }
+
+    /// Stamp a finished summary once from its saved ballot. Only the two claims
+    /// that need proof are stamped: 全体一致 and 有条件一致. Everything else
+    /// keeps the raw-code label. A shell or ballot-less record degrades instead
+    /// of claiming agreement, and the raw code is never replaced.
+    static func stamp(
+        stopReason: String?,
+        ballot: [String: Any]?,
+        participants: [String]
+    ) -> Stamp? {
+        switch stopReason {
+        case "consensus":
+            return verifiedConsensus(
+                stopReason: stopReason, ballot: ballot, participants: participants
+            )
+                ? Stamp(key: "consensus", label: label(stopReason: "consensus"))
+                : Stamp(key: "incomplete-votes", label: "表态记录不完整")
+        case "conditional-agreement":
+            return hasConditionalVote(ballot: ballot)
+                ? Stamp(key: "conditional-agreement", label: label(stopReason: "conditional-agreement"))
+                : Stamp(key: "incomplete-votes", label: "表态记录不完整")
+        default:
+            return nil
         }
     }
 
@@ -66,6 +214,21 @@ enum ArenaHistoryOutcome {
             return item.paused ? "未完成 · 已暂停" : "未完成"
         }
         return label(for: item)
+    }
+}
+
+/// Where an opened saved session should land. A read-only session with a saved
+/// report renders that report inside the workbench, so no second window is
+/// opened. Everything else uses the independent details window: the saved
+/// answers, or the report when one exists.
+enum ArenaHistoryOpenTarget: Equatable {
+    case inlineReport
+    case savedAnswers
+    case report
+
+    static func decide(readOnly: Bool, hasReport: Bool) -> ArenaHistoryOpenTarget {
+        if readOnly, hasReport { return .inlineReport }
+        return hasReport ? .report : .savedAnswers
     }
 }
 
@@ -216,6 +379,11 @@ enum ArenaHistorySearch {
             // local summary text, never a re-read of prompts or answers.
             if normalize(item.question).contains(query) { return true }
             if normalize(ArenaHistoryOutcome.label(for: item)).contains(query) { return true }
+            if ArenaHistoryOutcome.searchTerms(for: item).contains(where: {
+                normalize($0).contains(query)
+            }) {
+                return true
+            }
             if item.providers.contains(where: {
                 normalize($0).contains(query) || normalize(seatName($0)).contains(query)
             }) {

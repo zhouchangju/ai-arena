@@ -9,8 +9,9 @@
 //    xcrun --sdk macosx swiftc -swift-version 5 \
 //      -framework AppKit -framework SwiftUI -framework JavaScriptCore \
 //      -framework UserNotifications \
-//      desktop/ArenaFeedback.swift desktop/ArenaEngine.swift \
-//      desktop/ArenaEvaluation.swift tests/feedback_completion.swift -o <bin>
+//      desktop/ArenaMotion.swift desktop/ArenaFeedback.swift \
+//      desktop/ArenaEngine.swift desktop/ArenaEvaluation.swift \
+//      tests/feedback_completion.swift -o <bin>
 //
 
 import AppKit
@@ -65,13 +66,20 @@ struct FeedbackCompletionCheck {
         check("a different session id never maps onto done", changed.recordPersisted(
             sessionID: "second", stage: "done") == nil)
 
-        // --- 5. Foreground/background delivery policy -------------------------
-        check("foreground opens the report", ArenaCompletionPolicy.delivery(
-            isForeground: true, explicitFinish: false) == .presentReport)
+        // --- 5. Delivery never steals the foreground ---------------------------
+        check("a foreground automatic completion stays in the workbench",
+              ArenaCompletionPolicy.delivery(isForeground: true, explicitFinish: false) == .revealInPlace)
+        check("a foreground explicit finish also stays in the workbench",
+              ArenaCompletionPolicy.delivery(isForeground: true, explicitFinish: true) == .revealInPlace)
         check("background automatic completion notifies", ArenaCompletionPolicy.delivery(
             isForeground: false, explicitFinish: false) == .notification)
         check("background explicit finish stays silent", ArenaCompletionPolicy.delivery(
             isForeground: false, explicitFinish: true) == .silent)
+        check("no delivery turns a completion into a notification in the foreground",
+              ArenaCompletionPolicy.delivery(isForeground: true, explicitFinish: false) != .notification)
+        check("the in-place notice has its own channel",
+              Notification.Name.arenaCompletionAnnouncedInPlace
+                  != Notification.Name("arena.completion"))
 
         // --- 6. Copy reports the pasteboard's own result ----------------------
         let board = NSPasteboard(name: NSPasteboard.Name("ArenaFeedbackCheck.\(UUID().uuidString)"))

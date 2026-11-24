@@ -7,7 +7,8 @@ struct ArenaEvaluationSection: View {
     let openSource: (String) -> Void
 
     @State private var saved: ArenaEvaluation?
-    @State private var error: String?
+    @State private var loadError: String?
+    @State private var actionError: String?
     @State private var loaded = false
     @State private var inspectedPage: ArenaModel.EvaluationPage?
 
@@ -28,17 +29,37 @@ struct ArenaEvaluationSection: View {
                 ForEach(saved.comparisons) { row in
                     comparisonRow(row, evaluation: saved)
                 }
+            } else if let loadError {
+                Label(loadError, systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("重新读取") { load() }
+                    .disabled(model.evaluatingSessionID != nil)
             } else if loaded {
                 Button("评估本场") { evaluate() }
                     .disabled(model.evaluatingSessionID != nil)
                 Text("将题面、附件和去掉席位标签的独立作答发到 ChatGPT 新会话。")
                     .font(.caption).foregroundStyle(.secondary)
+            } else {
+                ProgressView("正在读取本场评估…")
+                    .controlSize(.small)
             }
             if model.evaluatingSessionID == sessionID {
-                ProgressView("等待 ChatGPT 裁判结果…").controlSize(.small)
+                ProgressView("等待 ChatGPT 裁判结果…")
+                    .controlSize(.small)
+                    .accessibilityLabel("正在等待 ChatGPT 裁判结果")
+            } else if model.evaluatingSessionID != nil {
+                Text("另一场评估仍在进行，完成前不能开始新的评估。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
-            if let error {
-                Text(verbatim: error).foregroundStyle(.red)
+            if let actionError {
+                Label(actionError, systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
             }
             if let page = model.evaluationPage, page.sessionID == sessionID {
                 Button("查看裁判原页") { inspectedPage = page }
@@ -47,17 +68,11 @@ struct ArenaEvaluationSection: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .task(id: sessionID) {
-            do {
-                saved = try model.evaluation(sessionID: sessionID)
-                loaded = true
-            } catch {
-                self.error = "无法读取本场评估：\(error.localizedDescription)"
-            }
+            load()
         }
         .onChange(of: model.evaluatingSessionID) { active in
-            if active == nil, let latest = try? model.evaluation(sessionID: sessionID) {
-                saved = latest
-            }
+            if active == sessionID { actionError = nil }
+            if active == nil { refresh() }
         }
         .sheet(item: $inspectedPage) { page in
             VStack(alignment: .leading, spacing: 0) {
@@ -73,13 +88,36 @@ struct ArenaEvaluationSection: View {
         }
     }
 
+    private func load() {
+        do {
+            saved = try model.evaluation(sessionID: sessionID)
+            loadError = nil
+        } catch {
+            saved = nil
+            loadError = "无法读取本场评估：\(error.localizedDescription)"
+        }
+        loaded = true
+    }
+
+    /// Re-read an evaluation that already existed in memory without clearing
+    /// the current detail if the read hiccups.
+    private func refresh() {
+        guard let latest = try? model.evaluation(sessionID: sessionID) else { return }
+        saved = latest
+        loaded = true
+        loadError = nil
+    }
+
     private func evaluate(pairID: String? = nil) {
-        error = nil
+        guard model.evaluatingSessionID == nil else { return }
+        actionError = nil
         Task {
             do {
                 saved = try await model.runEvaluation(sessionID: sessionID, reversing: pairID)
+                loaded = true
+                loadError = nil
             } catch {
-                self.error = error.localizedDescription
+                actionError = error.localizedDescription
             }
         }
     }

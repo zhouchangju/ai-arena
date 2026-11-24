@@ -189,6 +189,114 @@ struct ArenaDraftAttachment: Identifiable {
     }
 }
 
+// MARK: - Unsent composer draft
+
+/// The composer's unsent content: the exact body text and the same ordered
+/// attachment array, ids included.
+struct ArenaDraftSnapshot {
+    let question: String
+    let attachments: [ArenaDraftAttachment]
+}
+
+/// Process-local parking for an unsent composer draft.
+///
+/// Opening or continuing history replaces `question` with the saved session's
+/// question and clears the composer's attachments. This box holds the user's own
+/// unsent content across that visit so an explicit 「返回草稿」 can hand it back.
+/// It never accepts content that came from a restored session; only the composer
+/// may hand anything in. It is deliberately not persisted per keystroke: an
+/// unsent draft survives history switching in one run and an accidental quit is
+/// answered by the exit confirmation instead.
+struct ArenaDraftParking {
+    private var snapshot: ArenaDraftSnapshot?
+
+    var hasDraft: Bool { snapshot != nil }
+
+    /// Park on the way into history. `leavingComposer` is the caller's proof
+    /// that the visible text is the user's own unsent composer content and not a
+    /// restored or continued session. Empty content parks nothing, and an
+    /// already parked draft is kept rather than overwritten.
+    mutating func park(
+        question: String,
+        attachments: [ArenaDraftAttachment],
+        leavingComposer: Bool
+    ) {
+        guard leavingComposer, snapshot == nil else { return }
+        guard !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !attachments.isEmpty else { return }
+        snapshot = ArenaDraftSnapshot(question: question, attachments: attachments)
+    }
+
+    /// The user asked for the draft back. The slot empties in the same step so a
+    /// single draft can never be restored twice.
+    mutating func take() -> ArenaDraftSnapshot? {
+        defer { snapshot = nil }
+        return snapshot
+    }
+
+    /// Only a discussion that really started consumes the unsent draft. A
+    /// refused start never reaches this call, so the content stays available.
+    mutating func consumeOnStart(succeeded: Bool) {
+        guard succeeded else { return }
+        snapshot = nil
+    }
+}
+
+/// How big a confirmation the quit path needs. A running discussion and an
+/// unsent draft can coexist: continue an unfinished history, then the parked
+/// draft is still unsent. One dialog then has to state both outcomes, because
+/// quitting stops the resumable progress *and* permanently drops the draft.
+struct ArenaQuitPrompt {
+    let hasRunningDiscussion: Bool
+    let hasUnsentDraft: Bool
+
+    var isNeeded: Bool { hasRunningDiscussion || hasUnsentDraft }
+
+    var title: String {
+        switch (hasRunningDiscussion, hasUnsentDraft) {
+        case (true, true): return "仍有讨论在进行，且有尚未发送的草稿"
+        case (true, false): return "仍有讨论在进行"
+        case (false, true): return "有尚未发送的草稿"
+        case (false, false): return ""
+        }
+    }
+
+    var message: String {
+        var parts: [String] = []
+        if hasRunningDiscussion {
+            parts.append("退出会停止后续派发。已发送的请求可能仍会在原页生成；之后可以从「历史」继续核对已保存的进度。")
+        }
+        if hasUnsentDraft {
+            parts.append("退出会永久丢弃尚未发送的问题和附件；草稿没有写入磁盘。")
+        }
+        return parts.joined(separator: "\n\n")
+    }
+
+    var confirmTitle: String {
+        hasUnsentDraft ? "退出并丢弃草稿" : "退出"
+    }
+
+    /// 取消 stays the default and return-key button: quitting must never be the
+    /// easier key than keeping the work.
+    var cancelIsDefault: Bool { true }
+}
+
+/// Whether returning to the parked draft is a plain navigation or stops live
+/// work. Read-only review owns no dispatch, so its 「返回草稿」 needs no
+/// confirmation. A running discussion is stopped by the same action, so that
+/// path must ask first, exactly like 「新建」.
+enum ArenaDraftReturnPolicy: Equatable {
+    case unavailable
+    case direct
+    case confirmStop
+
+    static func decide(isReadOnly: Bool, isRunning: Bool, hasParkedDraft: Bool) -> ArenaDraftReturnPolicy {
+        guard hasParkedDraft else { return .unavailable }
+        if isRunning && !isReadOnly { return .confirmStop }
+        return .direct
+    }
+}
+
 // MARK: - Delivery intents
 
 /// A persisted statement of what the app intended to send, written *before*
@@ -256,6 +364,11 @@ struct ArenaHistorySummary: Identifiable {
     /// Derived locally so history search can match a seat without opening a
     /// page or building an index.
     let providers: [String]
+    /// Display-only conservative outcome, derived once when the summary is
+    /// built from a saved ballot. `nil` means "use the raw stopReason label".
+    /// Never persisted and never replaces the raw stop code.
+    var conservativeOutcomeKey: String? = nil
+    var conservativeOutcomeLabel: String? = nil
 
     var isFinished: Bool { stage == "done" }
 }
@@ -468,6 +581,16 @@ final class ArenaSessionStore {
     }
 
     func summaries() -> [ArenaHistorySummary] {
+        summaries { summary(for: $0, session: $1) }
+    }
+
+    /// Read and project each saved session one at a time. The parsed file and
+    /// its full session text are released before the next file is read, so a
+    /// large history never holds every document in memory; only the projected
+    /// light rows are sorted at the end.
+    func summaries(
+        _ project: (ArenaSessionFile, [String: Any]?) -> ArenaHistorySummary
+    ) -> [ArenaHistorySummary] {
         guard let names = try? fileManager.contentsOfDirectory(atPath: root.path) else {
             return []
         }
@@ -478,7 +601,7 @@ final class ArenaSessionStore {
                   let file = try? decoder.decode(ArenaSessionFile.self, from: data) else {
                 continue
             }
-            result.append(summary(for: file, session: Self.sessionDocument(file.sessionJSON)))
+            result.append(project(file, Self.sessionDocument(file.sessionJSON)))
         }
         return Self.newestFirst(result)
     }
@@ -496,7 +619,7 @@ final class ArenaSessionStore {
             updatedAt: file.updatedAt,
             stage: session?.arenaString("stage") ?? "",
             round: session?.arenaInt("round") ?? 1,
-            stopReason: session?.arenaString("stopReason"),
+            stopReason: session?.arenaString("stopReason") ?? file.stopReason,
             hasReport: session?.arenaString("report")?.isEmpty == false,
             paused: session?.arenaBool("paused") ?? false,
             providers: session?.arenaStringArray("providers") ?? []
@@ -504,9 +627,13 @@ final class ArenaSessionStore {
     }
 
     /// Newest-first order shared by the full read and the post-save upsert, so
-    /// a freshly saved row lands exactly where a re-read would place it.
+    /// a freshly saved row lands exactly where a re-read would place it. Equal
+    /// update times fall back to the stable session id, so both paths agree.
     private static func newestFirst(_ items: [ArenaHistorySummary]) -> [ArenaHistorySummary] {
-        items.sorted { $0.updatedAt > $1.updatedAt }
+        items.sorted {
+            if $0.updatedAt != $1.updatedAt { return $0.updatedAt > $1.updatedAt }
+            return $0.id < $1.id
+        }
     }
 
     /// Replace (or insert) one durable summary in the newest-first list the

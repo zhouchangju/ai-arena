@@ -3,56 +3,155 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
   <title>AI Arena · 多 AI 讨论流程</title>
   <style>
     :root {
-      color-scheme: light;
+      color-scheme: light dark;
       --paper: #fff;
-      --ink: #262626;
-      --muted: #666;
-      --rule: #e5e5e5;
-      --accent: #007aff;
-      --link: #005dbb;
-      --tint: #edf5ff;
-      --surface: #f5f5f7;
-      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
+      --ink: #232326;
+      --muted: #5f6368;
+      --rule: #e3e3e6;
+      --accent: #0071e3;
+      --link: #00539c;
+      --tint: #eaf3ff;
+      --surface: #f4f4f6;
+      --gutter: 24px;
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", sans-serif;
       color: var(--ink);
       background: var(--paper);
     }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --paper: #141416;
+        --ink: #ececf0;
+        --muted: #a9abb2;
+        --rule: #303036;
+        --accent: #63a9ff;
+        --link: #8cc0ff;
+        --tint: #16273a;
+        --surface: #1e1e22;
+      }
+    }
     * { box-sizing: border-box; }
     body { margin: 0; }
-    main { width: min(100% - 48px, 1280px); margin: 40px auto; }
+    main { width: min(calc(100% - var(--gutter) * 2), 1280px); margin: 40px auto; }
     header { border-bottom: 1px solid var(--rule); padding-bottom: 20px; }
     .eyebrow { color: var(--muted); font-size: 12px; font-weight: 600; letter-spacing: .12em; margin: 0; }
-    h1 { font-size: clamp(28px, 4vw, 40px); letter-spacing: -.045em; line-height: 1.16; margin: 8px 0 12px; }
+    h1 { font-size: clamp(26px, 4vw, 40px); letter-spacing: -.045em; line-height: 1.16; margin: 8px 0 12px; }
+    h2 { font-size: clamp(18px, 2.4vw, 20px); margin: 0 0 8px; }
     p { line-height: 1.65; }
     .dek { color: var(--muted); margin: 0; }
-    figure { margin: 0; overflow-x: auto; }
-    figure:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
-    svg { display: block; width: 100%; min-width: 800px; }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: .92em;
+      padding: .1em .35em;
+      border-radius: 4px;
+      background: var(--surface);
+    }
+    a { color: var(--link); }
+    a:focus-visible, figure:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+
+    figure.flow-figure { margin: 0; overflow-x: auto; }
+    figure.flow-figure svg { display: block; width: 100%; min-width: 1000px; height: auto; }
+
+    /* SVG palette: every colour comes from the same tokens as the page so the
+       diagram follows light/dark like the surrounding text. */
+    .canvas { fill: var(--paper); }
+    .hairline { stroke: var(--rule); }
     .edge { fill: none; stroke: var(--muted); stroke-width: 1.6; marker-end: url(#arrow); }
     .loop { stroke-dasharray: 5 4; }
     .step { fill: var(--paper); stroke: var(--ink); stroke-width: 1.1; }
     .terminal { fill: var(--surface); stroke: var(--muted); }
     .focus { fill: var(--tint); stroke: var(--accent); stroke-width: 1.6; }
+    .plate { fill: var(--paper); }
     .name { fill: var(--ink); font-size: 24px; font-weight: 650; }
     .sub { fill: var(--muted); font-size: 16px; }
     .label { fill: var(--ink); font-size: 16px; font-weight: 600; }
+    .arrow-head { fill: var(--muted); }
+    .arrow-head-accent { fill: var(--accent); }
+    .arrow-head-link { fill: var(--link); }
+    .legend-dash { stroke: var(--muted); stroke-dasharray: 5 4; }
+    .legend-terminal { fill: var(--surface); stroke: var(--muted); }
+    .legend-step { fill: var(--paper); stroke: var(--ink); }
+    .legend-focus { fill: var(--tint); stroke: var(--accent); }
+
     .notes { display: grid; grid-template-columns: 1.25fr 1fr; gap: 32px; border-top: 1px solid var(--rule); padding-top: 20px; }
-    .notes h2 { font-size: 20px; margin: 0 0 8px; }
     .notes p, .notes ol { font-size: 15px; margin: 0 0 8px; }
     .notes li { line-height: 1.65; }
     .notes ol { padding-left: 24px; }
-    footer { border-top: 1px solid var(--rule); margin-top: 20px; padding-top: 16px; font-size: 14px; color: var(--muted); }
-    a { color: var(--link); }
-    @media (max-width: 640px) {
-      main { width: calc(100% - 32px); margin-block: 24px; }
-      .notes { grid-template-columns: 1fr; gap: 20px; }
+
+    /* Small screens get the real text, not a shrunken 1280px drawing. Hidden
+       by default; shown only when the wide diagram cannot be read. */
+    .flow-mobile { display: none; }
+    .steps { list-style: none; margin: 20px 0 28px; padding: 0; display: grid; gap: 12px; counter-reset: step; }
+    .steps > li {
+      position: relative;
+      padding: 14px 16px 14px 48px;
+      border: 1px solid var(--rule);
+      border-radius: 10px;
+      background: var(--paper);
+      font-size: 16px;
+      line-height: 1.65;
     }
+    .steps > li::before {
+      counter-increment: step;
+      content: counter(step);
+      position: absolute;
+      left: 14px;
+      top: 14px;
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      background: var(--tint);
+      color: var(--ink);
+      font-size: 12px;
+      font-weight: 700;
+      display: grid;
+      place-items: center;
+    }
+    .steps strong { display: block; font-size: 16px; margin-bottom: 4px; }
+    .step-decision { border-color: var(--accent); background: var(--tint); }
+    .branches { list-style: none; margin: 6px 0 0; padding: 0; display: grid; gap: 8px; }
+    .branches li { padding-left: 12px; border-left: 2px solid var(--rule); font-size: 15px; }
+    .branches b { font-weight: 650; }
+    .mobile-notes { border-top: 1px solid var(--rule); padding-top: 18px; margin-bottom: 18px; }
+    .mobile-notes p { font-size: 16px; }
+    .receipts { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; margin: 10px 0 14px; font-size: 16px; }
+    .receipts dt { font-weight: 650; }
+    .receipts dd { margin: 0; color: var(--muted); }
+
+    footer { border-top: 1px solid var(--rule); margin-top: 20px; padding-top: 16px; font-size: 14px; color: var(--muted); line-height: 1.7; }
+
+    @media (max-width: 1080px) {
+      :root { --gutter: 16px; }
+      main { margin-block: 24px; }
+      h1 { font-size: clamp(26px, 7vw, 34px); }
+      figure.flow-figure { display: none; }
+      .flow-mobile { display: block; }
+      .notes { grid-template-columns: 1fr; gap: 20px; }
+      .notes p, .notes ol { font-size: 16px; }
+      .notes ol { padding-left: 22px; }
+      footer { overflow-wrap: anywhere; }
+    }
+
     @media print {
+      :root {
+        color-scheme: light;
+        --paper: #fff;
+        --ink: #111;
+        --muted: #444;
+        --rule: #ccc;
+        --accent: #005bb5;
+        --link: #00478f;
+        --tint: #eef4ff;
+        --surface: #f4f4f6;
+      }
       main { width: 100%; margin: 0; }
-      svg { min-width: 0; }
-      figure { break-inside: avoid; }
+      figure.flow-figure { display: block; overflow: visible; }
+      figure.flow-figure svg { min-width: 0; }
+      .flow-mobile { display: none; }
+      figure, .notes section { break-inside: avoid; }
     }
   </style>
 </head>
@@ -63,16 +162,17 @@
     <h1>多 AI 讨论怎么推进？</h1>
     <p class="dek">模型作答、互相质疑、起草和表态。工作台负责转交材料、管理轮次，并按各席的有效表态与参与记录生成报告。</p>
   </header>
-  <figure tabindex="0" aria-label="讨论流程图，窄屏可横向滚动">
+
+  <figure class="flow-figure" tabindex="0" aria-label="讨论流程图，宽屏显示，窄屏请阅读下方的步骤列表">
     <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="discussion-flow-title discussion-flow-desc">
       <title id="discussion-flow-title">AI Arena 多 AI 讨论流程</title>
       <desc id="discussion-flow-desc">独立作答后，三席各收到另外两席的回答原文：A 看 B 和 C，B 看 A 和 C，C 看 A 和 B；各席各交一份互评，随后起草候选并按同一版本表态，需要续评时各席围绕候选和未决争点回应。</desc>
       <defs>
-        <marker id="arrow" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0 0 8 4 0 8Z" fill="#666"/></marker>
-        <marker id="arrow-accent" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0 0 8 4 0 8Z" fill="#007aff"/></marker>
-        <marker id="arrow-link" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0 0 8 4 0 8Z" fill="#005dbb"/></marker>
+        <marker id="arrow" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path class="arrow-head" d="M0 0 8 4 0 8Z"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path class="arrow-head-accent" d="M0 0 8 4 0 8Z"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path class="arrow-head-link" d="M0 0 8 4 0 8Z"/></marker>
       </defs>
-      <rect width="1280" height="720" fill="#fff"/>
+      <rect class="canvas" width="1280" height="720"/>
 
       <path class="edge" d="M540 96 V124"/>
       <path class="edge" d="M540 192 V220"/>
@@ -84,13 +184,13 @@
       <path class="edge" d="M540 584 V612"/>
 
       <g>
-        <rect x="36" y="324" width="192" height="92" rx="4" fill="#fff"/>
+        <rect class="plate" x="36" y="324" width="192" height="92" rx="4"/>
         <text class="label" x="220" y="344" text-anchor="end">还有互评轮次</text>
         <text class="sub" x="220" y="368" text-anchor="end">有反对，或票齐且有条件</text>
         <text class="sub" x="220" y="392" text-anchor="end">带着候选和争点继续互评</text>
-        <rect x="740" y="508" width="168" height="28" rx="4" fill="#fff"/>
+        <rect class="plate" x="740" y="508" width="168" height="28" rx="4"/>
         <text class="label" x="824" y="528" text-anchor="middle">满足全部一致条件</text>
-        <rect x="548" y="588" width="148" height="20" rx="4" fill="#fff"/>
+        <rect class="plate" x="548" y="588" width="148" height="20" rx="4"/>
         <text class="label" x="556" y="604">其余结束情形</text>
       </g>
 
@@ -128,23 +228,23 @@
       </g>
 
       <g>
-        <line x1="784" x2="784" y1="112" y2="464" stroke="#e5e5e5"/>
+        <line class="hairline" x1="784" x2="784" y1="112" y2="464"/>
         <text class="name" x="812" y="132">三席怎么互评？</text>
         <text class="sub" x="812" y="160">独立作答阶段结束后，工作台用同一批已保存的回答</text>
         <text class="sub" x="812" y="184">为每个已作答席位生成一份互评提示。</text>
 
         <text class="label" x="812" y="220">收件席</text>
         <text class="label" x="948" y="220">提示中的对方原文</text>
-        <line x1="812" x2="1244" y1="232" y2="232" stroke="#e5e5e5"/>
+        <line class="hairline" x1="812" x2="1244" y1="232" y2="232"/>
         <text class="label" x="812" y="256">A</text>
         <text class="sub" x="948" y="256">B 的回答 ＋ C 的回答</text>
-        <line x1="812" x2="1244" y1="268" y2="268" stroke="#e5e5e5"/>
+        <line class="hairline" x1="812" x2="1244" y1="268" y2="268"/>
         <text class="label" x="812" y="292">B</text>
         <text class="sub" x="948" y="292">A 的回答 ＋ C 的回答</text>
-        <line x1="812" x2="1244" y1="304" y2="304" stroke="#e5e5e5"/>
+        <line class="hairline" x1="812" x2="1244" y1="304" y2="304"/>
         <text class="label" x="812" y="328">C</text>
         <text class="sub" x="948" y="328">A 的回答 ＋ B 的回答</text>
-        <line x1="812" x2="1244" y1="340" y2="340" stroke="#e5e5e5"/>
+        <line class="hairline" x1="812" x2="1244" y1="340" y2="340"/>
 
         <text class="sub" x="812" y="368">每份提示也附原题和本席原文。各席各交一份互评，</text>
         <text class="sub" x="812" y="392">指出最强反例，并说明自己维持或修正了什么。</text>
@@ -152,19 +252,67 @@
         <text class="sub" x="812" y="452">各席收到当前候选及反对意见或附加条件原文，逐条回应。</text>
       </g>
 
-      <line x1="36" x2="1244" y1="688" y2="688" stroke="#e5e5e5"/>
+      <line class="hairline" x1="36" x2="1244" y1="688" y2="688"/>
       <g class="sub">
-        <rect x="40" y="696" width="24" height="12" rx="6" fill="#f5f5f7" stroke="#666"/>
+        <rect class="legend-terminal" x="40" y="696" width="24" height="12" rx="6"/>
         <text x="76" y="708">开场或结果</text>
-        <rect x="232" y="696" width="24" height="12" rx="4" fill="#fff" stroke="#262626"/>
+        <rect class="legend-step" x="232" y="696" width="24" height="12" rx="4"/>
         <text x="268" y="708">讨论步骤</text>
-        <polygon points="424,696 436,702 424,708 412,702" fill="#edf5ff" stroke="#007aff"/>
+        <polygon class="legend-focus" points="424,696 436,702 424,708 412,702"/>
         <text x="448" y="708">推进判定</text>
-        <path d="M604 704 H632" stroke="#666" stroke-dasharray="5 4"/>
+        <path class="legend-dash" d="M604 704 H632"/>
         <text x="644" y="708">下一轮互评</text>
       </g>
     </svg>
   </figure>
+
+  <section class="flow-mobile" aria-labelledby="mobile-flow-title">
+    <h2 id="mobile-flow-title">讨论步骤</h2>
+    <ol class="steps">
+      <li>
+        <strong>提交问题并选席</strong>
+        <span>从 ChatGPT、Gemini、DeepSeek 选 2–3 席。</span>
+      </li>
+      <li>
+        <strong>各席独立作答</strong>
+        <span>分别收到同一题面，此时彼此的答案不可见。</span>
+      </li>
+      <li>
+        <strong>交叉互评</strong>
+        <span>首轮评各席原文，后续轮回应未决争点。</span>
+      </li>
+      <li>
+        <strong>一席起草或修订候选</strong>
+        <span>保留条件、争点与出处；修订后生成新版本。</span>
+      </li>
+      <li>
+        <strong>各席对同一候选表态</strong>
+        <span>明确同意、有条件同意或反对，并给理由。</span>
+      </li>
+      <li class="step-decision">
+        <strong>继续还是结束？</strong>
+        <ul class="branches">
+          <li><b>还有互评轮次</b>：有反对，或票齐且有条件，带着候选和争点继续互评，回到「交叉互评」。</li>
+          <li><b>满足全部一致条件</b>：全体一致报告，保留最终版本、逐席表态和出处。</li>
+          <li><b>其余结束情形</b>：按当前结果出报告，包括有条件一致、未决分歧、部分完成或草稿。</li>
+        </ul>
+      </li>
+    </ol>
+
+    <div class="mobile-notes">
+      <h2>三席怎么互评？</h2>
+      <p>独立作答阶段结束后，工作台用同一批已保存的回答，为每个已作答席位生成一份互评提示。</p>
+      <dl class="receipts">
+        <dt>A</dt><dd>B 的回答 ＋ C 的回答</dd>
+        <dt>B</dt><dd>A 的回答 ＋ C 的回答</dd>
+        <dt>C</dt><dd>A 的回答 ＋ B 的回答</dd>
+      </dl>
+      <p>每份提示也附原题和本席原文。各席各交一份互评，指出最强反例，并说明自己维持或修正了什么。</p>
+      <p><b>续评改看候选和未决争点</b>　各席收到当前候选及反对意见或附加条件原文，逐条回应。</p>
+    </div>
+
+  </section>
+
   <div class="notes">
     <section aria-labelledby="agreement">
       <h2 id="agreement">什么情况下算全体一致？</h2>
