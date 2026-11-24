@@ -711,6 +711,27 @@ final class ArenaModel: ObservableObject {
 
     // MARK: - User conditions during a discussion
 
+    /// Unsaved condition text typed into the editor. It lives only in this
+    /// process, is keyed by the pinned session/stage/round, is never written to
+    /// the session file or the shared engine, and never triggers a dispatch.
+    /// Deliberately not published: only the editor reads it, so a keystroke
+    /// cannot invalidate the whole workbench.
+    private var guidanceDrafts = ArenaGuidanceDraftParking()
+
+    /// The editor's text for one pinned phase. The returned binding addresses
+    /// exactly one target, so a stale editor for another session, stage or
+    /// round can only ever write its own slot and can never overwrite the draft
+    /// currently on screen. Reads and writes stay in memory.
+    func guidanceDraftBinding(for target: ArenaGuidanceTarget) -> Binding<String> {
+        Binding(
+            get: { [weak self] in self?.guidanceDrafts.text(for: target) ?? "" },
+            set: { [weak self] text in self?.guidanceDrafts.set(text, for: target) }
+        )
+    }
+
+    func hasGuidanceDraft(for target: ArenaGuidanceTarget) -> Bool {        guidanceDrafts.hasDraft(for: target)
+    }
+
     /// Only a live, eligible independent/critique phase exposes the affordance.
     var guidanceAvailability: ArenaGuidanceAvailability {
         ArenaGuidanceRules.availability(
@@ -750,6 +771,9 @@ final class ArenaModel: ObservableObject {
             errorMessage = readOnlyGuidanceMessage
             return nil
         }
+        // Reopening this exact round restores its unsaved draft; any draft from
+        // another session, stage or round is dropped instead of carried over.
+        guidanceDrafts.keepOnly(target)
         guard !isPaused else {
             return ArenaGuidanceOpening(target: target, ownedPause: false)
         }
@@ -767,13 +791,33 @@ final class ArenaModel: ObservableObject {
 
     /// Undo the pause that the condition composer applied for this pinned
     /// phase. A pause the user made before opening the composer never sets
-    /// `ownedPause`, a manual「继续」already cleared the pause, and a moved
-    /// stage/round/session makes this a no-op. Nothing is dispatched or re-sent.
+    /// `ownedPause`, a manual「继续」already cleared the pause, a moved
+    /// stage/round/session makes this a no-op, and an unsaved draft for this
+    /// same round keeps the pause so reopening restores the text instead of
+    /// silently re-arming dispatch. Nothing is dispatched or re-sent.
     @discardableResult
     func resumePauseOwnedByGuidance(_ target: ArenaGuidanceTarget) -> Bool {
         guard isPaused, !isReadOnly, stageKey != "done" else { return false }
+        guard !guidanceDrafts.hasDraft(for: target) else { return false }
         guard guidancePhaseMatches(target) else { return false }
         return setPaused(false)
+    }
+
+    /// The single close path for every way the editor can end (the「关闭」
+    /// button, Escape or the system dismiss gesture). Only an editor that
+    /// paused the discussion itself, that saved nothing and that holds no draft
+    /// may undo that pause.
+    @discardableResult
+    func finishGuidance(_ opening: ArenaGuidanceOpening?, saved: Bool) -> Bool {
+        guard let opening,
+              ArenaGuidanceClosePolicy.undoesOwnedPause(
+                ownedPause: opening.ownedPause,
+                saved: saved,
+                hasDraft: guidanceDrafts.hasDraft(for: opening.target)
+              ) else {
+            return false
+        }
+        return resumePauseOwnedByGuidance(opening.target)
     }
 
     /// `true` when the pinned phase is still the live, paused, same session /
@@ -792,7 +836,8 @@ final class ArenaModel: ObservableObject {
     /// Record one condition. Refuses unless the discussion is still the pinned
     /// live session, the same stage/round and paused. The session is written
     /// atomically; a durable-save failure rolls the in-memory session back so
-    /// the composer can keep the draft and retry.
+    /// the composer can keep the draft and retry. Only a committed save clears
+    /// this round's parked draft; every rejection keeps it.
     func saveGuidance(_ text: String, target: ArenaGuidanceTarget) -> ArenaGuidanceSaveOutcome {
         guard let previous = session else {
             return .rejected("没有正在进行的讨论")
@@ -853,6 +898,7 @@ final class ArenaModel: ObservableObject {
             refreshStage()
             return .rejected("条件未写入本地记录，已撤销；草稿已保留。")
         }
+        guidanceDrafts.clear(target)
         return .saved(note)
     }
 
@@ -1404,6 +1450,9 @@ final class ArenaModel: ObservableObject {
         historyResumeID = nil
         stageKey = ""
         stageLabel = "尚未开始"
+        // Nothing typed into the previous discussion's condition editor may
+        // survive into a fresh composer.
+        guidanceDrafts.removeAll()
         completionTracker.reset()
         engine.store.setCurrent(nil)
         refreshHistoryList()

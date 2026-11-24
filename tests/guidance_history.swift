@@ -809,7 +809,49 @@ struct GuidanceHistoryCheck {
             !ArenaBallotProjection.containsProposal(version: 0, in: history)
         )
 
+        // --- 6. Unsaved condition drafts stay in process by pinned phase ---
+        let t1 = ArenaGuidanceTarget(sessionID: "s1", stage: "independent", round: 1)
+        let t2 = ArenaGuidanceTarget(sessionID: "s1", stage: "critique", round: 1)
+        let t3 = ArenaGuidanceTarget(sessionID: "s2", stage: "independent", round: 1)
+        var parking = ArenaGuidanceDraftParking()
+        check("a fresh workbench parks nothing", parking.isEmpty && parking.text(for: t1).isEmpty)
+        parking.set("预算最多两周", for: t1)
+        check("closing and reopening the same round restores the text",
+              parking.text(for: t1) == "预算最多两周")
+        check("a non-blank draft counts as kept", parking.hasDraft(for: t1))
+        parking.set("另一个阶段的草稿", for: t2)
+        check("a different stage keeps its own text",
+              parking.text(for: t1) == "预算最多两周" && parking.text(for: t2) == "另一个阶段的草稿")
+        parking.set("别的场次", for: t3)
+        check("a different session keeps its own text",
+              parking.text(for: t1) == "预算最多两周" && parking.text(for: t3) == "别的场次")
+        check("blank text never resurrects an empty slot",
+              parking.text(for: ArenaGuidanceTarget(sessionID: "s9", stage: "critique", round: 2)).isEmpty)
+        parking.keepOnly(t2)
+        check("opening one round drops drafts from every other target",
+              parking.text(for: t2) == "另一个阶段的草稿"
+                && parking.text(for: t1).isEmpty
+                && parking.text(for: t3).isEmpty)
+        parking.set("   \n ", for: t2)
+        check("a whitespace-only draft is not worth restoring", !parking.hasDraft(for: t2))
+        parking.set("保存后要清空", for: t2)
+        parking.clear(t2)
+        check("a committed save clears the draft", parking.text(for: t2).isEmpty && parking.isEmpty)
+        parking.set("拒绝保存要保留", for: t2)
+        check("a rejected save keeps the draft", parking.text(for: t2) == "拒绝保存要保留")
+        parking.removeAll()
+        check("a fresh discussion clears every parked draft", parking.isEmpty)
+
+        // --- 6b. What closing the editor does to the pause it applied ------
+        check("cancelled with an empty draft undoes the pause it applied",
+              ArenaGuidanceClosePolicy.undoesOwnedPause(ownedPause: true, saved: false, hasDraft: false))
+        check("an unsaved draft keeps the pause so it can be reopened",
+              !ArenaGuidanceClosePolicy.undoesOwnedPause(ownedPause: true, saved: false, hasDraft: true))
+        check("a saved condition keeps the pause",
+              !ArenaGuidanceClosePolicy.undoesOwnedPause(ownedPause: true, saved: true, hasDraft: false))
+        check("a pause the user made is never undone",
+              !ArenaGuidanceClosePolicy.undoesOwnedPause(ownedPause: false, saved: false, hasDraft: false))
+
         print(failures == 0 ? "all guidance/history checks passed" : "\(failures) check(s) failed")
-        exit(failures == 0 ? 0 : 1)
-    }
+        exit(failures == 0 ? 0 : 1)    }
 }

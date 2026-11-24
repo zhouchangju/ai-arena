@@ -85,6 +85,68 @@ enum ArenaGuidanceSaveOutcome: Equatable {
     case rejected(String)
 }
 
+/// Unsaved condition drafts lived only by this running workbench.
+///
+/// Each draft is keyed by the exact session / stage / round pinned when the
+/// editor opened, so closing and reopening the same round restores the text,
+/// while another discussion, stage or round can never inherit it. Nothing here
+/// is written to the session file or to the shared engine, and parking a draft
+/// never resumes dispatch: the condition still reaches the discussion only
+/// through `saveGuidance`.
+struct ArenaGuidanceDraftParking: Equatable {
+    private(set) var drafts: [String: String] = [:]
+
+    func text(for target: ArenaGuidanceTarget) -> String {
+        drafts[target.id] ?? ""
+    }
+
+    /// A blank (or whitespace-only) draft is not worth restoring, and only a
+    /// blank draft lets a cancelled editor undo the pause it applied.
+    func hasDraft(for target: ArenaGuidanceTarget) -> Bool {
+        !text(for: target).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    mutating func set(_ text: String, for target: ArenaGuidanceTarget) {
+        if text.isEmpty {
+            drafts.removeValue(forKey: target.id)
+        } else {
+            drafts[target.id] = text
+        }
+    }
+
+    /// Only a successful save clears the text. A rejected save keeps it.
+    mutating func clear(_ target: ArenaGuidanceTarget) {
+        drafts.removeValue(forKey: target.id)
+    }
+
+    /// Keep only the live phase's draft. Called when an editor opens (and when
+    /// a fresh discussion starts) so text typed into a different round or
+    /// session cannot surface under the current one.
+    mutating func keepOnly(_ target: ArenaGuidanceTarget) {
+        drafts = drafts.filter { $0.key == target.id }
+    }
+
+    mutating func removeAll() {
+        drafts.removeAll()
+    }
+
+    var isEmpty: Bool { drafts.isEmpty }
+}
+
+/// What closing the editor without saving does to the pause this workbench
+/// applied when it opened. Kept out of the view so the rule is checkable:
+///
+/// * a saved condition always keeps the pause (0.7 behaviour);
+/// * a draft typed into this same round also keeps the pause, so reopening
+///   restores it and the next dispatch is not silently re-armed;
+/// * only an editor cancelled with an empty draft undoes the pause it applied
+///   itself. A pause the user made before opening is never undone.
+enum ArenaGuidanceClosePolicy {
+    static func undoesOwnedPause(ownedPause: Bool, saved: Bool, hasDraft: Bool) -> Bool {
+        ownedPause && !saved && !hasDraft
+    }
+}
+
 enum ArenaGuidanceRules {
     /// Mirrors `GUIDANCE_INPUT_STAGES` in `shared/core.js`.
     static let eligibleStages: Set<String> = ["independent", "critique"]

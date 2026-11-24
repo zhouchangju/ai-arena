@@ -24,6 +24,18 @@ struct ArenaReportReader: View {
     @State private var snapshotCache: [Int: ArenaSnapshotCacheEntry] = [:]
     @State private var changePulse = false
     @State private var pulseSequence = 0
+    /// Keyboard focus for the discrete controls that open a saved original.
+    /// Returning from the source hands focus back to the control that asked.
+    @FocusState private var entryFocus: String?
+    /// The token of the control that opened the current source; `nil` when the
+    /// jump came from something without its own focusable row (an inline
+    /// citation or the evaluation section).
+    @State private var focusReturnToken: String?
+    /// Monotonic request for the AppKit-backed drafting button. It starts at 0
+    /// and only increments when a source opened from it (or from the excerpt
+    /// that falls back to it) returns, so ordinary refreshes never steal focus.
+    @State private var candidateAuthorFocusRequest = 0
+    private static let candidateAuthorIdentifier = "candidate-author"
 
     private var rows: [ArenaTaskRow] { ArenaSessionDigest.rows(session) }
     private var participants: [String] { ArenaSessionDigest.participants(session) }
@@ -65,7 +77,10 @@ struct ArenaReportReader: View {
             GeometryReader { viewport in
                 reportPage(compact: viewport.size.width < 620 || viewport.size.height < 430)
                     .accessibilityHidden(selectedSource != nil)
-                    .allowsHitTesting(selectedSource == nil)
+                    // Disabled, not just hit-test transparent: the report stays
+                    // mounted, but nothing in it can keep keyboard focus or
+                    // take a click while a saved original is open.
+                    .disabled(selectedSource != nil)
             }
             if let row = selectedSource {
                 sourceReader(row)
@@ -75,6 +90,37 @@ struct ArenaReportReader: View {
             }
         }
         .background(Color(nsColor: .textBackgroundColor))
+    }
+
+    /// Open one saved original and remember which row asked for it. The report
+    /// stays mounted underneath, so its scroll position, disclosures and
+    /// version comparison are untouched; only keyboard focus moves, to the
+    /// source's own「返回」control.
+    private func openSource(_ row: ArenaTaskRow, from token: String?) {
+        focusReturnToken = token
+        selectedSource = row
+    }
+
+    private func openSource(matching sourceID: String, from token: String?) {
+        guard let row = currentSources.first(where: { $0.sourceId == sourceID }) else { return }
+        openSource(row, from: token)
+    }
+
+    /// Return to the mounted report and put focus back on the row that opened
+    /// the source, once that row is interactive again. A jump that had no
+    /// discrete row leaves focus alone rather than guessing at a neighbour.
+    private func closeSource() {
+        let token = focusReturnToken
+        focusReturnToken = nil
+        selectedSource = nil
+        guard let token else { return }
+        if token == Self.candidateAuthorIdentifier {
+            // SwiftUI focus on a macOS sheet/window here lands on the window,
+            // so this entry asks its real AppKit button for first responder.
+            candidateAuthorFocusRequest &+= 1
+        } else {
+            DispatchQueue.main.async { entryFocus = token }
+        }
     }
 
     private func reportPage(compact: Bool) -> some View {
@@ -110,13 +156,21 @@ struct ArenaReportReader: View {
                                 .id("candidate-comparison")
                         }
                         if let answer = proposal?.answer {
-                            ReportDisclosure(isExpanded: $showCandidate) {
+                            ReportDisclosure(
+                                isExpanded: $showCandidate,
+                                focusToken: "candidate-full",
+                                focus: $entryFocus
+                            ) {
                                 Text("候选全文")
                             } content: {
-                                markdown(answer).padding(.top, 12)
+                                markdown(answer, from: "candidate-full").padding(.top, 12)
                             }
                         }
-                        ReportDisclosure(isExpanded: $showSources) {
+                        ReportDisclosure(
+                            isExpanded: $showSources,
+                            focusToken: "sources",
+                            focus: $entryFocus
+                        ) {
                             Label("发言与出处（\(currentSources.count)）", systemImage: "books.vertical")
                         } content: {
                             sourceList
@@ -125,14 +179,20 @@ struct ArenaReportReader: View {
                     if session?["stage"] as? String == "done",
                        let id = ArenaSessionDigest.id(session), ArenaSessionDigest.evaluationCandidates(session).count >= 2 {
                         ArenaEvaluationSection(sessionID: id, chatGPTParticipated: participants.contains("chatgpt"), model: model) { source in
-                            selectedSource = currentSources.first { $0.sourceId == source }
+                            // The section owns its own controls; this jump has no
+                            // row of ours to hand focus back to.
+                            openSource(matching: source, from: nil)
                         }
                     }
                     if let original = ArenaSessionDigest.report(session) {
-                        ReportDisclosure(isExpanded: $showArchive) {
+                        ReportDisclosure(
+                            isExpanded: $showArchive,
+                            focusToken: "archive",
+                            focus: $entryFocus
+                        ) {
                             Label("完整报告", systemImage: "doc.richtext")
                         } content: {
-                            fullReport(original).padding(.top, 12)
+                            fullReport(original, from: "archive").padding(.top, 12)
                         }
                     }
                 }
@@ -186,12 +246,20 @@ struct ArenaReportReader: View {
                     .font(.title3.weight(.semibold))
                     .accessibilityAddTraits(.isHeader)
                 Spacer()
-                Button { selectedSource = author } label: {
-                    Text("\(ArenaSeatCatalog.name(author.provider)) 起草 · \(author.sourceId)")
+                // The drafting link is the section's own source entry, including
+                // for inline citations in the excerpt below. It is a real
+                // AppKit-backed button so keyboard focus can return to it after
+                // the saved original closes (SwiftUI FocusState alone leaves
+                // first responder on the window here).
+                ArenaSourceButton(
+                    title: "\(ArenaSeatCatalog.name(author.provider)) 起草 · \(author.sourceId)",
+                    identifier: Self.candidateAuthorIdentifier,
+                    focusRequest: candidateAuthorFocusRequest
+                ) {
+                    openSource(author, from: Self.candidateAuthorIdentifier)
                 }
-                .buttonStyle(.link)
             }
-            markdown(ArenaCandidateLead.excerpt(answer)).lineLimit(compact ? 4 : 9)
+            markdown(ArenaCandidateLead.excerpt(answer), from: Self.candidateAuthorIdentifier).lineLimit(compact ? 4 : 9)
         }
         .padding(.vertical, compact ? 8 : 12)
         .padding(.horizontal, compact ? 12 : 16)
@@ -209,7 +277,7 @@ struct ArenaReportReader: View {
                         rows.first { $0.id == ArenaValue.string(vote["id"]) }
                     }
                     Button {
-                        if let source { selectedSource = source }
+                        if let source { openSource(source, from: "position-\(provider)") }
                     } label: {
                         let label = Label {
                             Text(ArenaSeatCatalog.name(provider)).fontWeight(.medium)
@@ -239,16 +307,20 @@ struct ArenaReportReader: View {
                     .buttonStyle(ArenaPressStyle())
                     .disabled(source == nil)
                     .accessibilityHint(source == nil ? "没有可打开的保存原文" : "打开保存原文")
+                    .reportFocusEntry("position-\(provider)", in: $entryFocus)
                 }
             }
             ForEach(Array(concerns.enumerated()), id: \.offset) { _, vote in
                 let id = ArenaValue.string(vote["id"]) ?? ""
                 if let row = rows.first(where: { $0.id == id }), let answer = row.answer {
-                    ReportSelfDisclosure {
+                    ReportSelfDisclosure(
+                        focusToken: "concern-body-\(row.id)",
+                        focus: $entryFocus
+                    ) {
                         Text("\(ArenaSeatCatalog.name(row.provider)) · \(Self.stance(ArenaValue.string(vote["stance"])))原文")
                             .font(.system(size: 13))
                     } content: {
-                        markdown(answer).padding(.top, 8)
+                        markdown(answer, from: "concern-body-\(row.id)").padding(.top, 8)
                     }
                 }
             }
@@ -287,6 +359,7 @@ struct ArenaReportReader: View {
             .buttonStyle(ArenaPressStyle())
             .accessibilityValue(showComparison ? "已展开" : "已收起")
             .accessibilityHint(showComparison ? "收起版本对比" : "展开版本对比")
+            .reportFocusEntry("comparison", in: $entryFocus)
             if showComparison {
                 VStack(alignment: .leading, spacing: compact ? 12 : 16) {
                     versionSelectors(compact: compact)
@@ -525,7 +598,11 @@ struct ArenaReportReader: View {
         newer: ArenaCandidateVersion,
         concerns: [ArenaCandidateVote]
     ) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+        // One token prefix for this exact version pair: the same S9 can be
+        // quoted by several changed paragraphs and by both panels, so every
+        // focus token also carries the change id and the source id.
+        let pairToken = "v\(older.version)-v\(newer.version)"
+        return VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text("段落变化").font(.subheadline.weight(.semibold))
                 Spacer(minLength: 4)
@@ -539,7 +616,7 @@ struct ArenaReportReader: View {
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(comparisonChanges) { change in
-                    comparisonChangeRow(change, concerns: concerns)
+                    comparisonChangeRow(change, scope: pairToken, concerns: concerns)
                 }
             }
             if comparisonTruncated {
@@ -554,6 +631,7 @@ struct ArenaReportReader: View {
     @ViewBuilder
     private func comparisonChangeRow(
         _ change: ArenaParagraphChange,
+        scope: String,
         concerns: [ArenaCandidateVote]
     ) -> some View {
         switch change.kind {
@@ -570,13 +648,13 @@ struct ArenaReportReader: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.vertical, 2)
         case .unchanged:
-            markdown(change.newText ?? "")
+            markdown(change.newText ?? "", from: "comparison")
                 .lineLimit(6)
                 .opacity(0.72)
         case .changed:
             VStack(alignment: .leading, spacing: 6) {
                 changeTag("修改", color: .accentColor)
-                markdown(change.newText ?? "")
+                markdown(change.newText ?? "", from: "comparison")
                 if let old = change.oldText {
                     ReportSelfDisclosure {
                         Text("旧版这一段").font(.caption)
@@ -588,7 +666,7 @@ struct ArenaReportReader: View {
                             .padding(.top, 4)
                     }
                 }
-                comparisonCitations(change.newCitations, concerns: concerns)
+                comparisonCitations(change.newCitations, scope: scope, change: change.id, concerns: concerns)
             }
             .padding(10)
             .background(
@@ -598,8 +676,8 @@ struct ArenaReportReader: View {
         case .added:
             VStack(alignment: .leading, spacing: 6) {
                 changeTag("新增", color: .green)
-                markdown(change.newText ?? "")
-                comparisonCitations(change.newCitations, concerns: concerns)
+                markdown(change.newText ?? "", from: "comparison")
+                comparisonCitations(change.newCitations, scope: scope, change: change.id, concerns: concerns)
             }
             .padding(10)
             .background(
@@ -632,6 +710,8 @@ struct ArenaReportReader: View {
     @ViewBuilder
     private func comparisonCitations(
         _ identifiers: [String],
+        scope: String,
+        change: Int,
         concerns: [ArenaCandidateVote]
     ) -> some View {
         if !identifiers.isEmpty {
@@ -641,8 +721,9 @@ struct ArenaReportReader: View {
                     .foregroundStyle(.secondary)
                 ForEach(identifiers, id: \.self) { identifier in
                     if let row = candidateSource(identifier) {
+                        let token = "\(scope)-c\(change)-\(identifier)"
                         Button {
-                            selectedSource = row
+                            openSource(row, from: token)
                         } label: {
                             HStack(spacing: 4) {
                                 Text(citationTitle(identifier, row: row, concerns: concerns))
@@ -654,6 +735,7 @@ struct ArenaReportReader: View {
                         }
                         .buttonStyle(.link)
                         .accessibilityLabel("打开 \(identifier) 的保存原文")
+                        .reportFocusEntry(token, in: $entryFocus)
                     } else {
                         Text("\(identifier) · 未找到保存原文")
                             .font(.caption)
@@ -691,8 +773,9 @@ struct ArenaReportReader: View {
             } else {
                 ForEach(concerns) { concern in
                     let source = candidateSource(concern.sourceID)
+                    let token = "concern-\(concern.version)-\(concern.provider)-\(concern.sourceID)"
                     Button {
-                        if let source { selectedSource = source }
+                        if let source { openSource(source, from: token) }
                     } label: {
                         HStack(spacing: 6) {
                             Circle()
@@ -721,6 +804,7 @@ struct ArenaReportReader: View {
                     }
                     .buttonStyle(ArenaPressStyle())
                     .disabled(source == nil)
+                    .reportFocusEntry(token, in: $entryFocus)
                 }
             }
         }
@@ -766,10 +850,10 @@ struct ArenaReportReader: View {
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(snapshot.votes) { vote in
-                    versionVoteRow(vote)
+                    versionVoteRow(vote, version: snapshot.version)
                 }
                 ForEach(snapshot.gaps) { gap in
-                    versionGapRow(gap)
+                    versionGapRow(gap, version: snapshot.version)
                 }
             }
         }
@@ -778,10 +862,11 @@ struct ArenaReportReader: View {
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.035)))
     }
 
-    private func versionVoteRow(_ vote: ArenaCandidateVote) -> some View {
+    private func versionVoteRow(_ vote: ArenaCandidateVote, version: Int) -> some View {
         let source = candidateSource(vote.sourceID)
+        let token = "ballot-\(version)-\(vote.provider)"
         return Button {
-            if let source { selectedSource = source }
+            if let source { openSource(source, from: token) }
         } label: {
             HStack(spacing: 7) {
                 Circle()
@@ -810,12 +895,14 @@ struct ArenaReportReader: View {
         .buttonStyle(ArenaPressStyle())
         .disabled(source == nil)
         .help("打开 \(vote.sourceID) 的保存原文")
+        .reportFocusEntry(token, in: $entryFocus)
     }
 
-    private func versionGapRow(_ gap: ArenaCandidateVoteGap) -> some View {
+    private func versionGapRow(_ gap: ArenaCandidateVoteGap, version: Int) -> some View {
         let source = gap.sourceID.flatMap { candidateSource($0) }
+        let token = "gap-\(version)-\(gap.provider)-\(gap.sourceID ?? "none")"
         return Button {
-            if let source { selectedSource = source }
+            if let source { openSource(source, from: token) }
         } label: {
             HStack(spacing: 7) {
                 Circle()
@@ -840,6 +927,7 @@ struct ArenaReportReader: View {
         }
         .buttonStyle(ArenaPressStyle())
         .disabled(source == nil)
+        .reportFocusEntry(token, in: $entryFocus)
     }
 
     private func candidateSource(_ identifier: String) -> ArenaTaskRow? {
@@ -850,7 +938,8 @@ struct ArenaReportReader: View {
     private var sourceList: some View {
         VStack(alignment: .leading, spacing: 2) {
             ForEach(currentSources) { row in
-                Button { selectedSource = row } label: {
+                let token = "source-\(row.id)"
+                Button { openSource(row, from: token) } label: {
                     HStack {
                         Text(row.sourceId).monospacedDigit().foregroundStyle(.secondary).frame(width: 44, alignment: .leading)
                         Text(ArenaSeatCatalog.name(row.provider))
@@ -862,6 +951,7 @@ struct ArenaReportReader: View {
                 }
                 .buttonStyle(ArenaPressStyle())
                 .accessibilityHint("打开 \(row.sourceId) 的保存原文")
+                .reportFocusEntry("source-\(row.id)", in: $entryFocus)
             }
         }.padding(.top, 8)
     }
@@ -897,32 +987,34 @@ struct ArenaReportReader: View {
 
     private func sourceReader(_ row: ArenaTaskRow) -> some View {
         ArenaSourceReader(row: row, session: session, returnLabel: "返回报告") {
-            selectedSource = nil
+            closeSource()
         }
     }
 
-    private func markdown(_ text: String) -> some View {
+    /// Markdown bodies render citations as text links, so the jump has no
+    /// character-level focus of its own. `from` names the section's own
+    /// operable button (its disclosure header or drafting link); returning puts
+    /// focus there instead of guessing a neighbour.
+    private func markdown(_ text: String, from token: String? = nil) -> some View {
         ArenaMarkdownView(text: text, onSource: { ref in
-            if let row = currentSources.first(where: { $0.sourceId == ref }) { selectedSource = row }
+            openSource(matching: ref, from: token)
         }, sources: Set(currentSources.map(\.sourceId)))
     }
 
     /// 完整报告正文。超长报告换成单篇可选富文本，一次排版完再显示；普通材料
     /// 继续用原有逐块排版。两条路径的出处跳转都落到同一份保存原文。
-    @ViewBuilder private func fullReport(_ text: String) -> some View {
+    @ViewBuilder private func fullReport(_ text: String, from token: String?) -> some View {
         if ArenaReportSurfacePolicy.prefersTextSurface(for: text) {
             // 挂到下一次主循环再创建正文，AXPress 不会卡在整篇排版里超时。
             ArenaDeferredReportSurface(
                 text: text,
                 onSource: { ref in
-                    if let row = currentSources.first(where: { $0.sourceId == ref }) {
-                        selectedSource = row
-                    }
+                    openSource(matching: ref, from: token)
                 },
                 sources: Set(currentSources.map(\.sourceId))
             )
         } else {
-            markdown(text)
+            markdown(text, from: token)
         }
     }
 
@@ -941,15 +1033,24 @@ struct ArenaReportReader: View {
     /// while expanded, exactly like the original 完整报告 row.
     private struct ReportDisclosure<RowLabel: View, Content: View>: View {
         @Binding var isExpanded: Bool
+        /// Optional entry token for the report's focus state. It must land on
+        /// the header button itself, because that is the control a return
+        /// hands keyboard focus back to.
+        var focusToken: String? = nil
+        var focus: FocusState<String?>.Binding? = nil
         private let label: () -> RowLabel
         private let content: () -> Content
 
         init(
             isExpanded: Binding<Bool>,
+            focusToken: String? = nil,
+            focus: FocusState<String?>.Binding? = nil,
             @ViewBuilder label: @escaping () -> RowLabel,
             @ViewBuilder content: @escaping () -> Content
         ) {
             self._isExpanded = isExpanded
+            self.focusToken = focusToken
+            self.focus = focus
             self.label = label
             self.content = content
         }
@@ -969,6 +1070,7 @@ struct ArenaReportReader: View {
                 .buttonStyle(ArenaPressStyle())
                 .accessibilityValue(isExpanded ? "已展开" : "已收起")
                 .accessibilityHint(isExpanded ? "收起内容" : "展开内容")
+                .modifier(ArenaReportFocusEntry(token: focusToken, focus: focus))
                 if isExpanded { content() }
             }
         }
@@ -979,19 +1081,31 @@ struct ArenaReportReader: View {
     /// feedback, same accessibility state as `ReportDisclosure`.
     private struct ReportSelfDisclosure<RowLabel: View, Content: View>: View {
         @State private var isExpanded = false
+        var focusToken: String? = nil
+        var focus: FocusState<String?>.Binding? = nil
         private let label: () -> RowLabel
         private let content: () -> Content
 
         init(
+            focusToken: String? = nil,
+            focus: FocusState<String?>.Binding? = nil,
             @ViewBuilder label: @escaping () -> RowLabel,
             @ViewBuilder content: @escaping () -> Content
         ) {
+            self.focusToken = focusToken
+            self.focus = focus
             self.label = label
             self.content = content
         }
 
         var body: some View {
-            ReportDisclosure(isExpanded: $isExpanded, label: label, content: content)
+            ReportDisclosure(
+                isExpanded: $isExpanded,
+                focusToken: focusToken,
+                focus: focus,
+                label: label,
+                content: content
+            )
         }
     }
 }
@@ -1017,6 +1131,9 @@ struct ArenaSourceReader: View {
     let session: [String: Any]?
     let returnLabel: String
     let onReturn: () -> Void
+    /// Opening a saved original disables the report underneath, so keyboard
+    /// focus starts on this「返回」control and never stays on an inert row.
+    @FocusState private var returnFocused: Bool
 
     var body: some View {
         ScrollView {
@@ -1030,7 +1147,8 @@ struct ArenaSourceReader: View {
                 .buttonStyle(.link)
                 .keyboardShortcut(.cancelAction)
                 .help("\(returnLabel)（Esc）")
-                .accessibilityHint("返回后保留原来的阅读位置")
+                .accessibilityHint("返回后保留原来的阅读位置，焦点回到打开它的条目")
+                .focused($returnFocused)
                 Text("\(ArenaSeatCatalog.name(row.provider)) · \(ArenaStageNames.label(row.stage))")
                     .font(.title.weight(.semibold))
                 Text([ArenaStageNames.taskLabel(row.stage, round: row.round, session: session), row.sourceId]
@@ -1043,7 +1161,32 @@ struct ArenaSourceReader: View {
             .padding(24)
             .frame(maxWidth: .infinity)
         }
+        .onAppear { returnFocused = true }
         .id(row.id)
+    }
+}
+
+/// Applies the report's one focus state to a discrete entry control, so
+/// returning from a saved original can put keyboard focus back on the row that
+/// opened it. A view without a token is left untouched rather than being turned
+/// into a focus stop of its own; real buttons already take keyboard focus.
+fileprivate struct ArenaReportFocusEntry: ViewModifier {
+    let token: String?
+    let focus: FocusState<String?>.Binding?
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if let token, let focus {
+            content.focused(focus, equals: token)
+        } else {
+            content
+        }
+    }
+}
+
+fileprivate extension View {
+    func reportFocusEntry(_ token: String?, in focus: FocusState<String?>.Binding) -> some View {
+        modifier(ArenaReportFocusEntry(token: token, focus: focus))
     }
 }
 /// Extracts the actual opening answer for the compact reading view. Subsequent

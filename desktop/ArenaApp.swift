@@ -432,12 +432,25 @@ struct ArenaRootView: View {
     @State private var showsOpeningOptions = false
     @State private var showsHistorySearch = false
     @State private var pendingHistoryAction: HistoryAction?
+    /// The real AppKit history trigger. Only a pure close of the history panel
+    /// asks its visible instance to become the window's first responder.
+    @StateObject private var historyButtonHost = ArenaHistoryButtonHost()
+    /// One scroll-only reveal for a narrow three-column layout. A click only
+    /// asks the existing ScrollViewReader to bring that seat into view; it
+    /// never switches mode, resumes dispatch or moves keyboard focus.
+    @State private var seatLocate: SeatLocateRequest?
+    @State private var seatLocateCounter = 0
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private enum HistoryAction {
         case view(String)
         case resume(String)
+    }
+
+    private struct SeatLocateRequest: Equatable {
+        let id: Int
+        let provider: String
     }
 
     var body: some View {
@@ -544,6 +557,7 @@ struct ArenaRootView: View {
             ArenaGuidanceComposer(
                 model: model,
                 target: target,
+                draft: model.guidanceDraftBinding(for: target),
                 ownedPause: guidanceOpening?.ownedPause ?? false,
                 onSaved: { guidanceDidSave = true },
                 onClose: { guidanceTarget = nil }
@@ -604,14 +618,13 @@ struct ArenaRootView: View {
     private func headerActions(compact: Bool) -> some View {
         HStack(spacing: 8) {
             if compact {
-                iconToolButton("打开历史面板（⌘⇧F）", icon: "clock.arrow.circlepath") {
+                ArenaHistoryToolbarButton(compact: true, host: historyButtonHost) {
                     showsHistorySearch = true
                 }
             } else {
-                toolButton("历史", icon: "clock.arrow.circlepath") {
+                ArenaHistoryToolbarButton(compact: false, host: historyButtonHost) {
                     showsHistorySearch = true
                 }
-                .help("打开历史面板（⌘⇧F）")
             }
             if hasStarted {
                 if compact {
@@ -1240,15 +1253,87 @@ struct ArenaRootView: View {
         let ideal = available / CGFloat(count)
         let minimumColumn: CGFloat = providers.count >= 3 ? 320 : 240
         let column = max(ideal, minimumColumn)
-        return ScrollView(.horizontal) {
-            HStack(spacing: gap) {
-                ForEach(providers, id: \.self) { provider in
-                    seatCard(provider)
-                        .frame(width: column, height: max(size.height, 1))
+        // The locate strip exists only for the real narrow case: three columns
+        // that cannot fit, and a seat that actually needs a person. It sits
+        // outside the horizontal scroll, so it stays visible at any offset.
+        let attention = providers.count >= 3 && ideal < minimumColumn
+            ? seatsNeedingLocation(providers)
+            : []
+        let strip: CGFloat = attention.isEmpty ? 0 : 30
+        return VStack(alignment: .leading, spacing: 0) {
+            if !attention.isEmpty {
+                seatLocateStrip(attention)
+                    .padding(.bottom, 6)
+            }
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal) {
+                    HStack(spacing: gap) {
+                        ForEach(providers, id: \.self) { provider in
+                            seatCard(provider)
+                                .frame(width: column, height: max(size.height - strip, 1))
+                                .id(provider)
+                        }
+                    }
+                }
+                .onChange(of: seatLocate) { request in
+                    guard let request, providers.contains(request.provider) else { return }
+                    // Scroll only. No mode change, focus change or dispatch.
+                    withAnimation(ArenaMotion.change(reduceMotion)) {
+                        proxy.scrollTo(request.provider, anchor: .center)
+                    }
                 }
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    /// Seats that really need a person at their page. Derived only from the
+    /// structured live seat state: a merely busy, paused, finished or read-only
+    /// seat is never "needs a person", and a manual seat that already finished
+    /// this round has no pending task to locate.
+    private func seatsNeedingLocation(_ providers: [String]) -> [String] {
+        guard isRunning, !isFinished, !model.isReadOnly else { return [] }
+        return providers.filter { provider in
+            switch seatBadge(provider).kind {
+            case .needsAction:
+                return true
+            case .takenOver:
+                return model.manualTarget(for: provider) != nil
+            default:
+                return false
+            }
+        }
+    }
+
+    /// Always-visible, scroll-free entry for the seats above. Each blocked seat
+    /// gets its own button, so several can be located separately.
+    private func seatLocateStrip(_ providers: [String]) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "scope")
+                .font(.system(size: 10.5, weight: .semibold))
+                .foregroundStyle(Color.orange)
+                .accessibilityHidden(true)
+            Text("需要你处理")
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(.secondary)
+            ForEach(providers, id: \.self) { provider in
+                Button {
+                    seatLocateCounter += 1
+                    seatLocate = SeatLocateRequest(id: seatLocateCounter, provider: provider)
+                } label: {
+                    Label("定位 \(ArenaSeatCatalog.name(provider))", systemImage: "arrow.left.and.right")
+                        .font(.system(size: 11.5, weight: .medium))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help("只滚动到这一席；不会切换模式、不会重新派发")
+                .accessibilityHint("横向滚动到这一席，不发送、不切换模式")
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("需要你处理的席位")
     }
 
     private var readOnlyBanner: some View {
@@ -1538,23 +1623,29 @@ struct ArenaRootView: View {
     }
 
     /// Runs for every way the condition sheet can close: the「关闭」button,
-    /// Escape, or the system dismiss gesture. Leaving without saving undoes the
-    /// pause this workbench applied for the editor, and never a pause the user
-    /// made before opening it. A saved condition keeps the pause, as documented
-    /// in the editor, until the user presses 「继续」.
+    /// Escape, or the system dismiss gesture. The close policy (saved, a parked
+    /// draft, and the pause this editor owns) lives in one model entry, so this
+    /// view does not re-derive it and cannot drift from the composer.
     private func guidanceDismissed() {
         let opening = guidanceOpening
         let saved = guidanceDidSave
         guidanceOpening = nil
         guidanceDidSave = false
-        guard let opening, opening.ownedPause, !saved else { return }
-        model.resumePauseOwnedByGuidance(opening.target)
+        model.finishGuidance(opening, saved: saved)
     }
 
     /// Run the history action only after the search sheet finished dismissing,
     /// so a confirmation alert is never presented on top of a live sheet.
     private func runPendingHistoryAction() {
-        guard let action = pendingHistoryAction else { return }
+        guard let action = pendingHistoryAction else {
+            // A pure close (Esc or the close button) leaves no next surface.
+            // Wait for AppKit to finish dismissing the sheet, then make the
+            // visible native history button the window's first responder. A
+            // close that continues with navigation or a confirmation returns
+            // above and never touches focus.
+            restoreHistoryButtonFocus(attempt: 0)
+            return
+        }
         pendingHistoryAction = nil
         switch action {
         case .view(let id):
@@ -1562,6 +1653,19 @@ struct ArenaRootView: View {
             else { openHistory(id) }
         case .resume(let id):
             confirmation = .continueHistory(id)
+        }
+    }
+
+    /// Runs only after a pure close. Each attempt is one main-loop turn; the
+    /// host refuses while the sheet is still attached or the workbench window
+    /// is not key, so focus is never taken from a following alert or another
+    /// window. Two turns are enough for the sheet to finish dismissing.
+    private func restoreHistoryButtonFocus(attempt: Int) {
+        DispatchQueue.main.async {
+            guard !showsHistorySearch else { return }
+            if historyButtonHost.focusVisibleHistoryButton() { return }
+            guard attempt < 2 else { return }
+            restoreHistoryButtonFocus(attempt: attempt + 1)
         }
     }
 
@@ -1649,6 +1753,118 @@ struct ArenaRootView: View {
             return state
         }
         return ArenaSeatOutcome.derive(session: model.session, provider: provider)
+    }
+}
+
+// MARK: - 原生历史按钮
+
+/// Owns the one or two native history buttons SwiftUI actually mounts for the
+/// regular/compact header variants. Focus only ever goes to the visible one in
+/// its own window; there is no global window search and no synthetic focus.
+@MainActor
+final class ArenaHistoryButtonHost: ObservableObject {
+    private final class WeakButton {
+        weak var value: NSButton?
+        init(_ value: NSButton) { self.value = value }
+    }
+
+    private var buttons: [WeakButton] = []
+
+    func register(_ button: NSButton) {
+        buttons.removeAll { $0.value == nil || $0.value === button }
+        buttons.append(WeakButton(button))
+    }
+
+    func unregister(_ button: NSButton) {
+        buttons.removeAll { $0.value == nil || $0.value === button }
+    }
+
+    /// Makes the mounted history button the real first responder of its own
+    /// window. The window does not need to be the system key window and is
+    /// never keyed, activated or raised here. Refuses while a sheet is still
+    /// attached, so the caller can wait a turn instead of racing AppKit.
+    @discardableResult
+    func focusVisibleHistoryButton() -> Bool {
+        for box in buttons {
+            guard let button = box.value,
+                  let window = button.window,
+                  window.attachedSheet == nil,
+                  !button.isHiddenOrHasHiddenAncestor,
+                  !button.visibleRect.isEmpty else { continue }
+            return window.makeFirstResponder(button)
+        }
+        return false
+    }
+}
+
+/// A real AppKit button for the history trigger: it accepts first responder
+/// explicitly, so the window never falls back to the WKWebView. Space/Return
+/// activation lives in the shared `ArenaKeyboardActionButton`.
+
+/// Replaces only the history trigger. The system rounded bezel, font, state
+/// and image position are reused, so the regular and compact variants keep the
+/// existing header layout while gaining a deterministic native first responder.
+struct ArenaHistoryToolbarButton: NSViewRepresentable {
+    let compact: Bool
+    let host: ArenaHistoryButtonHost
+    let action: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(action: action, host: host)
+    }
+
+    func makeNSView(context: Context) -> NSButton {
+        let button = ArenaKeyboardActionButton()
+        button.target = context.coordinator
+        button.action = #selector(Coordinator.openHistoryPanel)
+        button.setButtonType(.momentaryPushIn)
+        button.bezelStyle = .rounded
+        button.focusRingType = .default
+        button.controlSize = .regular
+        button.identifier = NSUserInterfaceItemIdentifier("arena.history")
+        button.setAccessibilityIdentifier("arena.history")
+        button.setAccessibilityLabel("历史")
+        button.setAccessibilityHelp("打开历史面板（⌘⇧F）")
+        button.toolTip = "打开历史面板（⌘⇧F）"
+        button.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        apply(compact: compact, to: button)
+        context.coordinator.host.register(button)
+        return button
+    }
+
+    func updateNSView(_ button: NSButton, context: Context) {
+        context.coordinator.action = action
+        apply(compact: compact, to: button)
+    }
+
+    static func dismantleNSView(_ nsView: NSButton, coordinator: Coordinator) {
+        coordinator.host.unregister(nsView)
+    }
+
+    private func apply(compact: Bool, to button: NSButton) {
+        if let image = NSImage(systemSymbolName: "clock.arrow.circlepath", accessibilityDescription: nil) {
+            button.image = image.withSymbolConfiguration(
+                NSImage.SymbolConfiguration(pointSize: compact ? 12.5 : 11.5, weight: .semibold)
+            )
+        }
+        button.imagePosition = compact ? .imageOnly : .imageLeading
+        button.title = compact ? "" : "历史"
+        button.font = .systemFont(ofSize: compact ? 12.5 : 13, weight: .medium)
+    }
+
+    @MainActor
+    final class Coordinator: NSObject {
+        var action: () -> Void
+        let host: ArenaHistoryButtonHost
+
+        init(action: @escaping () -> Void, host: ArenaHistoryButtonHost) {
+            self.action = action
+            self.host = host
+        }
+
+        @objc func openHistoryPanel() {
+            action()
+        }
     }
 }
 
@@ -2679,6 +2895,12 @@ struct ArenaDetailsWindowView: View {
     @ObservedObject var feedback: ArenaFeedbackPresenter
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @State private var selectedAnswerSource: ArenaTaskRow?
+    /// The material button a source was opened from. Returning from the
+    /// source reader keeps the list mounted (same row, same scroll) and gives
+    /// keyboard focus back to that exact button.
+    @State private var sourceOrigin: ArenaSourceOrigin?
+    @State private var sourceReturnToken = 0
+    @State private var sourceReturnFocus: ArenaSourceReturnFocus?
 
     private var session: [String: Any]? { model.session }
     private var report: String? { ArenaSessionDigest.report(session) }
@@ -2712,6 +2934,8 @@ struct ArenaDetailsWindowView: View {
         .onAppear { state.normalize(session: session) }
         .onChange(of: sessionIdentity) { _ in
             selectedAnswerSource = nil
+            sourceOrigin = nil
+            sourceReturnFocus = nil
             state.normalize(session: session)
         }
     }
@@ -2763,6 +2987,8 @@ struct ArenaDetailsWindowView: View {
                 state.tab = value
                 state.showsRawRecord = false
                 selectedAnswerSource = nil
+                sourceOrigin = nil
+                sourceReturnFocus = nil
             }
         )
     }
@@ -2791,6 +3017,7 @@ struct ArenaDetailsWindowView: View {
             answersView
                 .opacity(selectedAnswerSource == nil ? 1 : 0)
                 .allowsHitTesting(selectedAnswerSource == nil)
+                .disabled(selectedAnswerSource != nil)
                 .accessibilityHidden(selectedAnswerSource != nil)
             if let source = selectedAnswerSource {
                 ArenaSourceReader(
@@ -2799,6 +3026,15 @@ struct ArenaDetailsWindowView: View {
                     returnLabel: "返回历史原文"
                 ) {
                     selectedAnswerSource = nil
+                    // The reader's own return button is gone afterwards. Give
+                    // focus back to the material row that opened it, while the
+                    // list keeps its scroll position and expansion state.
+                    guard let origin = sourceOrigin else { return }
+                    sourceReturnToken += 1
+                    sourceReturnFocus = ArenaSourceReturnFocus(
+                        origin: origin,
+                        token: sourceReturnToken
+                    )
                 }
                 .background(Color(nsColor: .textBackgroundColor))
             }
@@ -2976,7 +3212,11 @@ struct ArenaDetailsWindowView: View {
                             session: model.session,
                             reviewMaterials: reviewMaterials[row.id],
                             feedback: feedback,
-                            onOpenSource: { selectedAnswerSource = $0 }
+                            returnFocus: sourceReturnFocus,
+                            onOpenSource: { source, origin in
+                                sourceOrigin = origin
+                                selectedAnswerSource = source
+                            }
                         )
                     }
                 }
@@ -3050,15 +3290,31 @@ struct ArenaDetailsWindowView: View {
     }
 }
 
+/// The material row a saved answer was opened from, so returning from the
+/// source reader can land on the same row and the same button.
+struct ArenaSourceOrigin: Equatable {
+    let rowID: String
+    let materialIndex: Int
+}
+
+struct ArenaSourceReturnFocus: Equatable {
+    let origin: ArenaSourceOrigin
+    let token: Int
+}
+
 struct ArenaAnswerDisclosure: View {
     let row: ArenaTaskRow
     let session: [String: Any]?
     let reviewMaterials: [[String: String]]?
     let feedback: ArenaFeedbackPresenter
-    let onOpenSource: (ArenaTaskRow) -> Void
+    let returnFocus: ArenaSourceReturnFocus?
+    let onOpenSource: (ArenaTaskRow, ArenaSourceOrigin) -> Void
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isExpanded = false
+    /// The actual prompt is secondary evidence for a peer review: it opens
+    /// only when asked for, after the saved answer and its sources.
+    @State private var showsPrompt = false
     @State private var highlightedMaterials: Set<Int> = []
     @State private var highlightTask: Task<Void, Never>?
 
@@ -3074,18 +3330,19 @@ struct ArenaAnswerDisclosure: View {
     var body: some View {
         DisclosureGroup(isExpanded: $isExpanded) {
             VStack(alignment: .leading, spacing: 10) {
-                if let materials = reviewMaterials, !materials.isEmpty {
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text("本席收到的材料 · 点一处打开原文")
-                            .font(.system(size: 10.5, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                        ForEach(materials.indices, id: \.self) { index in
-                            materialRow(index: index, material: materials[index])
-                        }
+                if row.stage == "critique" {
+                    // Read order for a peer review: the full saved answer
+                    // first, then the clickable materials it was based on,
+                    // then the actual prompt folded away.
+                    labeled("原文", text: row.answer ?? "", dim: false)
+                    if let materials = reviewMaterials, !materials.isEmpty {
+                        materialsBlock(materials)
                     }
+                    promptBlock
+                } else {
+                    labeled("提示", text: row.prompt, dim: true)
+                    labeled("原文", text: row.answer ?? "", dim: false)
                 }
-                labeled("提示", text: row.prompt, dim: true)
-                labeled("原文", text: row.answer ?? "", dim: false)
             }
             .padding(.top, 8)
         } label: {
@@ -3152,6 +3409,47 @@ struct ArenaAnswerDisclosure: View {
         }
     }
 
+    private func materialsBlock(_ materials: [[String: String]]) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text("本席收到的材料 · 点一处打开原文")
+                .font(.system(size: 10.5, weight: .semibold))
+                .foregroundStyle(.secondary)
+            ForEach(materials.indices, id: \.self) { index in
+                materialRow(index: index, material: materials[index])
+            }
+        }
+    }
+
+    /// The prompt actually sent to this seat, folded under the answer it
+    /// produced. It stays verbatim and fully copyable; nothing is truncated.
+    private var promptBlock: some View {
+        DisclosureGroup(isExpanded: $showsPrompt) {
+            VStack(alignment: .leading, spacing: 7) {
+                Text(row.prompt.isEmpty ? "（空）" : row.prompt)
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                HStack(spacing: 8) {
+                    Spacer(minLength: 0)
+                    Button("复制实际提示") {
+                        guard !row.prompt.isEmpty else { return }
+                        feedback.copyToPasteboard(row.prompt)
+                    }
+                    .controlSize(.large)
+                    .disabled(row.prompt.isEmpty)
+                    .help("复制这一席实际收到的完整提示")
+                }
+            }
+            .padding(.top, 6)
+        } label: {
+            Text("查看实际提示")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+        }
+    }
+
     private func materialTitle(_ material: [String: String]) -> String {
         let name = material["provider"].map(ArenaSeatCatalog.name) ?? "其他席位"
         switch material["stage"] {
@@ -3175,17 +3473,34 @@ struct ArenaAnswerDisclosure: View {
         }
     }
 
+    @ViewBuilder
     private func materialRow(index: Int, material: [String: String]) -> some View {
         let source = materialSource(material)
         let highlighted = highlightedMaterials.contains(index)
         let sourceID = material["sourceId"] ?? "出处未知"
-        return Button {
-            if let source { onOpenSource(source) }
-        } label: {
+        let title = "\(materialTitle(material)) · \(sourceID)"
+        if let source {
+            // One real native link button is the whole row entry; the same
+            // origin identifies it when the reader returns from that source.
+            ArenaSourceButton(
+                title: title,
+                identifier: "arena.source.\(row.id).\(index)",
+                focusRequest: focusRequest(for: index)
+            ) {
+                onOpenSource(source, ArenaSourceOrigin(rowID: row.id, materialIndex: index))
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(highlighted ? Color.accentColor.opacity(0.16) : Color.primary.opacity(0.03))
+            )
+            .contentShape(Rectangle())
+        } else {
+            // Unlocatable materials keep their previous read-only appearance.
             HStack(spacing: 7) {
-                Image(systemName: source == nil ? "doc.questionmark" : "arrow.up.forward.square")
+                Image(systemName: "doc.questionmark")
                     .font(.system(size: 10.5, weight: .semibold))
-                    .foregroundStyle(source == nil ? Color.secondary : Color.accentColor)
+                    .foregroundStyle(.secondary)
                 Text(materialTitle(material))
                     .font(.system(size: 12))
                 Text(sourceID)
@@ -3193,32 +3508,30 @@ struct ArenaAnswerDisclosure: View {
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
                 Spacer(minLength: 6)
-                if source == nil {
-                    Text("原文不可用")
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(.secondary)
-                } else {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 9.5, weight: .semibold))
-                        .foregroundStyle(.tertiary)
-                }
+                Text("原文不可用")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 5)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(highlighted ? Color.accentColor.opacity(0.16) : Color.primary.opacity(0.03))
+                    .fill(Color.primary.opacity(0.03))
             )
-            .contentShape(Rectangle())
+            .help("这条材料的原文不在本场已保存记录中")
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(materialTitle(material)) \(sourceID)，原文不可用")
         }
-        .buttonStyle(.plain)
-        .disabled(source == nil)
-        .help(source == nil ? "这条材料的原文不在本场已保存记录中" : "打开这条材料的已保存原文")
-        .accessibilityLabel(
-            "\(materialTitle(material)) \(sourceID)"
-                + (source == nil ? "，原文不可用" : "，打开原文")
-        )
+    }
+
+    /// One unique origin per material row. Only the row the reader actually
+    /// returned to sees a growing request; every other row stays at 0.
+    private func focusRequest(for index: Int) -> Int {
+        guard let focus = returnFocus,
+              focus.origin.rowID == row.id,
+              focus.origin.materialIndex == index else { return 0 }
+        return focus.token
     }
 
     /// A one-shot domino highlight over the exact recipient's real input rows.

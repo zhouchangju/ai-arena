@@ -342,18 +342,46 @@ def default_steps(question: str) -> list[dict]:
         {"op": "capture", "name": "report-wide", "window": "details"},
         {"op": "click", "label": "候选全文", "window": "details", "expectValue": "已展开"},
         {"op": "capture", "name": "candidate-expanded", "window": "details"},
-        {"op": "click", "labelContains": "起草 ·", "window": "details"},
+        {"op": "scrollTo", "window": "details", "offset": 380},
+        {"op": "scrollMark", "window": "details", "name": "before-source"},
+        {"op": "click", "labelContains": "起草 ·", "window": "details", "remember": "source-link"},
         {"op": "waitText", "text": "返回报告", "window": "details"},
         {"op": "capture", "name": "source", "window": "details"},
-        {"op": "click", "label": "返回报告", "window": "details"},
+        {"op": "key", "key": "escape", "window": "details", "settle": 0.6},
         {"op": "waitText", "text": "讨论报告", "window": "details"},
+        {"op": "assertScrollMark", "window": "details", "name": "before-source", "tolerance": 2},
+        {"op": "assertDisclosure", "label": "候选全文", "value": "已展开", "window": "details"},
+        {"op": "sourceReopen", "remember": "source-link", "window": "details"},
+        {"op": "capture", "name": "source-reopened", "window": "details"},
         {"op": "capture", "name": "back-to-report", "window": "details"},
+        {"op": "click", "label": "候选全文", "window": "details", "expectValue": "已收起"},
+        {"op": "capture", "name": "report-continued", "window": "details"},
         {"op": "reduceMotion", "value": True},
         {"op": "perf", "mode": "toggle", "window": "details", "label": "候选全文",
          "cycles": 2, "name": "candidate-toggle-reduce-motion", "settleMs": 180},
         {"op": "reduceMotion", "value": False},
-        {"op": "openHistory"},
-        {"op": "sleep", "seconds": 0.8},
+        {"op": "click", "label": "历史", "window": "main", "settle": 0.9,
+         "remember": "history-button", "name": "open-history"},
+        {"op": "waitSheet", "present": True, "timeout": 10},
+        {"op": "focus", "window": "sheet", "expect": "search", "name": "history-search-auto-focus"},
+        {"op": "search", "text": "UI 验收", "name": "history-search"},
+        {"op": "mark", "text": "Gemini", "name": "history-marked"},
+        {"op": "key", "key": "return", "window": "sheet", "settle": 0.6,
+         "name": "history-marked-return"},
+        {"op": "waitSheet", "present": True, "timeout": 3, "name": "history-marked-does-not-open"},
+        {"op": "assertModel", "readOnly": False, "name": "history-marked-session-unchanged"},
+        {"op": "clearMark"},
+        {"op": "key", "key": "escape", "window": "sheet", "settle": 0.8, "name": "history-escape"},
+        {"op": "waitSheet", "present": False, "timeout": 10},
+        {"op": "assertHistoryFocus", "name": "history-focus-restored"},
+        {"op": "key", "key": "space", "window": "main", "settle": 0.9, "name": "history-space-reopen"},
+        {"op": "waitSheet", "present": True, "timeout": 10, "name": "history-reopened"},
+        {"op": "focus", "window": "sheet", "expect": "search", "name": "history-reopened-auto-focus"},
+        {"op": "search", "text": "UI 验收"},
+        {"op": "key", "key": "return", "window": "sheet", "settle": 1.0, "name": "history-open-return"},
+        {"op": "waitSheet", "present": False, "timeout": 10},
+        {"op": "waitText", "text": "历史回看 · 只读", "window": "main", "timeout": 15},
+        {"op": "assertModel", "readOnly": True, "name": "history-read-only"},
         {"op": "capture", "name": "history", "window": "main"},
         {"op": "resize", "window": "main", "width": 900, "height": 600},
         {"op": "capture", "name": "history-narrow", "window": "main"},
@@ -371,6 +399,8 @@ def check_result(result: dict, requested: list[dict], require_default: bool) -> 
     for step in steps:
         if not step.get("ok", False):
             problems.append(f"step {step.get('index')} {step.get('name')} failed: {step.get('error')}")
+    for failure in result.get("keyboardFailures", []):
+        problems.append("keyboard failure: " + failure)
     if not require_default:
         return problems
     names = {capture.get("name") for capture in result.get("captures", [])}
@@ -400,16 +430,20 @@ def check_result(result: dict, requested: list[dict], require_default: bool) -> 
     return problems
 
 
-def summary_markdown(result: dict, events: list[dict]) -> str:
+def summary_markdown(result: dict, events: list[dict], problems: list[str]) -> str:
     lines = [
         "# AI Arena UI 验收",
         "",
-        f"- ok: **{result.get('ok')}**",
+        f"- ok: **{not problems}**",
         f"- bundle: `{result.get('bundleIdentifier')}`",
         f"- fixture: `{result.get('fixtureBase')}`",
         f"- 用时: {result.get('durationMs', 0) / 1000:.1f}s",
         f"- 回环观测消息: {len(events)}",
         "",
+    ]
+    if problems:
+        lines += ["## 问题", ""] + [f"- {problem}" for problem in problems] + [""]
+    lines += [
         "## 截图",
         "",
     ]
@@ -441,6 +475,9 @@ def summary_markdown(result: dict, events: list[dict]) -> str:
     notes = result.get("notes", [])
     if notes:
         lines += ["", "## 标注", ""] + [f"- {note}" for note in notes]
+    gaps = result.get("coverageGaps", [])
+    if gaps:
+        lines += ["", "## 覆盖缺口", ""] + [f"- {gap}" for gap in gaps]
     return "\n".join(lines) + "\n"
 
 
@@ -573,13 +610,20 @@ def main() -> int:
             return 1
         result = json.loads(result_path.read_text())
         problems = check_result(result, steps, require_default=args.steps is None)
-        (out / "summary.md").write_text(summary_markdown(result, fixture.events))
+        (out / "summary.md").write_text(summary_markdown(result, fixture.events, problems))
         if problems:
             print("FAIL", file=sys.stderr)
             for problem in problems:
                 print(" - " + problem, file=sys.stderr)
             return 1
         print(f"PASS: {len(result['captures'])} captures, {len(result['steps'])} steps")
+        for name in ("history-focus-restored", "history-space-reopen", "history-open-return"):
+            step = next((s for s in result.get("steps", []) if s.get("name") == name), None)
+            if step:
+                print(f"  {name}: {step.get('detail', {})}")
+        gaps = result.get("coverageGaps", [])
+        for gap in gaps:
+            print(f"  GAP: {gap}")
         scroll = next((m for m in result.get("metrics", []) if m.get("mode") == "scroll"), None)
         toggle = next((m for m in result.get("metrics", []) if m.get("mode") == "toggle"), None)
         if scroll:

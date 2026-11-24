@@ -7,6 +7,10 @@
 //  保存成功后继续保持暂停，需要用户自己点「继续」。保存失败时草稿留在
 //  输入框里，不关闭弹窗。
 //
+//  未保存的草稿由模型按「本场 + 阶段 + 轮次」停在进程内：关闭、Esc 或再次
+//  打开同一轮都能取回，换到别的场次、阶段或轮次不会串稿；只有保存成功才
+//  清空。草稿不写进场次文件、不进入共享引擎，也不会自动恢复派发。
+//
 
 import SwiftUI
 
@@ -21,6 +25,10 @@ struct ArenaGuidanceOpening: Equatable {
 struct ArenaGuidanceComposer: View {
     @ObservedObject var model: ArenaModel
     let target: ArenaGuidanceTarget
+    /// The unsaved text, parked by the model for exactly this target. The
+    /// composer keeps no second copy, so it can neither lose the draft on close
+    /// nor flush stale text over a newer one.
+    @Binding var draft: String
     /// Whether the pause in effect was caused by opening this editor.
     let ownedPause: Bool
     /// Called after one condition was saved. The caller keeps that as「已保存」
@@ -28,19 +36,39 @@ struct ArenaGuidanceComposer: View {
     let onSaved: () -> Void
     let onClose: () -> Void
 
-    @State private var draft: String = ""
+    /// Bumped by every keystroke so the placeholder, the counter and the save
+    /// button re-read the same parked value. The text itself has one home: the
+    /// model's per-target draft.
+    @State private var draftRevision = 0
     @State private var status: String?
     @State private var statusIsError = false
     @FocusState private var editorFocused: Bool
 
+    private var liveDraft: String {
+        _ = draftRevision
+        return draft
+    }
+
+    /// The editor writes straight through to the parked draft, then asks this
+    /// view to re-read it.
+    private var editableDraft: Binding<String> {
+        Binding(
+            get: { draft },
+            set: { text in
+                draft = text
+                draftRevision &+= 1
+            }
+        )
+    }
+
     private var trimmedDraft: String {
-        draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        liveDraft.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// JavaScript's `MAX_GUIDANCE` counts UTF-16 code units; count the same way
     /// so the UI limit matches what the shared engine will enforce.
     private var draftLength: Int {
-        draft.utf16.count
+        liveDraft.utf16.count
     }
 
     private var overLimit: Bool {
@@ -106,21 +134,26 @@ struct ArenaGuidanceComposer: View {
         .padding(.vertical, 13)
     }
 
-    /// Says exactly what closing the editor will do. The pause is only undone
-    /// when this sheet caused it and nothing was saved; a pause the user made
-    /// before opening the editor is always kept.
+    /// Says exactly what closing the editor will do in its current state. The
+    /// pause is only undone when this sheet caused it, nothing was saved and no
+    /// draft is parked; a pause the user made before opening is always kept.
     private var pauseNote: String {
+        let draftKept = model.hasGuidanceDraft(for: target)
         if ownedPause {
-            return "打开时已自动暂停。保存后仍保持暂停；不保存直接关闭会恢复原来的派发。"
+            return draftKept
+                ? "打开时已自动暂停。有未保存草稿，关闭会保留草稿并继续暂停。"
+                : "打开时已自动暂停。保存后保持暂停；关闭且没有草稿时恢复原来的派发。"
         }
-        return "本场原本已暂停。保存后仍保持暂停；关闭不会自动继续。"
+        return draftKept
+            ? "本场原本已暂停。关闭会继续暂停，草稿留到下次打开同一轮。"
+            : "本场原本已暂停。保存后仍保持暂停；关闭不会自动继续。"
     }
 
     private var effectNotice: some View {
         VStack(alignment: .leading, spacing: 6) {
             Label("只写入保存之后新建的提示", systemImage: "arrow.turn.down.right")
                 .font(.system(size: 12.5, weight: .semibold))
-            Text("新的独立作答、互评或候选提示会带上这条条件。已经发出、待处理或已归档的任务及其表态不会被改写，也不会重发；继续讨论需要你手动点「继续」。")
+            Text("新的独立作答、互评或候选提示会带上这条条件；已经发出或待处理的任务不会被改写、不会重发，继续讨论需要你手动点「继续」。未保存的草稿只留在本次运行中，按本场、阶段和轮次分开保存，保存成功才清空。")
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -139,7 +172,7 @@ struct ArenaGuidanceComposer: View {
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.secondary)
             ZStack(alignment: .topLeading) {
-                if draft.isEmpty {
+                if liveDraft.isEmpty {
                     Text("例如：预算最多两周；如果没有真实数据，请明确标出待核实。")
                         .font(.system(size: 13))
                         .foregroundStyle(.tertiary)
@@ -148,13 +181,14 @@ struct ArenaGuidanceComposer: View {
                         .allowsHitTesting(false)
                         .accessibilityHidden(true)
                 }
-                TextEditor(text: $draft)
+                TextEditor(text: editableDraft)
                     .font(.system(size: 13))
                     .scrollContentBackground(.hidden)
                     .padding(4)
                     .focused($editorFocused)
                     .frame(minHeight: 96)
                     .accessibilityLabel("补充条件")
+                    .accessibilityHint("未保存的草稿只保留在本次运行中，按本场、本阶段和轮次分别保存，保存成功才清空")
             }
             .background(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -188,8 +222,8 @@ struct ArenaGuidanceComposer: View {
             Button("关闭") { onClose() }
                 .keyboardShortcut(.cancelAction)
                 .help(ownedPause
-                      ? "不保存条件；如果这次暂停是打开编辑器时自动造成的，会恢复到原来的派发状态"
-                      : "不保存条件；本场保持你原来的暂停状态")
+                      ? "不保存条件；有未保存草稿时保留草稿并继续暂停，没有草稿时恢复到打开前的派发状态"
+                      : "不保存条件；保持本场暂停，未保存的草稿留到下次打开同一轮")
             Button("保存条件") { save() }
                 .keyboardShortcut(.defaultAction)
                 .disabled(!canSave)
@@ -201,7 +235,9 @@ struct ArenaGuidanceComposer: View {
     private func save() {
         switch model.saveGuidance(draft, target: target) {
         case let .saved(note):
-            draft = ""
+            // The model cleared this round's parked draft on the committed
+            // save; bump once so the editor and counter re-read it.
+            draftRevision &+= 1
             statusIsError = false
             status = "已保存条件 #\(note.seq)；讨论仍保持暂停。"
             editorFocused = true

@@ -222,6 +222,19 @@ final class QAUIDriver {
     private var captures: [[String: Any]] = []
     private var metrics: [[String: Any]] = []
     private var notes: [String] = []
+    /// Reading positions recorded by `scrollMark` and compared by
+    /// `assertScrollMark`; used to prove a source return kept the report where
+    /// the reader left it.
+    private var scrollMarks: [String: NSPoint] = [:]
+    /// AX elements remembered by `click` so a later step can compare the real
+    /// focused element with the control the user actually pressed.
+    private var axMarkText: [String: String] = [:]
+    /// Honest coverage gaps (e.g. a background app cannot establish keyboard
+    /// focus). Reported, never turned into a pass.
+    private var coverageGaps: [String] = []
+    /// Behavioural keyboard failures. They never abort the remaining steps, but
+    /// the run cannot pass while any is present.
+    private var keyboardFailures: [String] = []
     private let startedAt = ISO8601DateFormatter().string(from: Date())
     private let clock = qaNow()
     private var didFinish = false
@@ -302,6 +315,8 @@ final class QAUIDriver {
             "captures": captures,
             "metrics": metrics,
             "notes": notes,
+            "coverageGaps": coverageGaps,
+            "keyboardFailures": keyboardFailures,
             "session": [
                 "id": model.session?.arenaString("id") ?? "",
                 "stage": model.stageKey,
@@ -425,6 +440,42 @@ final class QAUIDriver {
 
         case "openHistory":
             return try await openHistory(step: step)
+
+        case "waitSheet":
+            return try await waitSheet(step: step)
+
+        case "focus":
+            return try await focus(step: step)
+
+        case "search":
+            return try await search(step: step)
+
+        case "mark":
+            return try await mark(step: step)
+
+        case "clearMark":
+            return try await clearMark(step: step)
+
+        case "key":
+            return try await key(step: step)
+
+        case "scrollTo":
+            return try scrollTo(step: step)
+
+        case "scrollMark":
+            return try scrollMark(step: step)
+
+        case "assertScrollMark":
+            return try assertScrollMark(step: step)
+
+        case "assertDisclosure":
+            return try assertDisclosure(step: step)
+
+        case "assertHistoryFocus":
+            return try assertHistoryFocus(step: step)
+
+        case "sourceReopen":
+            return try await sourceReopen(step: step)
 
         case "assertModel":
             return try assertModel(step: step)
@@ -767,6 +818,11 @@ final class QAUIDriver {
         guard actions.contains(kAXPressAction as String) else {
             throw QAFailure("「\(label)」不支持 AXPress，动作：\(actions)")
         }
+        if let remember = step["remember"] as? String {
+            axMarkText[remember] = axText(target)
+            result["remembered"] = remember
+            result["rememberedText"] = axText(target)
+        }
         let pressStart = qaNow()
         let error = AXUIElementPerformAction(target, kAXPressAction as CFString)
         let pressMs = (qaNow() - pressStart) * 1000
@@ -936,6 +992,449 @@ final class QAUIDriver {
             "intercepted": QAWorkspaceMotion.installed,
             "notification": NSWorkspace.accessibilityDisplayOptionsDidChangeNotification.rawValue,
         ]
+    }
+
+    // MARK: 键盘、焦点与阅读位置
+
+    private func waitSheet(step: [String: Any]) async throws -> [String: Any] {
+        guard let present = step["present"] as? Bool else { throw QAFailure("waitSheet 缺 present") }
+        let timeout = step["timeout"] as? Double ?? 8
+        let deadline = Date().addingTimeInterval(timeout)
+        var last = ""
+        while Date() < deadline {
+            let sheet = window.attachedSheet
+            last = sheet.map { "「\($0.title)」visible=\($0.isVisible)" } ?? "none"
+            if present, let sheet, sheet.isVisible {
+                return ["present": true, "title": sheet.title]
+            }
+            if !present, sheet == nil {
+                return ["present": false]
+            }
+            try await settle(0.1)
+        }
+        throw QAFailure("sheet 状态不符（期望 present=\(present)，当前 \(last)）")
+    }
+
+    private func searchField(in view: NSView) -> NSSearchField? {
+        if let field = view as? NSSearchField { return field }
+        for child in view.subviews {
+            if let found = searchField(in: child) { return found }
+        }
+        return nil
+    }
+
+    /// Read the real responder instead of trusting a completion we ran
+    /// ourselves. `isFieldEditor` is only true when the window's first responder
+    /// is the search field's own field editor.
+    private func focus(step: [String: Any]) async throws -> [String: Any] {
+        let key = step["window"] as? String ?? "sheet"
+        let expect = step["expect"] as? String ?? ""
+        let timeout = step["timeout"] as? Double ?? 4
+        let deadline = Date().addingTimeInterval(timeout)
+        var last: [String: Any] = [:]
+        guard key == "sheet" else {
+            throw QAFailure("focus 只用于历史面板搜索框（得到窗口「\(key)」）")
+        }
+        while Date() < deadline {
+            if let sheet = window.attachedSheet, sheet.isVisible,
+               let content = sheet.contentView,
+               let field = searchField(in: content) {
+                // Read-only: never move focus just to make the assertion true.
+                let editor = field.currentEditor() as? NSTextView
+                let responder = sheet.firstResponder
+                let isEditor = editor != nil && responder === editor
+                last = [
+                    "window": "sheet",
+                    "role": "search",
+                    "firstResponder": responder.map { String(describing: Swift.type(of: $0)) } ?? "nil",
+                    "isFieldEditor": isEditor,
+                    "fieldString": field.stringValue,
+                    "editorString": editor?.string ?? "",
+                    "hasMarkedText": editor?.hasMarkedText() ?? false,
+                    "keyWindow": NSApp.keyWindow?.title ?? "nil",
+                ]
+                if expect.isEmpty || (expect == "search" && isEditor) { return last }
+            }
+            try await settle(0.1)
+        }
+        throw QAFailure("搜索框未取得焦点（expect=\(expect)）：\(last)")
+    }
+
+    private func search(step: [String: Any]) async throws -> [String: Any] {
+        guard let text = step["text"] as? String else { throw QAFailure("search 缺 text") }
+        guard let sheet = window.attachedSheet, sheet.isVisible,
+              let content = sheet.contentView,
+              let field = searchField(in: content) else {
+            throw QAFailure("历史面板没有可用的搜索框")
+        }
+        sheet.makeFirstResponder(field)
+        var editor: NSTextView?
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline {
+            editor = field.currentEditor() as? NSTextView
+            if editor != nil { break }
+            try await settle(0.05)
+        }
+        guard let editor else { throw QAFailure("搜索框没有 field editor") }
+        let full = NSRange(location: 0, length: (editor.string as NSString).length)
+        editor.setSelectedRange(full)
+        editor.insertText(text, replacementRange: full)
+        try await settle(0.45)
+        return [
+            "fieldString": field.stringValue,
+            "editorString": editor.string,
+            "hasMarkedText": editor.hasMarkedText(),
+        ]
+    }
+
+    /// Marked text is set on the real field editor the window is using, then a
+    /// real Return goes through AppKit below. The test never calls the panel's
+    /// submit closure itself.
+    private func mark(step: [String: Any]) async throws -> [String: Any] {
+        guard let text = step["text"] as? String else { throw QAFailure("mark 缺 text") }
+        guard let sheet = window.attachedSheet, sheet.isVisible,
+              let content = sheet.contentView,
+              let field = searchField(in: content),
+              let editor = field.currentEditor() as? NSTextView else {
+            throw QAFailure("搜索框没有可标记的 field editor")
+        }
+        let full = NSRange(location: 0, length: (editor.string as NSString).length)
+        editor.setSelectedRange(full)
+        editor.setMarkedText(
+            text,
+            selectedRange: NSRange(location: (text as NSString).length, length: 0),
+            replacementRange: full
+        )
+        try await settle(0.25)
+        return [
+            "marked": editor.hasMarkedText(),
+            "markedRange": NSStringFromRange(editor.markedRange()),
+            "editorString": editor.string,
+            "fieldString": field.stringValue,
+        ]
+    }
+
+    private func clearMark(step: [String: Any]) async throws -> [String: Any] {
+        guard let sheet = window.attachedSheet,
+              let editor = sheet.firstResponder as? NSTextView else {
+            throw QAFailure("没有正在组合的 field editor")
+        }
+        editor.setMarkedText(
+            "",
+            selectedRange: NSRange(location: 0, length: 0),
+            replacementRange: editor.selectedRange()
+        )
+        try await settle(0.2)
+        return ["hasMarkedText": editor.hasMarkedText(), "editorString": editor.string]
+    }
+
+    /// Send a real key event to the window. Key equivalents (Esc's cancel
+    /// action, ⌘↩ in the composer) get the same `performKeyEquivalent` chance
+    /// AppKit gives them; anything else goes to the current first responder.
+    private func key(step: [String: Any]) async throws -> [String: Any] {
+        let name = step["key"] as? String ?? "return"
+        let code: UInt16
+        let characters: String
+        switch name {
+        case "escape": code = 53; characters = "\u{1b}"
+        case "return": code = 36; characters = "\r"
+        case "space": code = 49; characters = " "
+        case "up": code = 126; characters = "\u{F700}"
+        case "down": code = 125; characters = "\u{F701}"
+        default: throw QAFailure("key 只支持 escape/return/space/up/down（得到「\(name)」）")
+        }
+        let target = try nsWindow(for: step["window"] as? String ?? "sheet")
+        let command = step["command"] as? Bool ?? false
+        let flags: NSEvent.ModifierFlags = command ? [.command] : []
+        func makeEvent(_ type: NSEvent.EventType) -> NSEvent? {
+            NSEvent.keyEvent(
+                with: type,
+                location: .zero,
+                modifierFlags: flags,
+                timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: target.windowNumber,
+                context: nil,
+                characters: characters,
+                charactersIgnoringModifiers: characters,
+                isARepeat: false,
+                keyCode: code
+            )
+        }
+        guard let down = makeEvent(.keyDown) else { throw QAFailure("无法构造按键事件") }
+        let before = responderSnapshot(target)
+        let handled = target.performKeyEquivalent(with: down)
+        if !handled { target.sendEvent(down) }
+        if let up = makeEvent(.keyUp), !handled { target.sendEvent(up) }
+        try await settle(step["settle"] as? Double ?? 0.5)
+        return [
+            "key": name,
+            "command": command,
+            "keyEquivalentHandled": handled,
+            "before": before,
+            "after": responderSnapshot(target),
+        ]
+    }
+
+    private func responderSnapshot(_ ns: NSWindow) -> [String: Any] {
+        let responder = ns.firstResponder
+        var info: [String: Any] = [
+            "window": ns.title,
+            "responder": responder.map { String(describing: Swift.type(of: $0)) } ?? "nil",
+            "keyWindow": NSApp.keyWindow?.title ?? "nil",
+        ]
+        if let text = responder as? NSTextView {
+            info["editorString"] = String(text.string.prefix(80))
+            info["hasMarkedText"] = text.hasMarkedText()
+            info["markedRange"] = NSStringFromRange(text.markedRange())
+        }
+        return info
+    }
+
+    private func scrollTo(step: [String: Any]) throws -> [String: Any] {
+        guard let offset = step["offset"] as? Double else { throw QAFailure("scrollTo 缺 offset") }
+        let ns = try nsWindow(for: step["window"] as? String ?? "details")
+        guard let content = ns.contentView, let scroll = largestScrollView(content) else {
+            throw QAFailure("窗口里没有可滚动区域")
+        }
+        let clip = scroll.contentView
+        let before = clip.bounds.origin
+        let maxY = max(0, (scroll.documentView?.frame.height ?? 0) - clip.bounds.height)
+        let target = min(max(0, offset), maxY)
+        clip.scroll(to: NSPoint(x: before.x, y: target))
+        scroll.reflectScrolledClipView(clip)
+        content.layoutSubtreeIfNeeded()
+        return ["before": before.y, "offset": clip.bounds.origin.y, "max": maxY]
+    }
+
+    private func scrollMark(step: [String: Any]) throws -> [String: Any] {
+        guard let name = step["name"] as? String else { throw QAFailure("scrollMark 缺 name") }
+        let ns = try nsWindow(for: step["window"] as? String ?? "details")
+        guard let content = ns.contentView, let scroll = largestScrollView(content) else {
+            throw QAFailure("窗口里没有可滚动区域")
+        }
+        let offset = scroll.contentView.bounds.origin
+        scrollMarks[name] = offset
+        return ["name": name, "offset": offset.y]
+    }
+
+    private func assertScrollMark(step: [String: Any]) throws -> [String: Any] {
+        guard let name = step["name"] as? String else { throw QAFailure("assertScrollMark 缺 name") }
+        guard let mark = scrollMarks[name] else { throw QAFailure("没有记录过的阅读位置「\(name)」") }
+        let ns = try nsWindow(for: step["window"] as? String ?? "details")
+        guard let content = ns.contentView, let scroll = largestScrollView(content) else {
+            throw QAFailure("窗口里没有可滚动区域")
+        }
+        let current = scroll.contentView.bounds.origin
+        let tolerance = step["tolerance"] as? Double ?? 2
+        guard abs(current.y - mark.y) <= tolerance else {
+            throw QAFailure("返回后阅读位置从 \(mark.y) 变成 \(current.y)，未保留原位置")
+        }
+        return ["name": name, "marked": mark.y, "current": current.y, "tolerance": tolerance]
+    }
+
+    private func assertDisclosure(step: [String: Any]) throws -> [String: Any] {
+        guard let label = step["label"] as? String,
+              let expected = step["value"] as? String else {
+            throw QAFailure("assertDisclosure 缺 label/value")
+        }
+        let root = try axWindow(step["window"] as? String ?? "details")
+        guard let element = axFind(root, { element in
+            axFields(element).contains(label) || axText(element).hasPrefix(label)
+        }) else {
+            throw QAFailure("找不到折叠标题「\(label)」")
+        }
+        let value = axString(element, kAXValueAttribute)
+        guard value == expected else {
+            throw QAFailure("「\(label)」状态是「\(value)」，期望「\(expected)」")
+        }
+        return ["label": label, "value": value]
+    }
+
+    private func focusedAXElement() -> AXUIElement? {
+        let app = AXUIElementCreateApplication(getpid())
+        guard let raw = axValue(app, kAXFocusedUIElementAttribute) else { return nil }
+        let value = raw as CFTypeRef
+        guard CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        return (value as! AXUIElement)
+    }
+
+    private func describeAX(_ element: AXUIElement?) -> String {
+        guard let element else { return "nil" }
+        return "\(axString(element, kAXRoleAttribute))"
+            + "「\(axString(element, kAXTitleAttribute))"
+            + "/\(axString(element, kAXDescriptionAttribute))」"
+    }
+
+    private func historyButton(in view: NSView) -> NSButton? {
+        if let button = view as? NSButton,
+           button.identifier?.rawValue == "arena.history" {
+            return button
+        }
+        for child in view.subviews {
+            if let found = historyButton(in: child) { return found }
+        }
+        return nil
+    }
+
+    /// Passive check of the native first responder. A background app may report
+    /// no AX focused element; that alone is not a failure. It is recorded, and
+    /// the following real Space must reopen the panel for the behaviour to pass.
+    private func assertHistoryFocus(step: [String: Any]) throws -> [String: Any] {
+        guard let content = window.contentView else {
+            throw QAFailure("主窗口没有 contentView")
+        }
+        guard let button = historyButton(in: content) else {
+            throw QAFailure("主窗口找不到 identifier arena.history 的历史按钮")
+        }
+        let responder = window.firstResponder
+        let ax = focusedAXElement()
+        return [
+            "identifier": "arena.history",
+            "matched": responder === button,
+            "firstResponder": responder.map { String(describing: Swift.type(of: $0)) } ?? "nil",
+            "firstResponderIdentifier": (responder as? NSButton)?.identifier?.rawValue ?? "",
+            "axFocused": describeAX(ax),
+            "keyWindow": NSApp.keyWindow?.title ?? "nil",
+        ]
+    }
+
+    /// Extract a standalone `S<number>` source id from an AX label that may
+    /// also contain help text such as「S7 打开这条材料的已保存原文」.
+    private static func sourceID(in text: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: "S[0-9]+") else { return nil }
+        let range = NSRange(text.startIndex..., in: text)
+        guard let match = regex.firstMatch(in: text, range: range),
+              let found = Range(match.range, in: text) else { return nil }
+        return String(text[found])
+    }
+
+    /// Match the exact source id, so `S7` does not match `S70`.
+    private static func containsSourceID(_ token: String, in text: String) -> Bool {
+        let escaped = NSRegularExpression.escapedPattern(for: token)
+        guard let regex = try? NSRegularExpression(
+            pattern: "(?<![A-Za-z0-9])\(escaped)(?![0-9])"
+        ) else { return false }
+        let range = NSRange(text.startIndex..., in: text)
+        return regex.firstMatch(in: text, range: range) != nil
+    }
+
+    private func sourceKeyEvent(
+        _ type: NSEvent.EventType,
+        characters: String,
+        code: UInt16,
+        window: NSWindow
+    ) -> NSEvent? {
+        NSEvent.keyEvent(
+            with: type,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber,
+            context: nil,
+            characters: characters,
+            charactersIgnoringModifiers: characters,
+            isARepeat: false,
+            keyCode: code
+        )
+    }
+
+    private func sendSourceKey(_ down: NSEvent, _ up: NSEvent?, to window: NSWindow) {
+        let handled = window.performKeyEquivalent(with: down)
+        if !handled {
+            window.sendEvent(down)
+            if let up { window.sendEvent(up) }
+        }
+    }
+
+    /// Always deliver a real Space after returning from a source. If it cannot
+    /// activate the source row, that is recorded as a failure (the remaining
+    /// steps still run). On success the same source is verified, then Escape
+    /// leaves it and the original control is compared.
+    private func sourceReopen(step: [String: Any]) async throws -> [String: Any] {
+        let name = step["remember"] as? String ?? "source-link"
+        let remembered = axMarkText[name] ?? ""
+        let window = try nsWindow(for: "details")
+        let original = window.firstResponder
+        let originalID = original.map { ObjectIdentifier($0) }
+        var info: [String: Any] = [
+            "remembered": remembered,
+            "responderBefore": original.map { String(describing: Swift.type(of: $0)) } ?? "nil",
+            "axFocusedBefore": describeAX(focusedAXElement()),
+        ]
+        guard let down = sourceKeyEvent(.keyDown, characters: " ", code: 49, window: window),
+              let up = sourceKeyEvent(.keyUp, characters: " ", code: 49, window: window) else {
+            keyboardFailures.append("无法构造 Space 事件，出处键盘重开未执行")
+            info["keyboardReopen"] = "not-delivered"
+            return info
+        }
+
+        sendSourceKey(down, up, to: window)
+        let openDeadline = Date().addingTimeInterval(4)
+        var reopened = false
+        while Date() < openDeadline {
+            let root = try axWindow("details")
+            if axFind(root, { axText($0).contains("返回报告") }) != nil {
+                reopened = true
+                break
+            }
+            try await settle(0.1)
+        }
+        guard reopened else {
+            let failure = "键盘 Space 没有打开出处「\(remembered)」；"
+                + "返回后焦点是 \(describeAX(focusedAXElement()))"
+            keyboardFailures.append(failure)
+            info["keyboardReopen"] = "not-activated"
+            return info
+        }
+
+        let token = Self.sourceID(in: remembered) ?? ""
+        let root = try axWindow("details")
+        if token.isEmpty {
+            keyboardFailures.append("无法从记录的出处「\(remembered)」确定 sourceId")
+        } else if axFind(root, maxNodes: 1600, limitMs: 1200, { element in
+            Self.containsSourceID(token, in: axText(element))
+        }) == nil {
+            keyboardFailures.append("键盘重开的出处不是同一来源（缺少独立的「\(token)」）")
+        }
+        info["sourceToken"] = token
+
+        // Leave the source again with a real Escape.
+        if let escDown = sourceKeyEvent(.keyDown, characters: "\u{1b}", code: 53, window: window),
+           let escUp = sourceKeyEvent(.keyUp, characters: "\u{1b}", code: 53, window: window) {
+            sendSourceKey(escDown, escUp, to: window)
+        }
+        let closeDeadline = Date().addingTimeInterval(4)
+        var closed = false
+        while Date() < closeDeadline {
+            let report = try axWindow("details")
+            if axFind(report, { axText($0).contains("讨论报告") }) != nil {
+                closed = true
+                break
+            }
+            try await settle(0.1)
+        }
+        guard closed else {
+            keyboardFailures.append("键盘 Escape 没有从出处返回报告")
+            info["keyboardReopen"] = "reopened-not-returned"
+            return info
+        }
+        let after = window.firstResponder
+        let afterID = after.map { ObjectIdentifier($0) }
+        info["responderAfter"] = after.map { String(describing: Swift.type(of: $0)) } ?? "nil"
+        if let originalID {
+            info["returnedToSameResponder"] = afterID == originalID
+            if afterID != originalID {
+                keyboardFailures.append(
+                    "出处键盘返回后焦点是 \(info["responderAfter"] ?? "nil")，不是原控件 "
+                    + String(describing: Swift.type(of: original!))
+                )
+            }
+        } else {
+            info["returnedToSameResponder"] = "unverified-no-focus"
+            coverageGaps.append("出处返回后后台没有可核对的控件焦点，无法确认回到原控件")
+        }
+        info["keyboardReopen"] = "same-source"
+        return info
     }
 
     // MARK: 历史回看
