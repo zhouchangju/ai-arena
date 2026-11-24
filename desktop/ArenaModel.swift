@@ -1458,6 +1458,11 @@ final class ArenaModel: ObservableObject {
     /// Persist the upload attempt *before* passing any bytes to the page.
     /// After a restart the final submit can only use a previously prepared,
     /// site/task-owned composer. A missing proof requires manual takeover.
+    ///
+    /// A persisted started marker never authorizes another upload. The page is
+    /// asked to re-verify the same task's existing draft instead
+    /// (`recheckImagePreparation`); the driver refuses to upload again for a
+    /// recheck and keeps every precondition (same document, task and draft).
     private func prepareOpeningImages(
         provider: String, taskID: String, prompt: String, config: ArenaSiteConfig,
         pane: SitePane, token: UUID, knownDraftDigests: [String]
@@ -1467,35 +1472,62 @@ final class ArenaModel: ObservableObject {
         guard await waitWhilePaused(token), callbackIsCurrent(token: token, taskID: taskID, provider: provider),
               let currentID else { return false }
         var intent = intents[taskID] ?? newIntent(taskID: taskID, prompt: prompt)
-        if intent.imagePreparationStarted == true { return true }
+        // A resume, a restart or a failed preflight must recheck the known
+        // upload instead of going straight to the final submit.
+        let recheck = intent.imagePreparationStarted == true
+        let names = openingImageNames
 
         do {
-            var message = engine.driverMessage(kind: "submit", taskID: taskID, prompt: prompt,
-                                              knownDraftDigests: knownDraftDigests, config: config)
-            message["images"] = try images.map { image -> [String: String] in
+            let payload = try images.map { image -> [String: String] in
                 guard let name = image.arenaString("name"), let mediaType = image.arenaString("mediaType") else {
                     throw ArenaEngineError("本场图片信息不完整")
                 }
                 let data = try engine.store.attachmentData(sessionID: currentID, attachment: image)
                 return ["name": name, "mediaType": mediaType, "base64": data.base64EncodedString()]
             }
-            let names = openingImageNames
-            message["prepareImagesOnly"] = true
-            intent.imagePreparationStarted = true
-            intents[taskID] = intent
-            guard persist() else {
-                intents[taskID]?.imagePreparationStarted = nil
-                throw ArenaEngineError("未能保存附件投递记录，未开始上传")
+            if !recheck {
+                intent.imagePreparationStarted = true
+                intents[taskID] = intent
+                guard persist() else {
+                    intents[taskID]?.imagePreparationStarted = nil
+                    throw ArenaEngineError("未能保存附件投递记录，未开始上传")
+                }
             }
-            setState(provider, .sending, "正在原页添加并核对图片…")
-            let result = try await pane.command(message)
+            setState(provider, .sending, recheck ? "正在原页核对已添加的图片…" : "正在原页添加并核对图片…")
+            var rechecked = recheck
+            var result = try await sendImagePreparation(
+                taskID: taskID, prompt: prompt, config: config, pane: pane,
+                knownDraftDigests: knownDraftDigests, images: payload, recheck: recheck
+            )
             guard callbackIsCurrent(token: token, taskID: taskID, provider: provider) else { return false }
+            // Gemini can still be finishing this very upload when it first
+            // reports not-ready. Exactly one bounded, read-only recheck is
+            // allowed for a refusal that states no click happened before the
+            // upload was attempted. Terminal refusals, refusals before any
+            // file reached the page, and post-click answers are never retried.
+            let refusal = result["detail"] as? [String: Any]
+            let preClickRefusal = refusal?.arenaBool("clickAttempted") == false
+                && refusal?.arenaString("phase") == "pre-click"
+                && refusal?.arenaBool("uploadAttempted") != false
+            if !recheck, provider == "gemini",
+               result.arenaString("error") == "attachment-not-ready", preClickRefusal,
+               await waitWhilePaused(token),
+               callbackIsCurrent(token: token, taskID: taskID, provider: provider) {
+                setState(provider, .sending, "图片尚未就绪，自动只读核对一次…")
+                rechecked = true
+                result = try await sendImagePreparation(
+                    taskID: taskID, prompt: prompt, config: config, pane: pane,
+                    knownDraftDigests: knownDraftDigests, images: payload, recheck: true
+                )
+                guard callbackIsCurrent(token: token, taskID: taskID, provider: provider) else { return false }
+            }
             let detail = result["detail"] as? [String: Any]
             guard result.arenaString("status") == "attachments-ready",
                   detail?["readyImageNames"] as? [String] == names else {
-                if detail?.arenaBool("uploadAttempted") == false {
-                    // A driver refusal before handing any file to the website
-                    // permits an explicit retry after the user resolves it.
+                // Clear the marker only when no command has ever touched the
+                // page: this must be the first refusal, before any upload, and
+                // no recheck may have run. A refused recheck keeps it.
+                if !rechecked, detail?.arenaBool("uploadAttempted") == false {
                     intents[taskID]?.imagePreparationStarted = nil
                     persist()
                 }
@@ -1512,6 +1544,22 @@ final class ArenaModel: ObservableObject {
             setState(provider, .needsAction, "图片待核对：\(Self.short(error.localizedDescription))")
             return false
         }
+    }
+
+    /// The one `prepareImagesOnly` command. The decoded files always travel with
+    /// it so the page can fingerprint the exact selection. `recheck` only asks
+    /// the page to re-verify the same task's draft: the driver must refuse to
+    /// upload again and preserve every precondition.
+    private func sendImagePreparation(
+        taskID: String, prompt: String, config: ArenaSiteConfig, pane: SitePane,
+        knownDraftDigests: [String], images: [[String: String]], recheck: Bool
+    ) async throws -> [String: Any] {
+        var message = engine.driverMessage(kind: "submit", taskID: taskID, prompt: prompt,
+                                          knownDraftDigests: knownDraftDigests, config: config)
+        message["images"] = images
+        message["prepareImagesOnly"] = true
+        if recheck { message["recheckImagePreparation"] = true }
+        return try await pane.command(message)
     }
 
     private func attachmentProblem(_ response: [String: Any], fallback: String) -> String {

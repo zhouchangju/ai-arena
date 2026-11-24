@@ -1428,6 +1428,24 @@ final class SitePane: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
             message[key] = source[key]
         }
 
+        // `recheckImagePreparation` only answers an upload attempt this task
+        // already persisted, so it is valid on exactly one shape: an independent
+        // submit that carries images for first-round preparation. Anything else
+        // is refused here rather than dropped, so a misplaced or mistyped flag
+        // can never look like it reached the page.
+        if let rawRecheck = source["recheckImagePreparation"] {
+            guard let recheck = rawRecheck as? Bool else {
+                throw SitePaneError.invalidCommand("recheckImagePreparation 必须是布尔值")
+            }
+            guard normalizedType == "arena.web.submit",
+                  taskID.contains(":independent:"),
+                  source["prepareImagesOnly"] as? Bool == true,
+                  (source["images"] as? [Any])?.isEmpty == false else {
+                throw SitePaneError.invalidCommand("附件核对标记只能随该席首轮图片准备")
+            }
+            message["recheckImagePreparation"] = recheck
+        }
+
         if let rawDigests = source["knownDraftDigests"] {
             message["knownDraftDigests"] = try Self.normalizedDraftDigests(rawDigests)
         }

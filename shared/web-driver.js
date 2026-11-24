@@ -14,6 +14,10 @@
  *     prompt: '本轮要发送的原文',          // submit 必填
  *     // 首轮有图时先用 prepareImagesOnly:true 和 images:[{name,mediaType,base64}]
  *     // 准备页面文件；下次 submit/read 只传 imageNames:[...] 核对同组图片。
+ *     // 同一 task、同一页面上再次 prepare 只复核对本驱动已经派发过的上传
+ *     // （文件摘要 + 预览像素），绝不第二次把文件交给页面。
+ *     // Gemini 现版编辑区没有 file input 时，仅在识别出的 dropzone 内用一次
+ *     // paste 兜底；recheckImagePreparation:true 只复核，从不重贴或重传。
  *     selectors: {
  *       input: '#composer',                 // 输入框（必填）
  *       send: '#send',                     // 发送控件（必填）
@@ -103,6 +107,42 @@
  *      已有记录上遇到 user-turn-mismatch / history-changed 且携带原文一致时，
  *      同样在期限内保持 pending（detail.reason=read-recovery-pending），
  *      不因一次没找到就永久停下。
+ *
+ *   9. 开场图片的“同一任务可恢复核对”：prepare 已把文件交给页面、但预览晚于
+ *      该次等待才出现时，首次调用返回 attachment-not-ready（uploadAttempted
+ *      不为 false）。之后同一 taskId、同一会话地址、同一编辑区和同一组图名的
+ *      prepare 只复核对，不重新派发：
+ *        a) 必须仍是本驱动为这个任务记录的上传，且文件输入仍是同一个，里面
+ *           要么还是我们创建的 File 对象，要么已被站点清空；出现别人的文件
+ *           即 attachment-draft-conflict；
+ *        b) 收到 images 时逐张比对文件字节摘要，同名不同字节也视为冲突；
+ *        c) 草稿正文和本轮用户/回答节点数必须与派发时一致，用户编辑过就不接管。
+ *           唯一例外是本驱动自己写入并核对过的本轮 prompt（记录为 filledText，
+ *           且 textarea 当前规范化后仍与它全等），用于“准备成功、等发送键时
+ *           已填好正文”的恢复；
+ *        d) 预览必须按顺序逐张命中文件名或整图像素摘要。只有“已缓存且非空、
+ *           但与本轮文件摘要不同”才算冲突；仍不可读、尚未解码或还没挂满的
+ *           预览只算未就绪，在 submitTimeoutMs 内继续等；
+ *        e) 成功后返回 attachments-ready 且 detail.resumedUpload=true，仍不点击。
+ *      `recheckImagePreparation:true`（与 prepareImagesOnly、images 同发）是
+ *      重启后的显式复核：只认同一文档、同一任务、本驱动记录过的上传；没有这条
+ *      记录时返回 attachment-draft-conflict 且 detail.uploadAttempted=true，
+ *      不按数量或页面预览猜测，也绝不构造或派发任何 File。
+ *      已点击过的 taskId 在 submit 入口就按去重返回既有状态，不再进入附件准备。
+ *
+ *  10. Gemini 现版编辑区在 Upload & Tools 菜单关闭时文档里没有 file input；菜单
+ *      打开的图片入口挂在编辑区之外，设值/合成拖放都不生效。真实登录页验证过的
+ *      路径是：用我们已有的 DataTransfer（内含 File）向编辑区派发一次
+ *      `paste` ClipboardEvent。该兜底只在以下条件全部成立时使用：
+ *        a) composer 内没有任何匹配的本地 file input（候选 0 个；多个仍按歧义拒绝）；
+ *        b) 当前 origin 恰为 https://gemini.google.com；
+ *        c) 编辑区位于站点自己的 `.xap-uploader-dropzone` 内；
+ *        d) 文档里没有任何 file input 已经带着文件。
+ *      其它站点、其它布局、缺少 dropzone 一律照旧按 attachment-unsupported 停下。
+ *      粘贴只派发一次；记录里 entry='paste'、fileInput=null（这是预期），并保存
+ *      编辑器节点、任务、地址、文件摘要和像素。之后同一任务的 prepare/recheck
+ *      只复核对：同一编辑器、同一 dropzone、无任何 file input 持有文件、字节摘要
+ *      一致、按顺序命中预览像素；不再粘贴。收据仍按原规则逐图校验。
  *
  * 错误码（status:error 时 error 字段）：
  *   bad-message, foreign-sender, not-authorized-page, document-not-ready,
@@ -660,6 +700,14 @@
   function parseImages(message) {
     const images = message.images;
     const preparing = message.prepareImagesOnly === true;
+    if (message.recheckImagePreparation !== undefined &&
+        typeof message.recheckImagePreparation !== 'boolean') {
+      return { error: fail('bad-message', { field: 'recheckImagePreparation' }) };
+    }
+    const recheck = message.recheckImagePreparation === true;
+    if (recheck && !preparing) {
+      return { error: fail('bad-message', { field: 'recheckImagePreparation', reason: 'prepare-only' }) };
+    }
     if (images === undefined && message.imageNames === undefined && !preparing) return { names: [] };
     const names = preparing && Array.isArray(images) ? images.map((item) => item?.name) : message.imageNames;
     if (!message.taskId.includes(':independent:') || !Array.isArray(names) || !names.length || names.length > 8 ||
@@ -682,7 +730,7 @@
         pixels.some((hash) => typeof hash !== 'string' || (hash !== '' && !/^[0-9a-f]{64}$/.test(hash)))) {
       return { error: fail('bad-message', { field: 'imagePixels' }) };
     }
-    return { names, images, pixels };
+    return { names, images, pixels, recheck };
   }
 
   function parseCommon(message, needPrompt) {
@@ -746,6 +794,7 @@
       imageNames: attachments.names,
       images: attachments.images,
       imagePixels: attachments.pixels || [],
+      recheckImagePreparation: attachments.recheck === true,
       freshConversationOnly: message.freshConversationOnly === true,
     };
   }
@@ -1385,11 +1434,15 @@
     // React can mount a text editor several seconds before the upload picker.
     // Reuse the native bounded, read-only probe loop: each poll checks pause,
     // takeover and the active task before any file bytes are furnished.
+    // Gemini's current composer has no file input until its Upload & tools
+    // menu opens; its own uploader dropzone is the recognized paste layout, so
+    // a judge/opening probe may report ready without a picker. Every other
+    // layout still needs a matching picker and otherwise fails closed.
     if (req.imageNames.length && !state.records.has(req.taskId) && !hasFiles) {
       const kinds = req.imageNames.map((name) => ({
         name, mediaType: /\.png$/i.test(name) ? 'image/png' : 'image/jpeg',
       }));
-      if (!area || !imagePickers(area, kinds).length) {
+      if (!area || (!imagePickers(area, kinds).length && !geminiPasteUploader(input))) {
         return fail('selector-missing', { which: 'attachment-picker',
           reason: area ? 'missing-picker' : 'missing-composer', uploadAttempted: false });
       }
@@ -1658,6 +1711,71 @@
     return { missingImageNames: names.filter((name) => !matched.has(name)) };
   }
 
+  /**
+   * Classify the composer previews against the dispatch this driver made.
+   * `ready` needs positive ordered evidence (name or full-image pixel digest)
+   * for every image. `pending` means a preview is absent or still decoding:
+   * a transition frame can resolve later. `conflict` needs positive evidence
+   * of a different image (a non-empty digest that differs, a name that belongs
+   * to another slot, or an extra tile), never the mere absence of evidence.
+   *
+   * Real Gemini markup (prior observation): one `gem-media-attachment` holding
+   * a single blob `<img alt="">`, no progress node. A 1600x1462 PNG gave the
+   * same pixel digest from HTMLImageElement and createImageBitmap offline in
+   * WebKit, so an unlabeled preview is provable by pixels alone.
+   */
+  function evidenceTriage(root, names, pixels = []) {
+    const roots = attachmentRoots(root);
+    if (roots.length > names.length) return 'conflict';
+    let pending = roots.length < names.length;
+    for (let i = 0; i < roots.length; i++) {
+      const node = roots[i];
+      if (attachmentLabelMatches(node, names[i])) continue;
+      if (names.some((name, index) => index !== i && attachmentLabelMatches(node, name))) return 'conflict';
+      const image = evidenceImage(node);
+      const cached = image && previewPixels.get(image);
+      if (!image || !cached || cached.src !== image.currentSrc || !cached.hash) {
+        pending = true;
+        continue;
+      }
+      if (!pixels[i]) {
+        pending = true;
+        continue;
+      }
+      if (cached.hash !== pixels[i]) return 'conflict';
+    }
+    return pending ? 'pending' : 'ready';
+  }
+
+  /** SHA-256 of each delivered File's bytes, read once from our own selection. */
+  async function fileSourceDigests(files) {
+    const out = [];
+    for (const file of files || []) {
+      try {
+        out.push(await digestHex(new Uint8Array(await file.arrayBuffer())));
+      } catch (_) {
+        out.push('');
+      }
+    }
+    return out;
+  }
+
+  /** SHA-256 of a retry's bytes, used to prove it carries nothing new. */
+  async function imageSourceDigests(images) {
+    const out = [];
+    for (const image of images || []) {
+      try {
+        const binary = atob(image.base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        out.push(await digestHex(bytes));
+      } catch (_) {
+        out.push('');
+      }
+    }
+    return out;
+  }
+
   function editorAttachmentArea(input, req) {
     const candidates = req.selectors.attachmentComposer || [];
     for (const css of ['[data-arena-composer]', ...[].concat(candidates)]) {
@@ -1698,69 +1816,221 @@
     return [generalChatGPT, photoInputs, mediaInputs, inputs].find((group) => group.length) || [];
   }
 
-  async function prepareImages(state, req, editor, root) {
+  /**
+   * Gemini's current composer has no file input while the Upload & tools menu is
+   * closed; opening it hoists one elsewhere in the document, and that input does
+   * not accept a synthetic selection. On a real signed-in page the working path
+   * was one `paste` ClipboardEvent carrying our existing DataTransfer on the
+   * editor itself. Require that exact host and Gemini's own uploader dropzone,
+   * so no other site or layout can reach this branch.
+   */
+  function geminiPasteUploader(editor) {
+    if (location.origin !== GEMINI_ORIGIN || !isElement(editor)) return null;
+    try {
+      return editor.closest('.xap-uploader-dropzone');
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /** Any file input in this document that already holds files (ours or a human's). */
+  function documentPickerFiles() {
+    return [...document.querySelectorAll('input[type="file"]')].filter((el) => el.files?.length);
+  }
+
+  /**
+   * The composer still belongs to the draft we dispatched: same document, same
+   * composer area, same history counts, and the text is either what the site
+   * held at upload time or the exact prompt this driver wrote afterwards.
+   * A prompt that merely looks similar, or one the user typed, is not ours.
+   */
+  function draftLocationIntact(draft, req, editor, root, container) {
+    if (!editor.isConnected || editorAttachmentArea(editor, req) !== root ||
+        draft.href !== location.href ||
+        listNodes(req.selectors.user, container).length !== draft.users ||
+        listNodes(req.selectors.answer, container).length !== draft.answers) {
+      return false;
+    }
+    const text = composerText(composerRoot(editor));
+    if (text === draft.draftText) return true;
+    return typeof draft.filledText === 'string' && sameText(text, draft.filledText);
+  }
+
+  /**
+   * Bounded wait shared by a fresh dispatch, a same-task retry and the explicit
+   * `recheckImagePreparation` mode. It only ever reads the page: no File is
+   * dispatched from here, and readiness requires the same ordered pixel/name
+   * evidence a receipt uses.
+   */
+  async function awaitImageDraft(draft, req, editor, root, container, names) {
+    // Only a live, positively matched preview set may be marked ready.
+    draft.ready = false;
+    draft.nodes = null;
+    const deadline = Date.now() + req.options.submitTimeoutMs;
+    do {
+      const gate = conversationGate(req.scope, 'pre-click');
+      if (gate) return gate;
+      if (!draftLocationIntact(draft, req, editor, root, container)) {
+        return attachmentError('attachment-draft-conflict', names, true);
+      }
+      if (uploadErrorVisible(root)) return attachmentError('attachment-upload-failed', names, true, root);
+      await sampleImageEvidence(root, names, draft.pixels);
+      const evidence = evidenceTriage(root, names, draft.pixels);
+      if (evidence === 'conflict') return attachmentError('attachment-draft-conflict', names, true);
+      if (evidence === 'ready' && !uploadBlocked(root, uploadPending) && !uploadErrorVisible(root)) {
+        draft.nodes = attachmentRoots(root);
+        draft.ready = true;
+        return reply('attachments-ready', {
+          detail: { readyImageNames: names, readyImagePixels: draft.pixels,
+            clickAttempted: false, ...(draft.resumed === true && { resumedUpload: true }) },
+        });
+      }
+      await sleep(req.options.pollMs);
+    } while (Date.now() < deadline);
+    return attachmentError('attachment-not-ready', names, true, root);
+  }
+
+  /**
+   * Prove that the recorded draft is really this driver's upload for this task
+   * and document before any re-check trusts its previews.
+   */
+  async function verifyRecordedUpload(state, req, editor, root, container, names) {
+    const draft = state.imageDraft;
+    if (!root || !draft || draft.taskId !== req.taskId || draft.href !== location.href ||
+        draft.root !== root || !sameItems(draft.names, names) ||
+        !Array.isArray(draft.files) || draft.files.length !== names.length ||
+        !Array.isArray(draft.sourceDigests) || draft.sourceDigests.length !== names.length ||
+        draft.editor !== editor) {
+      return false;
+    }
+    // A recheck may carry the same bytes again; they must be the delivered ones.
+    if (req.images) {
+      const digests = await imageSourceDigests(req.images);
+      if (digests.some((hash) => !hash) || !sameItems(digests, draft.sourceDigests)) return false;
+    }
+    if (!draftLocationIntact(draft, req, editor, root, container)) return false;
+    if (draft.entry === 'paste') {
+      // The verified Gemini paste never owns a picker. Any picker that holds
+      // files belongs to the page or the user, so this is not our draft.
+      if (documentPickerFiles().length) return false;
+      if (!geminiPasteUploader(editor)) return false;
+    } else {
+      if (!isElement(draft.fileInput) || !draft.fileInput.isConnected || !root.contains(draft.fileInput)) {
+        return false;
+      }
+      // The site may clear its input after importing the File objects. Any file
+      // left anywhere in this composer must still be our own selection.
+      for (const picker of root.querySelectorAll('input[type="file"]')) {
+        const files = picker.files ? Array.from(picker.files) : [];
+        if (!files.length) continue;
+        if (picker !== draft.fileInput || !sameItems(files, draft.files)) return false;
+      }
+    }
+    return true;
+  }
+
+  /** A recheck/retry that may already have uploaded: never clears the caller's intent. */
+  function unprovenUploadConflict(names) {
+    const failure = attachmentError('attachment-draft-conflict', names, true);
+    failure.detail.uploadAttempted = true;
+    return failure;
+  }
+
+  async function prepareImages(state, req, editor, root, container) {
     const names = req.imageNames;
     const prior = state.imageDraft;
     const uploadAttempted = prior?.taskId === req.taskId;
+    // Explicit recheck after a restart: only our own same-document, same-task
+    // upload may be adopted. Without that record (even when the composer is
+    // gone) fail closed and say an upload may already have happened; never
+    // build or dispatch a File here.
+    if (req.recheckImagePreparation) {
+      if (!await verifyRecordedUpload(state, req, editor, root, container, names)) {
+        return unprovenUploadConflict(names);
+      }
+      state.imageDraft.resumed = true;
+      return awaitImageDraft(state.imageDraft, req, editor, root, container, names);
+    }
     if (!root) {
       const failure = attachmentError('attachment-unsupported', names, uploadAttempted);
       failure.detail.reason = 'missing-composer';
       return failure;
     }
-    if (prior && prior.taskId === req.taskId && prior.root === root && prior.href === location.href &&
-        sameItems(prior.names, names) && prior.ready && evidenceMatches(root, names, prior.pixels) &&
-        !uploadBlocked(root, uploadPending) && !uploadErrorVisible(root)) {
-      return reply('attachments-ready', { detail: { readyImageNames: names, readyImagePixels: state.imageDraft.pixels, clickAttempted: false } });
+    // Same task on the same document: reuse the recorded upload. A retry must
+    // not create a second upload, so no new files are ever built.
+    if (prior && prior.taskId === req.taskId) {
+      if (!await verifyRecordedUpload(state, req, editor, root, container, names)) {
+        return attachmentError('attachment-draft-conflict', names, true);
+      }
+      prior.resumed = true;
+      return awaitImageDraft(prior, req, editor, root, container, names);
     }
     if (prior || attachmentRoots(root).length || uploadBlocked(root, uploadPending) ||
         [...root.querySelectorAll('input[type="file"]')].some((el) => el.files?.length)) {
       return attachmentError('attachment-draft-conflict', names, uploadAttempted);
     }
     const candidates = imagePickers(root, req.images);
-    if (candidates.length !== 1) {
+    // The picker path stays first and unchanged. Only when this composer has no
+    // matching picker, on Gemini's own dropzone, may the verified clipboard
+    // paste be used; multiple pickers and every other host still fail closed.
+    const paste = candidates.length === 0 && Boolean(geminiPasteUploader(editor));
+    if (paste && documentPickerFiles().length) {
+      // A picker anywhere in this document already holds files: a human
+      // selection we cannot adopt. Never paste on top of it.
+      return attachmentError('attachment-draft-conflict', names, uploadAttempted);
+    }
+    if (candidates.length !== 1 && !paste) {
       const failure = attachmentError('attachment-unsupported', names, uploadAttempted);
       failure.detail.reason = candidates.length ? 'ambiguous-picker' : 'missing-picker';
       failure.detail.candidateCount = candidates.length;
       return failure;
     }
     if (uploadErrorVisible(root)) return attachmentError('attachment-upload-failed', names, uploadAttempted);
-    const fileInput = candidates[0];
+    const fileInput = paste ? null : candidates[0];
     const draftText = composerText(composerRoot(editor));
+    let files;
     try {
-      const files = new DataTransfer();
+      files = new DataTransfer();
       for (const image of req.images) {
         const binary = atob(image.base64);
         const bytes = new Uint8Array(binary.length);
         for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
         files.items.add(new File([bytes], image.name, { type: image.mediaType }));
       }
-      state.imageDraft = { taskId: req.taskId, names, href: location.href, root, fileInput,
-        files: Array.from(files.files), ready: false };
-      fileInput.files = files.files;
-      fileInput.dispatchEvent(new Event('input', { bubbles: true }));
-      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
     } catch (_) {
       return attachmentError('attachment-upload-failed', names);
     }
-    state.imageDraft.pixels = await filePixelSignatures(state.imageDraft.files);
-    const deadline = Date.now() + req.options.submitTimeoutMs;
-    do {
-      const gate = conversationGate(req.scope, 'pre-click');
-      if (gate) return gate;
-      if (!editor.isConnected || editorAttachmentArea(editor, req) !== root ||
-          composerText(composerRoot(editor)) !== draftText) return attachmentError('attachment-draft-conflict', names);
-      if (uploadErrorVisible(root)) return attachmentError('attachment-upload-failed', names, true, root);
-      await sampleImageEvidence(root, names, state.imageDraft.pixels);
-      if (root.isConnected && editor.isConnected && state.imageDraft.href === location.href &&
-          composerText(composerRoot(editor)) === draftText && evidenceMatches(root, names, state.imageDraft.pixels) &&
-          !uploadBlocked(root, uploadPending) && !uploadErrorVisible(root)) {
-        state.imageDraft.nodes = attachmentRoots(root);
-        state.imageDraft.ready = true;
-        return reply('attachments-ready', { detail: { readyImageNames: names, readyImagePixels: state.imageDraft.pixels, clickAttempted: false } });
+    // The record is the provenance every later re-check trusts: the exact File
+    // objects we handed over, where the page was, what the composer held, and
+    // which entry was used. It is complete *before* the dispatch so no reader
+    // sees a half record, and the digest read happens after the page has them.
+    const draft = { taskId: req.taskId, names, href: location.href, root, fileInput,
+      entry: paste ? 'paste' : 'picker', editor,
+      files: Array.from(files.files), sourceDigests: [],
+      draftText: draftText, users: listNodes(req.selectors.user, container).length,
+      answers: listNodes(req.selectors.answer, container).length,
+      pixels: [], nodes: null, ready: false };
+    state.imageDraft = draft;
+    try {
+      if (paste) {
+        // Exactly one paste per dispatch: Gemini imports the Files from this
+        // event. A retry or recheck never reaches this branch.
+        editor.dispatchEvent(new ClipboardEvent('paste', {
+          clipboardData: files, bubbles: true, cancelable: true, composed: true,
+        }));
+      } else {
+        fileInput.files = files.files;
+        fileInput.dispatchEvent(new Event('input', { bubbles: true }));
+        fileInput.dispatchEvent(new Event('change', { bubbles: true }));
       }
-      await sleep(req.options.pollMs);
-    } while (Date.now() < deadline);
-    return attachmentError('attachment-not-ready', names, true, root);
+    } catch (_) {
+      return attachmentError('attachment-upload-failed', names, true);
+    }
+    // Read each File once, after the single dispatch, so hashing can never
+    // delay or interleave with the hand-off.
+    draft.sourceDigests = await fileSourceDigests(draft.files);
+    draft.pixels = await filePixelSignatures(draft.files);
+    return awaitImageDraft(draft, req, editor, root, container, names);
   }
 
   function checkImageDraft(state, req, editor) {
@@ -1781,6 +2051,11 @@
     }
     // Sites can clear their input after importing File objects. If files still
     // exist, require identity with our selection, including every other picker.
+    // A paste draft never owns a picker, so any document picker with files is
+    // a human selection and must stop the click.
+    if (prior.entry === 'paste' && documentPickerFiles().length) {
+      return attachmentError('attachment-draft-conflict', names);
+    }
     for (const picker of root.querySelectorAll('input[type="file"]')) {
       if (picker.files?.length && (picker !== prior.fileInput || !sameItems(Array.from(picker.files), prior.files))) {
         return attachmentError('attachment-draft-conflict', names);
@@ -1878,7 +2153,7 @@
     if (beforeFill) return beforeFill;
     let preparation;
     if (req.images) {
-      preparation = await prepareImages(state, req, input, editorAttachmentArea(input, req));
+      preparation = await prepareImages(state, req, input, editorAttachmentArea(input, req), container);
       if (!preparation.ok) return preparation;
       // Uploads and pixel checks can take time. Revalidate the complete draft
       // and page immediately before a write, including user navigation/edits.
@@ -1910,6 +2185,14 @@
       await sleep(60);
       if (!sameText(composerText(composerRoot(input)), req.prompt)) {
         return fail('fill-mismatch', { phase: 'after-fill' });
+      }
+      // Record a verified fill of *this* task so a later recheck can tell our
+      // own prompt from an unrelated draft. The task, document and composer
+      // must all still be the ones the upload was made on.
+      if (state.imageDraft && state.imageDraft.taskId === req.taskId &&
+          state.imageDraft.href === location.href &&
+          state.imageDraft.root === editorAttachmentArea(input, req)) {
+        state.imageDraft.filledText = req.prompt;
       }
     }
 

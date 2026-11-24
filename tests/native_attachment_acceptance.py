@@ -9,6 +9,7 @@ from pathlib import Path
 import struct
 import subprocess
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 import zlib
@@ -102,7 +103,10 @@ files.addEventListener('change',()=>{
  previews.replaceChildren();
  const visible=mode==='partial'?uploaded.slice(0,1):uploaded.slice();
  if(mode==='swapped')visible.reverse();
- for(const file of visible)addFilePreview(previews,file);
+ const render=()=>{for(const file of visible)addFilePreview(previews,file);};
+ // The real Gemini preview can mount after the driver's bounded upload wait.
+ // 31.5 s is just past the real 30 s submitTimeoutMs in this app's sites.json.
+ if(mode==='late-preview')setTimeout(render,31500);else render();
  Promise.all(uploaded.map(describe)).then(items=>observe('upload',{items,names:getNames(previews)}));
 });
 const receive=(user,prompt)=>{
@@ -151,6 +155,7 @@ def exercise(executable, directory, case):
     events = []
     modes = {
         "delivery": {"chatgpt": "late-picker", "deepseek": "late-send"},
+        "late-preview": {"chatgpt": "late-picker", "gemini": "late-preview", "deepseek": "late-send"},
         "faults": {"chatgpt": "partial", "gemini": "unknown", "deepseek": "after-click"},
         "swapped": {"gemini": "swapped"},
         "resume": {"gemini": "withhold"},
@@ -173,7 +178,8 @@ def exercise(executable, directory, case):
             if self.path != "/observed":
                 self.send_error(404)
                 return
-            events.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            events.append({**json.loads(self.rfile.read(int(self.headers["Content-Length"]))),
+                           "at": time.monotonic()})
             self.send_response(204)
             self.end_headers()
 
@@ -292,6 +298,21 @@ def exercise(executable, directory, case):
                     assert first["names"] == [image["name"] for image in EXPECTED_IMAGES], first
                 assert TEXT in first["prompt"] and all(row["status"] == "answered" for row in saved)
                 assert all(not e["items"] and not e["names"] and not e["blobHashes"] for e in later), later
+            if case == "late-preview":
+                # The site mounted its previews after the driver's bounded upload
+                # wait. The native layer must re-check that same upload once and
+                # then send once: one upload, one send, at least 30 s after it.
+                uploads = [event for event in events
+                           if event["site"] == "gemini" and event["event"] == "upload"]
+                assert len(uploads) == 1 and uploads[0]["items"] == EXPECTED_IMAGES, uploads
+                first_send = sent_to("gemini")[0]
+                assert first_send["at"] - uploads[0]["at"] >= 30, (uploads[0], first_send)
+                saved = json.loads((directory / "data" / (session["id"] + ".json")).read_text())
+                intent = next(i for i in saved["intents"]
+                              if i["taskId"].endswith(":independent:gemini"))
+                assert intent["imagePreparationStarted"] is True, intent
+                assert intent["phase"] == "submitted", intent
+                assert len(intent["imagePixelDigests"]) == 2, intent
             # Reopen after removing the original Finder items. Saved evidence and
             # export must remain usable; restoration cannot post another turn.
             for source in inputs.iterdir():
@@ -370,7 +391,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--app", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
-    parser.add_argument("--case", choices=("all", "pasteboard", "delivery", "faults", "swapped", "resume"), default="all")
+    parser.add_argument("--case", choices=("all", "pasteboard", "delivery", "late-preview", "faults",
+                                           "swapped", "resume"), default="all")
     args = parser.parse_args()
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -379,7 +401,8 @@ def main():
     if args.case == "pasteboard":
         return
     with stage_qa_app(args.app, out / "qa-app") as qa:
-        for case in ("delivery", "faults", "swapped", "resume") if args.case == "all" else (args.case,):
+        for case in (("delivery", "late-preview", "faults", "swapped", "resume")
+                     if args.case == "all" else (args.case,)):
             exercise(qa.executable, out / case, case)
             print("PASS: WKWebView attachment " + case, flush=True)
 
