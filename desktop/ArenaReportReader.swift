@@ -120,14 +120,16 @@ struct ArenaReportReader: View {
                                 .id("candidate-comparison")
                         }
                         if let answer = proposal?.answer {
-                            DisclosureGroup("候选全文", isExpanded: $showCandidate) {
-                                if showCandidate { markdown(answer).padding(.top, 12) }
+                            ReportDisclosure(isExpanded: $showCandidate) {
+                                Text("候选全文")
+                            } content: {
+                                markdown(answer).padding(.top, 12)
                             }
                         }
-                        DisclosureGroup(isExpanded: $showSources) {
-                            if showSources { sourceList }
-                        } label: {
+                        ReportDisclosure(isExpanded: $showSources) {
                             Label("发言与出处（\(currentSources.count)）", systemImage: "books.vertical")
+                        } content: {
+                            sourceList
                         }
                     }
                     if session?["stage"] as? String == "done",
@@ -137,23 +139,10 @@ struct ArenaReportReader: View {
                         }
                     }
                     if let original = ArenaSessionDigest.report(session) {
-                        VStack(alignment: .leading, spacing: 0) {
-                            Button {
-                                showArchive.toggle()
-                            } label: {
-                                HStack(spacing: 8) {
-                                    Image(systemName: showArchive ? "chevron.down" : "chevron.right")
-                                        .font(.caption.weight(.semibold))
-                                        .foregroundStyle(.secondary)
-                                        .accessibilityHidden(true)
-                                    Label("完整报告", systemImage: "doc.richtext")
-                                }
-                                .frame(maxWidth: .infinity, minHeight: 32, alignment: .leading)
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityValue(showArchive ? "已展开" : "已收起")
-                            if showArchive { markdown(original).padding(.top, 12) }
+                        ReportDisclosure(isExpanded: $showArchive) {
+                            Label("完整报告", systemImage: "doc.richtext")
+                        } content: {
+                            markdown(original).padding(.top, 12)
                         }
                     }
                 }
@@ -866,6 +855,48 @@ struct ArenaReportReader: View {
     }
     private static func color(_ value: String?) -> Color {
         switch value { case "agree": return .green; case "conditional": return .orange; case "oppose": return .red; default: return .secondary }
+    }
+
+    /// One collapsed block of the report. The chevron, the caller's label and the
+    /// empty space to the right are a single plain full-width button, so the whole
+    /// row toggles while the content stays inert. Accessibility reads the current
+    /// state; content only exists while expanded, exactly like the original
+    /// 完整报告 row.
+    private struct ReportDisclosure<RowLabel: View, Content: View>: View {
+        @Binding var isExpanded: Bool
+        private let label: () -> RowLabel
+        private let content: () -> Content
+
+        init(
+            isExpanded: Binding<Bool>,
+            @ViewBuilder label: @escaping () -> RowLabel,
+            @ViewBuilder content: @escaping () -> Content
+        ) {
+            self._isExpanded = isExpanded
+            self.label = label
+            self.content = content
+        }
+
+        var body: some View {
+            VStack(alignment: .leading, spacing: 0) {
+                Button {
+                    isExpanded.toggle()
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .accessibilityHidden(true)
+                        label()
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 32, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityValue(isExpanded ? "已展开" : "已收起")
+                if isExpanded { content() }
+            }
+        }
     }
 }
 
