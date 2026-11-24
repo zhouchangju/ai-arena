@@ -312,6 +312,83 @@ struct GuidanceHistoryCheck {
                 && !ArenaHistorySearchCriteria(query: "x").isDefault
         )
 
+        // --- 4b. Keyboard selection over the visible results ----------------
+        var selection = ArenaHistorySelection()
+        check("nothing is selected before the sheet loads", selection.id == nil)
+        check(
+            "reconciling an empty result set selects nothing",
+            !selection.reconcile(with: []) && selection.id == nil
+        )
+        check(
+            "reconciling selects the first visible row",
+            selection.reconcile(with: ["a", "b", "c"]) && selection.id == "a"
+        )
+        check(
+            "an already visible selection stays put",
+            !selection.reconcile(with: ["a", "b", "c"]) && selection.id == "a"
+        )
+        selection = ArenaHistorySelection(id: "c")
+        check(
+            "a query or filter change starts at the first visible row",
+            selection.selectFirst(in: ["a", "b", "c"]) && selection.id == "a"
+        )
+        check(
+            "selecting the first row again is a no-op",
+            !selection.selectFirst(in: ["a", "b", "c"]) && selection.id == "a"
+        )
+        selection = ArenaHistorySelection(id: "c")
+        check(
+            "clearing the query starts again at the newest row",
+            selection.selectFirst(in: ["n", "b", "c"]) && selection.id == "n"
+        )
+        check(
+            "a query with no results selects nothing",
+            selection.selectFirst(in: []) && selection.id == nil
+        )
+        selection = ArenaHistorySelection(id: "a")
+        check(
+            "a filter that hides the selection falls back to the first visible row",
+            selection.reconcile(with: ["b", "c"]) && selection.id == "b"
+        )
+        check(
+            "down moves one row",
+            selection.move(.down, in: ["b", "c"]) && selection.id == "c"
+        )
+        check(
+            "down stops at the last row",
+            !selection.move(.down, in: ["b", "c"]) && selection.id == "c"
+        )
+        check(
+            "up moves one row",
+            selection.move(.up, in: ["b", "c"]) && selection.id == "b"
+        )
+        check(
+            "up stops at the first row",
+            !selection.move(.up, in: ["b", "c"]) && selection.id == "b"
+        )
+        check(
+            "a filter that empties the results clears the selection",
+            selection.reconcile(with: []) && selection.id == nil
+        )
+        check(
+            "return has nothing to open on an empty result set",
+            !selection.move(.down, in: []) && !selection.move(.up, in: []) && selection.id == nil
+        )
+        check(
+            "down without a selection starts at the first row",
+            selection.move(.down, in: ["a", "b"]) && selection.id == "a"
+        )
+        selection = ArenaHistorySelection()
+        check(
+            "up without a selection starts at the last row",
+            selection.move(.up, in: ["a", "b"]) && selection.id == "b"
+        )
+        selection = ArenaHistorySelection(id: "gone")
+        check(
+            "a selection from a previous filter is replaced on the next move",
+            selection.move(.down, in: ["x", "y"]) && selection.id == "x"
+        )
+
         // --- 5. Version-scoped ballot projection ----------------------------
         let history: [[String: Any]] = [
             [

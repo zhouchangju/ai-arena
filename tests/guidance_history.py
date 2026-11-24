@@ -10,6 +10,9 @@ Target: G1/G2/G3/G4, R03/R06/R07. Verifies the pure rules behind the new
   engine's delivery bookkeeping;
 * history search filters local summaries by question, seat, outcome and state
   without mutating them;
+* the keyboard selection always stays on a visible row, restarts at the first
+  row when the query or a filter changes, falls back to the first row when the
+  saved history changes, and clears on empty results;
 * the version-scoped ballot projection keeps one candidate, its text, its
   digest metadata and that version's votes, and never prompts.
 

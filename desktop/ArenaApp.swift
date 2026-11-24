@@ -166,6 +166,13 @@ struct ArenaDesktopApp: App {
                 }
                 .keyboardShortcut(",", modifiers: .command)
             }
+            CommandGroup(after: .sidebar) {
+                Button("历史…") {
+                    guard appDelegate.canOpenHistoryFromCommand() else { return }
+                    NotificationCenter.default.post(name: .arenaOpenHistorySearch, object: nil)
+                }
+                .keyboardShortcut("f", modifiers: [.command, .shift])
+            }
         }
     }
 }
@@ -206,6 +213,15 @@ final class ArenaAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate 
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    /// ⌘⇧F only opens history from the plain main window. A sheet, a
+    /// confirmation alert or another key window (report, settings) keeps its
+    /// own shortcut context instead of having history appear underneath it.
+    @MainActor
+    func canOpenHistoryFromCommand() -> Bool {
+        guard let mainWindow, NSApp.keyWindow === mainWindow else { return false }
+        return mainWindow.attachedSheet == nil && NSApp.modalWindow == nil
     }
 
     @MainActor
@@ -457,6 +473,9 @@ struct ArenaRootView: View {
                 onClose: { showsHistorySearch = false }
             )
         }
+        .onReceive(NotificationCenter.default.publisher(for: .arenaOpenHistorySearch)) { _ in
+            showsHistorySearch = true
+        }
         .sheet(item: $guidanceTarget) { target in
             ArenaGuidanceComposer(model: model, target: target) {
                 guidanceTarget = nil
@@ -516,7 +535,16 @@ struct ArenaRootView: View {
     @ViewBuilder
     private func headerActions(compact: Bool) -> some View {
         HStack(spacing: 8) {
-            historyMenu(compact: compact)
+            if compact {
+                iconToolButton("打开历史面板（⌘⇧F）", icon: "clock.arrow.circlepath") {
+                    showsHistorySearch = true
+                }
+            } else {
+                toolButton("历史", icon: "clock.arrow.circlepath") {
+                    showsHistorySearch = true
+                }
+                .help("打开历史面板（⌘⇧F）")
+            }
             if hasStarted {
                 if compact {
                     iconToolButton("查看当前提示、历史原文、报告与原始记录", icon: "sidebar.right") {
@@ -582,87 +610,6 @@ struct ArenaRootView: View {
         .help(help)
         .accessibilityLabel(help)
     }
-
-    private func historyMenu(compact: Bool) -> some View {
-        Menu {
-            Button {
-                showsHistorySearch = true
-            } label: {
-                Label("搜索历史…", systemImage: "magnifyingglass")
-            }
-            .keyboardShortcut("f", modifiers: [.command, .shift])
-            .help("按题面、席位或结果搜索本机保存的场次")
-            Divider()
-            if model.historyList.isEmpty {
-                Button("暂无历史") {}.disabled(true)
-            } else {
-                ForEach(model.historyList) { item in
-                    Menu {
-                        Button("只读回看") {
-                            if isRunning { confirmation = .openHistory(item.id) }
-                            else { openHistory(item.id) }
-                        }
-                        if !item.isFinished {
-                            Button("继续这一场…") {
-                                confirmation = .continueHistory(item.id)
-                            }
-                            .help("先逐席核对原页，可能已发送的任务只做只读核对")
-                        }
-                    } label: {
-                        Text(historyLabel(item))
-                    }
-                }
-            }
-        } label: {
-            Group {
-                if compact {
-                    Image(systemName: "clock.arrow.circlepath")
-                        .font(.system(size: 12.5, weight: .medium))
-                        .frame(width: 30, height: 26)
-                } else {
-                    Label("历史", systemImage: "clock.arrow.circlepath")
-                        .font(.system(size: 12.5, weight: .medium))
-                        .padding(.horizontal, 9)
-                        .frame(minHeight: 26)
-                }
-            }
-            .contentShape(Rectangle())
-            .background(
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(Color.primary.opacity(0.06))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.09))
-            )
-        }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .help("打开已保存的场次")
-        .accessibilityLabel("历史场次")
-    }
-
-    /// One history row: local date/time, saved outcome and enough of the
-    /// question to tell sessions apart. An unfinished session says so.
-    private func historyLabel(_ item: ArenaHistorySummary) -> String {
-        let stamp = Self.historyDateFormatter.string(
-            from: Date(timeIntervalSince1970: item.updatedAt / 1000)
-        )
-        let outcome = historyOutcome(item)
-        return "\(stamp) · \(outcome) · \(arenaShorten(item.question, limit: 34))"
-    }
-
-    private func historyOutcome(_ item: ArenaHistorySummary) -> String {
-        ArenaHistoryOutcome.label(for: item)
-    }
-
-    private static let historyDateFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "zh_CN")
-        formatter.dateFormat = "MM-dd HH:mm"
-        return formatter
-    }()
 
     // MARK: 开始前：大号多行问题输入
 

@@ -109,6 +109,81 @@ struct ArenaHistorySearchCriteria: Equatable {
     }
 }
 
+// MARK: - Keyboard selection
+
+enum ArenaHistoryMove {
+    case up
+    case down
+}
+
+/// The one selected row in the search sheet. Kept pure so the rules the user
+/// relies on stay checkable without a window:
+///
+/// * the selection is always one of the currently visible results;
+/// * changing the query or a filter starts at the first visible row, never at
+///   a row that just disappeared; an empty result set selects none;
+/// * a saved-history refresh keeps the selection when it is still visible and
+///   otherwise falls back to the first row;
+/// * without a selection, Down picks the first row and Up the last;
+/// * moving stops at either end instead of wrapping.
+struct ArenaHistorySelection: Equatable {
+    private(set) var id: String?
+
+    init(id: String? = nil) {
+        self.id = id
+    }
+
+    /// Keep the selection visible after the saved history itself changed.
+    /// Returns `true` when the selection had to move.
+    @discardableResult
+    mutating func reconcile(with visibleIDs: [String]) -> Bool {
+        if let id, visibleIDs.contains(id) { return false }
+        let next = visibleIDs.first
+        guard next != id else { return false }
+        id = next
+        return true
+    }
+
+    /// A query or filter change starts again at the first visible row, even if
+    /// the previous selection happens to survive the new result set.
+    @discardableResult
+    mutating func selectFirst(in visibleIDs: [String]) -> Bool {
+        let next = visibleIDs.first
+        guard next != id else { return false }
+        id = next
+        return true
+    }
+
+    /// Move one row. The result is always a visible row, or `nil` when there
+    /// is nothing to select.
+    @discardableResult
+    mutating func move(_ direction: ArenaHistoryMove, in visibleIDs: [String]) -> Bool {
+        guard !visibleIDs.isEmpty else {
+            guard id != nil else { return false }
+            id = nil
+            return true
+        }
+        let next: String
+        if let current = id, let index = visibleIDs.firstIndex(of: current) {
+            switch direction {
+            case .up: next = visibleIDs[max(index - 1, 0)]
+            case .down: next = visibleIDs[min(index + 1, visibleIDs.count - 1)]
+            }
+        } else {
+            next = direction == .down ? visibleIDs[0] : visibleIDs[visibleIDs.count - 1]
+        }
+        guard next != id else { return false }
+        id = next
+        return true
+    }
+}
+
+extension Notification.Name {
+    /// Posted by the View menu command so the already-mounted workbench opens
+    /// the same history panel as the header button. One window, one sheet.
+    static let arenaOpenHistorySearch = Notification.Name("ArenaOpenHistorySearch")
+}
+
 enum ArenaHistorySearch {
     /// Filter local summaries. `seatName` lets the caller resolve a provider id
     /// to its display name without this file depending on UI metadata.
